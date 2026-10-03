@@ -13,14 +13,14 @@ In: frozen datasets, pipeline and evaluation declarations, runs that memoize fit
 | concern | owner | what the log records |
 |---|---|---|
 | code | git | per run: commit, dirty flag, the dirty diff as a blob; per fit: the git blob sha of every repo module imported while fitting, and the environment lock |
-| bytes | the blob store, `blobs/sha256/` | dataset rows, models, predictions, diffs, each under its sha |
+| bytes | the blob store, `blobs/sha256/` | dataset rows, models, predictions, diffs, each under its sha, in a format that opens without this Python environment |
 | facts | the event log, `forestry.sqlite` | the eight event types below |
 
 The log never stores what a function is, only a dotted path and the blob shas git computed for the files. Reproducing a number is the join: the log says which shas and which commit, git has the content, the blob store has the bytes.
 
 ## Declarations
 
-A pipeline is `fit(session, train_range, config) -> model` and `predict(model, session, range) -> predictions`. A scorer is `score(predictions, session, range, config) -> series`, one row per prediction, with `metrics(series) -> {name: value}` and a direction per metric declared once on the scorer; the same `metrics` runs per fold and over the concatenated folds.
+A pipeline is `fit(session, train_range, config) -> model`, `predict(model, session, range) -> predictions`, and `save(model) -> bytes` with `load(bytes) -> model` naming a format that opens without Python. A scorer is `score(predictions, session, range, config) -> series`, one row per prediction, with `metrics(series) -> {name: value}` and a direction per metric declared once on the scorer; the same `metrics` runs per fold and over the concatenated folds.
 
 `session` is the frozen dataset's columns, resident in memory, read by row range. Anything that learns from data lives inside `fit` over `train_range`. Declarations are frozen dataclasses referencing functions by dotted path, hashed by canonical serialization: a value change changes the id, a pipeline's name is a label outside the hash. No YAML, no closures. Identity is declaration only; code changes are caught by the memo rule, not by hashing files into identities.
 
@@ -48,8 +48,8 @@ CREATE TABLE event (
 | pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, scorer path, config, metric directions, cadence, the expanded folds and eval windows |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, env lock, host facts |
-| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock) | run id, model sha, duration |
-| predictions_computed | dataset | hash(fit id, range) | blob sha |
+| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock) | run id, model sha and format, duration |
+| predictions_computed | dataset | hash(fit id, range) | blob sha and format |
 | entry_scored | evaluation | entry id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per age |
 | decision_recorded | evaluation | entry id | kind (promote, reject), why, against (baseline entry at the time, verdict, deltas) |
 
@@ -82,6 +82,20 @@ Comparability: an entry compares only against the baseline of its own evaluation
 Embargo: no fit's train range ends after its fold's eval start minus the embargo. The folds are in the evaluation payload, written once.
 
 Day one, because rows written wrong cannot be repaired: ids that merge across hosts (content hashes and ULIDs, no serial counters); the blob store writes to a temp file, fsyncs and renames; every fit carries its import shas and env lock. Two logs from two hosts merge by `INSERT OR IGNORE` on id, decisions on one host.
+
+## Blobs
+
+Every blob opens without this Python environment, and every sha reference in a payload carries a `format`. Pickle is never written.
+
+| blob | format |
+|---|---|
+| dataset rows | Parquet, timestamp as a column |
+| predictions | Parquet, one column; the row range is in the event |
+| model | what the pipeline declares: `save(model) -> bytes` and `load(bytes) -> model` as registered steps, with helpers for a dict of arrays (Arrow IPC) and a bonsai model (its msgpack wire format); a pipeline without them is refused at run |
+| dirty diff | text |
+| declarations | not a blob: the JSON payload, re-imported by dotted path |
+
+A blob's name is the sha256 of its bytes as stored, so identical content is written once and `fsck` can rehash and compare. The database cannot enforce a pointer into the filesystem; a missing blob is found by read or by `fsck`.
 
 ## Analytics
 
