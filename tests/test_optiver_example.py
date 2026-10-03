@@ -32,7 +32,7 @@ def root(tmp_path_factory) -> pathlib.Path:
 
 @pytest.fixture(scope="module")
 def dataset(root: pathlib.Path) -> str:
-    return fy(root, "freeze", "optiver.capture:freeze", "0,1,2,3").strip()
+    return fy(root, "ingest", "optiver.capture", "0,1,2,3").strip()
 
 
 def fy(root: pathlib.Path, *argv: str) -> str:
@@ -50,7 +50,7 @@ def fy(root: pathlib.Path, *argv: str) -> str:
 
 def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
     ledger = Ledger.open(root)
-    event = ledger.latest("dataset_frozen", dataset)
+    event = ledger.latest("dataset_recorded", dataset)
     table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
     assert table.num_rows > 100_000 and table.num_rows == event["payload"]["rows"]
     assert not pc.any(pc.is_nan(table[capture.TARGET])).as_py()
@@ -59,14 +59,14 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
 
 
 def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
-    campaign = (DECL, "--dataset", dataset)
-    fy(root, "run", *campaign)
-    assert "scored" in fy(root, "board", *campaign)
-    fy(root, "decide", *campaign, "ridge_3m", "--kind", "promote", "--why", "incumbent")
-    board = fy(root, "board", *campaign)
+    decl = (DECL, "--dataset", dataset)
+    fy(root, "run", *decl)
+    assert "scored" in fy(root, "board", *decl)
+    fy(root, "decide", *decl, "ridge_3m", "--kind", "promote", "--why", "incumbent")
+    board = fy(root, "board", *decl)
     assert "baseline" in board and "pnl " in board and "ridge_1m" in board
-    assert "incumbent" in fy(root, "history", *campaign)
-    assert '"config_diff"' in fy(root, "board", *campaign, "ridge_1m")
+    assert "incumbent" in fy(root, "history", *decl)
+    assert '"config_diff"' in fy(root, "board", *decl, "ridge_1m")
 
 
 def test_a_rerun_appends_one_event_and_keeps_the_baseline(root, dataset):

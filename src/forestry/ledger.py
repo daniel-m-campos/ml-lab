@@ -27,10 +27,14 @@ SCHEMA_VERSION = 7
 ACTOR_ENV = "FORESTRY_ACTOR"
 
 
+class Refused(Exception):
+    """The ledger refuses an operation that would break an invariant."""
+
+
 class Event:
     """Event types."""
 
-    DATASET: Final = "dataset_frozen"
+    DATASET: Final = "dataset_recorded"
     PIPELINE: Final = "pipeline_declared"
     EVALUATION: Final = "evaluation_declared"
     RUN: Final = "run_started"
@@ -56,7 +60,7 @@ CREATE VIEW IF NOT EXISTS dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.window[1]') AS window_end,
   json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
   json_extract(payload,'$.blob.format') AS format
-FROM event WHERE type='dataset_frozen';
+FROM event WHERE type='dataset_recorded';
 
 CREATE VIEW IF NOT EXISTS pipeline AS SELECT seq, id, at, actor,
   json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,

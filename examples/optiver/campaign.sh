@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One Optiver campaign: freeze, run, seat the incumbent, read the board.
+# One Optiver campaign: ingest, run, seat the incumbent, read the board.
 # Usage: examples/optiver/campaign.sh [stocks]   ("all", a count such as "20", or "0,1,2,3")
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -8,8 +8,8 @@ command -v fy >/dev/null || { echo "fy not found: uv venv .venv && uv pip instal
 export PYTHONPATH=examples FORESTRY_ROOT=.forestry-optiver
 export FORESTRY_ACTOR="${FORESTRY_ACTOR:-$USER}"
 
-echo "== freeze"
-DS=$(fy freeze optiver.capture:freeze "${1:-20}")
+echo "== ingest"
+DS=$(fy ingest optiver.capture "${1:-20}")
 C="optiver.declarations --dataset $DS"
 echo "dataset $DS"
 

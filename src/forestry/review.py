@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from forestry import harness
+from forestry import decisions
 from forestry.declare import Evaluation
 from forestry.ledger import Event, Ledger
 
@@ -31,10 +31,10 @@ def board(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
                 "id": row["pipeline"],
                 "pipeline": row["name"],
                 "status": row["status"],
-                "verdict": harness.dominance(metrics, against, evaluation.directions)
+                "verdict": decisions.dominance(metrics, against, evaluation.directions)
                 if compared
                 else None,
-                "deltas": harness.relative_deltas(metrics, against, evaluation.directions)
+                "deltas": decisions.relative_deltas(metrics, against, evaluation.directions)
                 if compared
                 else {},
                 "metrics": metrics,
@@ -52,7 +52,7 @@ def detail(ledger: Ledger, evaluation: Evaluation, pipeline_id: str) -> dict[str
         raise KeyError(f"pipeline {pipeline_id} has no entry under this evaluation")
     row = rows[0]
     config = ledger.get(pipeline_id)["payload"]["config"]
-    head = harness.baseline(ledger, evaluation)
+    head = decisions.baseline(ledger, evaluation)
     base_config = (
         ledger.get(ledger.get(head)["payload"]["pipeline"])["payload"]["config"] if head else None
     )
@@ -93,7 +93,7 @@ def history(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
             "pipeline": _name(ledger, d),
         }
         for d in ledger.events(Event.DECISION, stream=evaluation.id)
-        if d["payload"]["kind"] == harness.Decision.PROMOTE
+        if d["payload"]["kind"] == decisions.Decision.PROMOTE
     ]
 
 

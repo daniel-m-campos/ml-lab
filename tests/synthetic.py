@@ -39,11 +39,11 @@ def keep_all(session: Session) -> Session:
     return session
 
 
-def freeze(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
+def dataset(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
     rows = generate(
         start="2025-01-01", months=months, rows_per_day=20, seed=seed, drift_at="2025-07-01"
     )
-    return data.freeze(
+    return data.ingest(
         ledger,
         rows,
         process="synthetic",

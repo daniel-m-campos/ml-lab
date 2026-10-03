@@ -44,7 +44,7 @@ CREATE TABLE event (
 
 | type | stream | key | payload |
 |---|---|---|---|
-| dataset_frozen | dataset | dataset id = hash(recipe) | process, instrument, window, recipe (params, filter paths, targets), rows, blob sha |
+| dataset_recorded | dataset | dataset id = hash(recipe) | process, instrument, window, recipe (params, filter paths, targets), rows, blob sha |
 | pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, scorer path, config, metric directions, cadence, the expanded folds and eval windows |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, env lock, host facts |
@@ -105,8 +105,8 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'forestry.sqlite' (TYPE sql
 
 ## From inception to experimentation
 
-1. A project is three modules in a git repo: how to read the raw data, the steps, the declarations (`pipelines` and `evaluation(dataset)`).
-2. `fy freeze` appends `dataset_frozen` and stores the rows under their sha. Same recipe, same id, no write.
+1. A project is a git repo exposing three module attributes, in one file or several: `dataset(ledger, *args)`, `pipelines` and `evaluation` (a value or a function of the dataset id). `fy` reads them by name, so a file holding only new pipelines runs beside the project's declarations.
+2. `fy ingest` appends `dataset_recorded` and stores the rows under their sha. Same recipe, same id, no write.
 3. The first `fy run` appends `evaluation_declared` with the schedule expanded once.
 4. Every `fy run` appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `entry_scored` per pipeline whose predictions are new.
 5. `fy decide <pipeline> --kind promote --why "incumbent"` appends the first decision; the baseline view resolves to that entry.
@@ -117,17 +117,18 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'forestry.sqlite' (TYPE sql
 ## Command line
 
 ```
-DS=$(fy freeze project.capture:freeze <args>)
+DS=$(fy ingest project.capture <args>)
 C="project.declarations --dataset $DS"
 fy run $C
 fy decide $C <pipeline> --kind promote --why "incumbent"
 fy board $C
 fy board $C <pipeline>
 fy decide $C <pipeline> --kind promote|reject --why "..."
+fy run project.declarations ideas/agent7.py --dataset $DS
 fy history $C
 ```
 
-Five verbs. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
+Five verbs. The four after `ingest` take one or more modules: pipelines are concatenated, the evaluation comes from the one module that declares it. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
 
 ## Later
 

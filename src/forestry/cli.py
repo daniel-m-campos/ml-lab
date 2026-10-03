@@ -1,19 +1,22 @@
 """``fy``: the command line over the log.
 
-A campaign is a declarations module exposing ``pipelines`` (a list of ``Pipeline``) and
-``evaluation`` (an ``Evaluation`` or a function of the dataset id returning one). Every campaign
-command takes the module and ``--dataset``. The ledger root comes from ``--root`` or
-``FORESTRY_ROOT`` (default ``.forestry``); the actor from ``FORESTRY_ACTOR``. Pipelines are named
-by name or id prefix.
+Declarations are plain module attributes, so a project may organize them freely: one script, or
+``capture.py`` + ``steps.py`` + ``declarations.py``, or one file per idea. ``fy ingest`` reads
+``dataset(ledger, *args)`` from a module. The other verbs take one or more modules and read
+``pipelines`` (a list of ``Pipeline``) from each and ``evaluation`` (an ``Evaluation`` or a
+function of the dataset id) from exactly one of them, so an agent-written file holding only new
+pipelines runs beside the project's declarations. Every one takes ``--dataset``. The ledger root
+comes from ``--root`` or ``FORESTRY_ROOT`` (default ``.forestry``); the actor from
+``FORESTRY_ACTOR``. Pipelines are named by name or id prefix.
 
 Examples
 --------
-$ DS=$(fy freeze optiver.capture:freeze 20)
+$ DS=$(fy ingest optiver.capture 20)
 $ C="optiver.declarations --dataset $DS"
 $ fy run $C
 $ fy decide $C ridge_3m --kind promote --why "the model in production"
 $ fy board $C
-$ fy decide $C bonsai_lw --kind promote --why "pnl +7.6%, drawdown accepted"
+$ fy run optiver.declarations ideas/agent7.py --dataset $DS
 $ fy history $C
 """
 
@@ -28,9 +31,9 @@ import pathlib
 import sys
 from typing import Any
 
-from forestry import harness, review
-from forestry.declare import Evaluation
-from forestry.ledger import Event, Ledger
+from forestry import decisions, review, runs
+from forestry.declare import Evaluation, Pipeline
+from forestry.ledger import Event, Ledger, Refused
 
 DEFAULT_ROOT = ".forestry"
 BOARD_COLUMNS = ("entry", "pipeline", "status", "verdict", "deltas", "metrics", "why")
@@ -42,36 +45,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", default=os.environ.get("FORESTRY_ROOT", DEFAULT_ROOT))
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("freeze", help="call module:function(ledger, *args); prints the id")
-    p.add_argument("function", help="module:function(ledger, *args)")
+    p = sub.add_parser("ingest", help="call the module's dataset(ledger, *args); prints the id")
+    p.add_argument("module", help="module name or .py path exposing dataset()")
     p.add_argument("args", nargs="*")
-    p.set_defaults(handler=_freeze)
+    p.set_defaults(handler=_ingest)
 
     p = sub.add_parser("run", help="fit, predict and score every pipeline")
-    _campaign_arguments(p)
+    _declarations_arguments(p)
     p.set_defaults(handler=_run)
 
     p = sub.add_parser("board", help="every pipeline against the baseline; one name for detail")
-    _campaign_arguments(p)
+    _declarations_arguments(p)
     p.add_argument("pipeline", nargs="?", help="one pipeline's detail as JSON")
     p.set_defaults(handler=_board)
 
     p = sub.add_parser("decide", help="record promote or reject on a pipeline")
-    _campaign_arguments(p)
+    _declarations_arguments(p)
     p.add_argument("pipeline")
     p.add_argument("--kind", required=True, choices=["promote", "reject"])
     p.add_argument("--why", required=True)
     p.set_defaults(handler=_decide)
 
     p = sub.add_parser("history", help="the chain of promotions")
-    _campaign_arguments(p)
+    _declarations_arguments(p)
     p.set_defaults(handler=_history)
 
     args = parser.parse_args(argv)
     ledger = Ledger.open(pathlib.Path(args.root))
     try:
         return args.handler(args, ledger)
-    except (harness.Refused, KeyError) as refused:
+    except (Refused, KeyError) as refused:
         print(f"fy {args.command}: {refused}", file=sys.stderr)
         return 1
 
@@ -79,19 +82,19 @@ def main(argv: list[str] | None = None) -> int:
 # Handlers =========================================================================================
 
 
-def _campaign_arguments(p: argparse.ArgumentParser):
-    p.add_argument("declarations", help="module name or .py path")
-    p.add_argument("--dataset", required=True, help="dataset id from fy freeze")
+def _declarations_arguments(p: argparse.ArgumentParser):
+    p.add_argument("declarations", nargs="+", help="modules or .py paths exposing pipelines")
+    p.add_argument("--dataset", required=True, help="dataset id from fy ingest")
 
 
-def _freeze(args: argparse.Namespace, ledger: Ledger) -> int:
-    print(_load(args.function)(ledger, *args.args))
+def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
+    print(_load(args.module).dataset(ledger, *args.args))
     return 0
 
 
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
-    module, evaluation = _campaign(args)
-    report = harness.run(ledger, list(module.pipelines), evaluation)
+    pipelines, evaluation = _declarations(args)
+    report = runs.run(ledger, pipelines, evaluation)
     print(
         f"run {report.run}: fits {report.fits_computed}, predictions "
         f"{report.predictions_computed}, entries {report.entries_scored}"
@@ -100,7 +103,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _board(args: argparse.Namespace, ledger: Ledger) -> int:
-    _, evaluation = _campaign(args)
+    _, evaluation = _declarations(args)
     if args.pipeline:
         pipeline = _resolve(ledger, evaluation, args.pipeline)
         print(json.dumps(review.detail(ledger, evaluation, pipeline), indent=2, default=str))
@@ -110,14 +113,14 @@ def _board(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _decide(args: argparse.Namespace, ledger: Ledger) -> int:
-    _, evaluation = _campaign(args)
+    _, evaluation = _declarations(args)
     pipeline = _resolve(ledger, evaluation, args.pipeline)
-    print(harness.decide(ledger, pipeline, evaluation, kind=args.kind, why=args.why))
+    print(decisions.decide(ledger, pipeline, evaluation, kind=args.kind, why=args.why))
     return 0
 
 
 def _history(args: argparse.Namespace, ledger: Ledger) -> int:
-    _, evaluation = _campaign(args)
+    _, evaluation = _declarations(args)
     print(_table(HISTORY_COLUMNS, review.history(ledger, evaluation)))
     return 0
 
@@ -133,28 +136,31 @@ def _resolve(ledger: Ledger, evaluation: Evaluation, name: str) -> str:
     if not matches:
         matches = [p for p in scored if ledger.get(p)["payload"]["name"] == name]
     if len(matches) != 1:
-        raise harness.Refused(f"pipeline {name!r}: {len(matches)} matches under this evaluation")
+        raise Refused(f"pipeline {name!r}: {len(matches)} matches under this evaluation")
     return matches[0]
 
 
-def _campaign(args: argparse.Namespace) -> tuple[Any, Evaluation]:
-    module = _load(args.declarations)
-    evaluation = module.evaluation
+def _declarations(args: argparse.Namespace) -> tuple[list[Pipeline], Evaluation]:
+    """Pipelines from every module named; the evaluation from the one module that declares it."""
+    modules = [_load(spec) for spec in args.declarations]
+    pipelines = [p for m in modules for p in getattr(m, "pipelines", [])]
+    found = {id(m.evaluation): m.evaluation for m in modules if hasattr(m, "evaluation")}
+    if len(found) != 1:
+        raise Refused(f"{len(found)} evaluations declared across {args.declarations}; need one")
+    evaluation = next(iter(found.values()))
     if callable(evaluation):
         evaluation = evaluation(args.dataset)
-    return module, evaluation
+    return pipelines, evaluation
 
 
 def _load(spec: str) -> Any:
-    target, _, name = spec.partition(":")
-    if target.endswith(".py"):
-        module_spec = importlib.util.spec_from_file_location(pathlib.Path(target).stem, target)
-        module = importlib.util.module_from_spec(module_spec)
-        sys.modules[module_spec.name] = module
-        module_spec.loader.exec_module(module)
-    else:
-        module = importlib.import_module(target)
-    return getattr(module, name) if name else module
+    if not spec.endswith(".py"):
+        return importlib.import_module(spec)
+    module_spec = importlib.util.spec_from_file_location(pathlib.Path(spec).stem, spec)
+    module = importlib.util.module_from_spec(module_spec)
+    sys.modules[module_spec.name] = module
+    module_spec.loader.exec_module(module)
+    return module
 
 
 def _table(columns: tuple[str, ...], rows: list[dict[str, Any]]) -> str:

@@ -56,10 +56,10 @@ def drop_null_target(session: Session) -> Session:
     return Session(session.ts[keep], {k: v[keep] for k, v in session.columns.items()})
 
 
-def freeze(ledger: Ledger, stocks: str = "all") -> str:
-    """Freeze a stock subset with null targets dropped; ``stocks`` is "all", "20" or "0,1,2"."""
+def dataset(ledger: Ledger, stocks: str = "all") -> str:
+    """Ingest a stock subset with null targets dropped; ``stocks`` is "all", "20" or "0,1,2"."""
     selected = parse_stocks(stocks)
-    return data.freeze(
+    return data.ingest(
         ledger,
         load(selected),
         process=PROCESS,

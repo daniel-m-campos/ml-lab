@@ -1,11 +1,11 @@
-"""Freezing a dataset and loading it back.
+"""Ingesting a dataset and loading it back.
 
 A dataset is the rows of one (process, instrument, window) passed through filter steps, with
 named target columns. Its id covers the whole recipe; the event records the bytes as Parquet.
 
 Examples
 --------
->>> dataset = freeze(ledger, session, process="toy", params={}, instrument="X",
+>>> dataset = ingest(ledger, session, process="toy", params={}, instrument="X",
 ...                  filters=(), targets=("ret_1",))  # doctest: +SKIP
 """
 
@@ -19,7 +19,7 @@ from forestry.ledger import Event, Ledger
 from forestry.session import Session
 
 
-def freeze(
+def ingest(
     ledger: Ledger,
     session: Session,
     *,

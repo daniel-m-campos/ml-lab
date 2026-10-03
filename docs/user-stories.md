@@ -6,7 +6,7 @@ Each story: a context, the steps as `fy` commands, what the log holds afterwards
 
 Context: a new month of order-book captures for one instrument and sampling process.
 
-1. `DS=$(fy freeze project.capture:freeze <args>)` loads the rows, applies the declared filter steps, checks the targets, stores the bytes under their sha and appends one `dataset_frozen` event with the recipe.
+1. `DS=$(fy ingest project.capture <args>)` calls the module's `dataset` function, which loads the rows, applies the declared filter steps, checks the targets, stores the bytes under their sha and appends one `dataset_recorded` event with the recipe.
 2. The same call with the same inputs returns the same id and writes nothing.
 
 Log after: one event, one blob.

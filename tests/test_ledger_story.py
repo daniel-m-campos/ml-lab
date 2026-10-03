@@ -1,4 +1,4 @@
-"""The ledger story on synthetic data: freeze, declare, run, decide, read back.
+"""The ledger story on synthetic data: ingest, declare, run, decide, read back.
 
 Mirrors docs/user-stories.md; every event type in docs/spec.md is written and read back.
 """
@@ -15,8 +15,8 @@ import sys
 import pyarrow.parquet as pq
 import pytest
 
-from forestry import data, harness, hashing, review
-from forestry.ledger import Event, Ledger
+from forestry import cli, data, decisions, hashing, review, runs
+from forestry.ledger import Event, Ledger, Refused
 from tests import synthetic
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -29,7 +29,7 @@ def ledger(tmp_path) -> Ledger:
 
 @pytest.fixture
 def dataset(ledger: Ledger) -> str:
-    return synthetic.freeze(ledger)
+    return synthetic.dataset(ledger)
 
 
 @pytest.fixture
@@ -38,12 +38,12 @@ def evaluation(dataset: str):
 
 
 def _run(ledger, evaluation, *pipelines):
-    return harness.run(ledger, list(pipelines), evaluation, code_root=REPO)
+    return runs.run(ledger, list(pipelines), evaluation, code_root=REPO)
 
 
 def _seat(ledger, evaluation, pipeline) -> str:
     _run(ledger, evaluation, pipeline)
-    harness.decide(ledger, pipeline.id, evaluation, kind="promote", why="incumbent")
+    decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="incumbent")
     return pipeline.id
 
 
@@ -57,8 +57,8 @@ def _types(ledger) -> dict[str, int]:
 # Dataset ==========================================================================================
 
 
-def test_freezing_the_same_recipe_twice_appends_one_event(ledger):
-    assert synthetic.freeze(ledger) == synthetic.freeze(ledger)
+def test_ingesting_the_same_recipe_twice_appends_one_event(ledger):
+    assert synthetic.dataset(ledger) == synthetic.dataset(ledger)
     assert _types(ledger) == {Event.DATASET: 1}
 
 
@@ -92,7 +92,7 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     ledger, dataset, evaluation
 ):
     session = data.session(ledger, dataset)
-    folds = harness.expand(evaluation, session)
+    folds = runs.expand(evaluation, session)
     assert len(folds) >= evaluation.min_folds
     for fold in folds:
         gap = session.ts[fold.evals[1][0]] - session.ts[fold.train[1] - 1]
@@ -108,7 +108,7 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
 def test_a_run_posts_fits_predictions_and_one_entry_and_a_rerun_posts_one_event(
     ledger, dataset, evaluation
 ):
-    folds = harness.expand(evaluation, data.session(ledger, dataset))
+    folds = runs.expand(evaluation, data.session(ledger, dataset))
     first = _run(ledger, evaluation, synthetic.ridge(3))
     assert first.fits_computed == len(folds)
     assert first.predictions_computed == len(folds) * len(evaluation.ages)
@@ -153,20 +153,20 @@ def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledg
     code = tmp_path / "steps_v.py"
     code.write_text((REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNV"))
     module = _import(code, "steps_v")
-    dataset = module.freeze(ledger)
+    dataset = module.dataset(ledger)
     evaluation = module.evaluation(dataset)
     pipeline = module.ridge(3)
-    harness.run(ledger, [pipeline], evaluation, code_root=tmp_path)
-    harness.decide(ledger, pipeline.id, evaluation, kind="promote", why="first")
-    first_entry = harness.baseline(ledger, evaluation)
+    runs.run(ledger, [pipeline], evaluation, code_root=tmp_path)
+    decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="first")
+    first_entry = decisions.baseline(ledger, evaluation)
     code.write_text(code.read_text().replace("0.01 * np.sum", "0.02 * np.sum"))
     module = _import(code, "steps_v")
-    report = harness.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    report = runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
     assert module.ridge(3).id == pipeline.id
     assert report.fits_computed > 0 and report.entries_scored == 1
     board = {r["pipeline"]: r for r in review.board(ledger, evaluation)}
     assert board["ridge_3m"]["status"] == "scored"
-    assert harness.baseline(ledger, evaluation) == first_entry
+    assert decisions.baseline(ledger, evaluation) == first_entry
 
 
 # Decide ===========================================================================================
@@ -174,11 +174,11 @@ def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledg
 
 def test_decide_refuses_an_unscored_pipeline_and_promote_seats_a_baseline(ledger, evaluation):
     pipeline = synthetic.ridge(3)
-    with pytest.raises(harness.Refused):
-        harness.decide(ledger, pipeline.id, evaluation, kind="promote", why="x")
+    with pytest.raises(Refused):
+        decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="x")
     _seat(ledger, evaluation, pipeline)
-    entry = harness.latest_entry(ledger, pipeline.id, evaluation)["id"]
-    assert harness.baseline(ledger, evaluation) == entry
+    entry = decisions.latest_entry(ledger, pipeline.id, evaluation)["id"]
+    assert decisions.baseline(ledger, evaluation) == entry
     assert ledger.events(Event.DECISION)[0]["payload"]["against"] is None
 
 
@@ -186,39 +186,39 @@ def test_a_promotion_records_what_it_was_made_against(ledger, evaluation):
     _seat(ledger, evaluation, synthetic.ridge(6))
     challenger = synthetic.ridge(1)
     _run(ledger, evaluation, challenger)
-    seen = harness.compare(ledger, challenger.id, evaluation)
+    seen = decisions.compare(ledger, challenger.id, evaluation)
     assert set(seen["deltas"]) == set(evaluation.directions)
-    harness.decide(ledger, challenger.id, evaluation, kind="promote", why="pnl up")
+    decisions.decide(ledger, challenger.id, evaluation, kind="promote", why="pnl up")
     decision = ledger.events(Event.DECISION)[-1]
     assert decision["payload"]["against"] == seen and decision["actor"]
     assert (
-        harness.baseline(ledger, evaluation)
-        == harness.latest_entry(ledger, challenger.id, evaluation)["id"]
+        decisions.baseline(ledger, evaluation)
+        == decisions.latest_entry(ledger, challenger.id, evaluation)["id"]
     )
 
 
 def test_reject_records_why_and_leaves_the_baseline(ledger, evaluation):
     _seat(ledger, evaluation, synthetic.ridge(6))
-    head = harness.baseline(ledger, evaluation)
+    head = decisions.baseline(ledger, evaluation)
     loser = synthetic.ridge(1)
     _run(ledger, evaluation, loser)
-    harness.decide(ledger, loser.id, evaluation, kind="reject", why="too much turnover")
-    assert harness.baseline(ledger, evaluation) == head
+    decisions.decide(ledger, loser.id, evaluation, kind="reject", why="too much turnover")
+    assert decisions.baseline(ledger, evaluation) == head
     assert review.detail(ledger, evaluation, loser.id)["status"] == "rejected"
 
 
 def test_a_pipeline_under_another_evaluation_is_not_decidable_here(ledger, dataset, evaluation):
     other = synthetic.evaluation(dataset, cost=0.01)
     _run(ledger, other, synthetic.ridge(1))
-    with pytest.raises(harness.Refused):
-        harness.decide(ledger, synthetic.ridge(1).id, evaluation, kind="promote", why="x")
+    with pytest.raises(Refused):
+        decisions.decide(ledger, synthetic.ridge(1).id, evaluation, kind="promote", why="x")
 
 
 def test_dominance_reads_directions():
     directions = {"pnl": "max", "turnover": "min"}
-    better = harness.dominance({"pnl": 2, "turnover": 1}, {"pnl": 1, "turnover": 2}, directions)
-    worse = harness.dominance({"pnl": 1, "turnover": 2}, {"pnl": 2, "turnover": 1}, directions)
-    mixed = harness.dominance({"pnl": 2, "turnover": 2}, {"pnl": 1, "turnover": 1}, directions)
+    better = decisions.dominance({"pnl": 2, "turnover": 1}, {"pnl": 1, "turnover": 2}, directions)
+    worse = decisions.dominance({"pnl": 1, "turnover": 2}, {"pnl": 2, "turnover": 1}, directions)
+    mixed = decisions.dominance({"pnl": 2, "turnover": 2}, {"pnl": 1, "turnover": 1}, directions)
     assert (better, worse, mixed) == ("dominates", "dominated", "incomparable")
 
 
@@ -237,7 +237,7 @@ def test_the_board_survives_a_rerun_and_answers_what_moved_the_baseline(ledger, 
     detail = review.detail(ledger, evaluation, board[1]["id"])
     assert detail["config_diff"]["train_window_months"]["baseline"] == 6
     assert detail["folds"] and detail["status"] == "scored" and len(detail["entries"]) == 1
-    harness.decide(ledger, board[1]["id"], evaluation, kind="promote", why="better")
+    decisions.decide(ledger, board[1]["id"], evaluation, kind="promote", why="better")
     assert review.detail(ledger, evaluation, base)["status"] == "superseded"
 
 
@@ -247,7 +247,7 @@ def test_the_views_read_with_sqlite_alone(ledger, evaluation, tmp_path):
     db = sqlite3.connect(tmp_path / "forestry" / "forestry.sqlite")
     folds = db.execute("SELECT COUNT(*) FROM fold_score").fetchone()[0]
     assert (
-        folds == 2 * len(ledger.get(harness.baseline(ledger, evaluation))["payload"]["folds"]) * 2
+        folds == 2 * len(ledger.get(decisions.baseline(ledger, evaluation))["payload"]["folds"]) * 2
     )
     assert db.execute("SELECT COUNT(*) FROM baseline").fetchone()[0] == 1
     statuses = dict(db.execute("SELECT pipeline, status FROM status").fetchall())
@@ -260,11 +260,31 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
     before = ledger.events()[-1]["seq"]
     second = synthetic.ridge(1)
     _run(ledger, evaluation, second)
-    harness.decide(ledger, second.id, evaluation, kind="promote", why="later")
+    decisions.decide(ledger, second.id, evaluation, kind="promote", why="later")
     assert (
-        harness.baseline(ledger, evaluation, upto=before)
-        == harness.latest_entry(ledger, first, evaluation)["id"]
+        decisions.baseline(ledger, evaluation, upto=before)
+        == decisions.latest_entry(ledger, first, evaluation)["id"]
     )
+
+
+# Command line =====================================================================================
+
+
+def test_fy_run_merges_pipelines_from_several_modules(ledger, dataset, tmp_path, capsys):
+    extra = tmp_path / "agent7.py"
+    extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
+    argv = ["--root", str(ledger.root), "run", "tests.synthetic", str(extra), "--dataset", dataset]
+    assert cli.main(argv) == 0
+    assert "entries 4" in capsys.readouterr().out
+    names = {r["pipeline"] for r in review.board(ledger, synthetic.evaluation(dataset))}
+    assert names == {"ridge_1m", "ridge_3m", "ridge_6m", "ridge_12m"}
+
+
+def test_fy_run_refuses_modules_without_exactly_one_evaluation(ledger, dataset, tmp_path, capsys):
+    extra = tmp_path / "bare.py"
+    extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
+    assert cli.main(["--root", str(ledger.root), "run", str(extra), "--dataset", dataset]) == 1
+    assert "0 evaluations" in capsys.readouterr().err
 
 
 # Storage ==========================================================================================
