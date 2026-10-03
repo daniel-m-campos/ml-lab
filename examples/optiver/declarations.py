@@ -32,6 +32,8 @@ bonsai_depthwise = Pipeline(
 bonsai_leafwise = bonsai_depthwise.with_config(grower="leafwise").named("bonsai_lw")
 bonsai_available = importlib.util.find_spec("bonsai") is not None
 
+pipelines = ridge_windows + ([bonsai_depthwise, bonsai_leafwise] if bonsai_available else [])
+
 
 def evaluation(dataset: str) -> Evaluation:
     """Monthly walk-forward with three ages, a one-month seal and a three-stage funnel."""

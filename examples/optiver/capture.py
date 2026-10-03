@@ -56,14 +56,29 @@ def drop_null_target(frame: Frame) -> Frame:
     return Frame(frame.ts[keep], {k: v[keep] for k, v in frame.columns.items()})
 
 
-def freeze(ledger: Ledger, stocks: tuple[int, ...] | None) -> str:
-    """Freeze the capture for a stock subset and the dataset with null targets dropped."""
-    frame = load_frame(stocks)
+def freeze(ledger: Ledger, stocks: str = "all") -> str:
+    """Freeze the capture for a stock subset and the dataset with null targets dropped.
+
+    Parameters
+    ----------
+    stocks
+        ``"all"``, a count ``"20"`` (the first twenty ids) or a list ``"0,1,2,3"``.
+    """
+    selected = parse_stocks(stocks)
+    frame = load_frame(selected)
     capture = data.freeze_capture(
         ledger,
         frame,
+        params={"stocks": list(selected) if selected else "all", "base_date": str(BASE_DATE)},
         process=PROCESS,
-        params={"stocks": list(stocks) if stocks else "all", "base_date": str(BASE_DATE)},
         instrument=INSTRUMENT,
     )
     return data.freeze_dataset(ledger, capture, filters=(drop_null_target,), targets=(TARGET,))
+
+
+def parse_stocks(spec: str) -> tuple[int, ...] | None:
+    if spec == "all":
+        return None
+    if "," in spec:
+        return tuple(int(s) for s in spec.split(","))
+    return tuple(range(int(spec)))

@@ -6,5 +6,7 @@ stock's weighted average price in basis points. The competition hides calendar d
 about thirty trading days wide.
 
 Data: ``data/optiver/optiver-trading-at-the-close/train.csv`` (Kaggle, competition rules or a
-public mirror). Run ``python examples/optiver/campaign.py --stocks 20``.
+public mirror). Run ``examples/optiver/campaign.sh 20``; the script is the template, the modules
+here are the per-project code: ``capture`` (how to read the raw data), ``steps`` (features,
+models, scorers), ``declarations`` (the pipelines and the evaluation).
 """
