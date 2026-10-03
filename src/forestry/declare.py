@@ -1,13 +1,15 @@
 """Typed declarations: steps, scorers, pipelines and evaluations.
 
 Declarations are frozen dataclasses hashed by canonical serialization; see docs/spec.md. A
-pipeline's name is a label and does not enter its hash.
+pipeline's name is a label and does not enter its hash. Identity is declaration only: code
+changes are caught by the fit memo, not by hashing files.
 
 Examples
 --------
 >>> @step
 ... def fit(session, train, config): ...
->>> Pipeline(name="p", fit=fit, predict=fit, config={"depth": 6}).id  # doctest: +SKIP
+>>> @step(format="arrow-arrays")
+... def save(model) -> bytes: ...
 """
 
 from __future__ import annotations
@@ -19,9 +21,19 @@ from typing import Any
 from forestry import hashing
 
 
-def step(func: Callable) -> Callable:
-    """Register a fit, predict or filter function as a hashable step."""
-    return hashing.register(func, kind="step")
+def step(func: Callable | None = None, *, format: str | None = None) -> Callable:
+    """Register a fit, predict, filter, save or load function as a hashable step.
+
+    Parameters
+    ----------
+    format : str, optional
+        For a ``save`` step: the name of the byte format it writes, recorded on every model blob.
+    """
+
+    def decorate(f: Callable) -> Callable:
+        return hashing.register(f, kind="step", format=format)
+
+    return decorate(func) if func is not None else decorate
 
 
 def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
@@ -43,16 +55,29 @@ def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
 
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
-    """How a training range becomes a model and how a model becomes predictions."""
+    """How a training range becomes a model, a model becomes predictions, and a model becomes bytes.
+
+    ``save(model) -> bytes`` and ``load(bytes) -> model`` name a format that opens without Python.
+    """
 
     fit: Callable
     predict: Callable
+    save: Callable
+    load: Callable
     config: Any
     name: str = dataclasses.field(default="", metadata={"label": True})
 
     @property
     def id(self) -> str:
         return hashing.content_hash(self)
+
+    @property
+    def format(self) -> str | None:
+        return self.save.__forestry_meta__.get("format")
+
+    @property
+    def steps(self) -> tuple[Callable, ...]:
+        return (self.fit, self.predict, self.save, self.load)
 
     def with_config(self, **changes: Any) -> Pipeline:
         """A copy with config fields replaced."""

@@ -12,12 +12,10 @@ Examples
 from __future__ import annotations
 
 import datetime
-import io
 
 import numpy as np
 
 Range = tuple[int, int]
-TS_KEY = "__ts__"
 
 
 class Session:
@@ -62,16 +60,6 @@ class Session:
 
     def column(self, name: str, rng: Range) -> np.ndarray:
         return self.columns[name][rng[0] : rng[1]]
-
-    def to_bytes(self) -> bytes:
-        buf = io.BytesIO()
-        np.savez(buf, **{TS_KEY: self.ts}, **self.columns)
-        return buf.getvalue()
-
-    @classmethod
-    def from_bytes(cls, payload: bytes) -> Session:
-        with np.load(io.BytesIO(payload)) as npz:
-            return cls(npz[TS_KEY], {k: npz[k] for k in npz.files if k != TS_KEY})
 
 
 # Date helpers =====================================================================================

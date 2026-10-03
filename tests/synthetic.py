@@ -6,7 +6,7 @@ import dataclasses
 
 import numpy as np
 
-from forestry import data
+from forestry import data, formats
 from forestry.declare import Evaluation, Pipeline, scorer, step
 from forestry.ledger import Ledger
 from forestry.session import Range, Session, add_months, as_date
@@ -46,9 +46,9 @@ def freeze(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
     return data.freeze(
         ledger,
         rows,
-        process="toy",
+        process="synthetic",
         params={"months": months, "seed": seed},
-        instrument="TOY",
+        instrument="SYN",
         filters=(keep_all,),
         targets=(TARGET,),
     )
@@ -83,6 +83,17 @@ def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray
     return session.matrix(rng, FEATURES) @ model.weights + model.bias
 
 
+@step(format=formats.Format.ARROW_ARRAYS)
+def ridge_save(model: RidgeModel) -> bytes:
+    return formats.arrays_save({"weights": model.weights, "bias": np.array([model.bias])})
+
+
+@step
+def ridge_load(payload: bytes) -> RidgeModel:
+    arrays = formats.arrays_load(payload)
+    return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
+
+
 @dataclasses.dataclass(frozen=True)
 class SimConfig:
     cost: float
@@ -105,6 +116,8 @@ def ridge(window_months: int, alpha: float = 1.0) -> Pipeline:
         name=f"ridge_{window_months}m",
         fit=ridge_fit,
         predict=ridge_predict,
+        save=ridge_save,
+        load=ridge_load,
         config=RidgeConfig(window_months, alpha),
     )
 

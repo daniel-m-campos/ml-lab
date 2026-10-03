@@ -1,53 +1,164 @@
-"""The ledger: one SQLite file of JSON rows per object kind, plus a content-addressed blob store.
+"""The ledger: one append-only SQLite table of events, SQL views over it, and a blob store.
 
-Rows are small and few (thousands), so filtering happens in Python over ``all(kind)``.
+Every write is an insert with a global ``seq``, an actor and a host. Objects carry content ids,
+runs and decisions carry ULIDs, so two ledgers merge by id. Blobs live under their sha256.
 
 Examples
 --------
 >>> ledger = Ledger.open("/tmp/fy-example")  # doctest: +SKIP
->>> ledger.put("pipeline", "abc", {"name": "ridge"})  # doctest: +SKIP
+>>> ledger.append("pipeline_declared", "abc", "abc", {"name": "ridge"})  # doctest: +SKIP
+'abc'
 """
 
 from __future__ import annotations
 
+import getpass
 import json
+import os
 import pathlib
+import platform
 import sqlite3
 import time
 from typing import Any, Final
 
 from forestry import hashing
 
-
-class Kinds:
-    """Object kinds, one table each."""
-
-    DATASET: Final = "dataset"
-    PIPELINE: Final = "pipeline"
-    EVALUATION: Final = "evaluation"
-    FIT: Final = "fit"
-    PREDICTIONS: Final = "predictions"
-    SCORE: Final = "score"
-    DECISION: Final = "decision"
+SCHEMA_VERSION = 7
+ACTOR_ENV = "FORESTRY_ACTOR"
 
 
-ALL_KINDS = tuple(v for k, v in vars(Kinds).items() if k.isupper())
+class Event:
+    """Event types."""
+
+    DATASET: Final = "dataset_frozen"
+    PIPELINE: Final = "pipeline_declared"
+    EVALUATION: Final = "evaluation_declared"
+    RUN: Final = "run_started"
+    FIT: Final = "fit_computed"
+    PREDICTIONS: Final = "predictions_computed"
+    ENTRY: Final = "entry_scored"
+    DECISION: Final = "decision_recorded"
+
+
+DDL = """
+CREATE TABLE IF NOT EXISTS event (
+  seq INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, type TEXT NOT NULL, stream TEXT NOT NULL,
+  key TEXT NOT NULL, at REAL NOT NULL, actor TEXT NOT NULL, host TEXT NOT NULL,
+  payload TEXT NOT NULL CHECK (json_valid(payload)));
+CREATE INDEX IF NOT EXISTS event_stream ON event(stream, type, seq);
+CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
+"""
+
+VIEWS = """
+CREATE VIEW IF NOT EXISTS dataset AS SELECT seq, id, at, actor,
+  json_extract(payload,'$.process') AS process, json_extract(payload,'$.instrument') AS instrument,
+  json_extract(payload,'$.window[0]') AS window_start,
+  json_extract(payload,'$.window[1]') AS window_end,
+  json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
+  json_extract(payload,'$.blob.format') AS format
+FROM event WHERE type='dataset_frozen';
+
+CREATE VIEW IF NOT EXISTS pipeline AS SELECT seq, id, at, actor,
+  json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,
+  json_extract(payload,'$.declaration') AS declaration
+FROM event WHERE type='pipeline_declared';
+
+CREATE VIEW IF NOT EXISTS evaluation AS SELECT seq, id, at, actor,
+  json_extract(payload,'$.dataset') AS dataset, json_extract(payload,'$.metrics') AS metrics,
+  json_extract(payload,'$.declaration') AS declaration, json_extract(payload,'$.folds') AS folds
+FROM event WHERE type='evaluation_declared';
+
+CREATE VIEW IF NOT EXISTS run AS SELECT seq, id, at, actor, host, stream AS evaluation,
+  json_extract(payload,'$.git.commit') AS "commit", json_extract(payload,'$.git.dirty') AS dirty,
+  json_extract(payload,'$.git.diff.sha') AS diff, json_extract(payload,'$.env_lock') AS env_lock
+FROM event WHERE type='run_started';
+
+CREATE VIEW IF NOT EXISTS fit AS SELECT seq, id, at, actor, host, stream AS dataset,
+  json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
+  json_extract(payload,'$.train[0]') AS train_start,
+  json_extract(payload,'$.train[1]') AS train_end,
+  json_extract(payload,'$.cutoff') AS cutoff, json_extract(payload,'$.env_lock') AS env_lock,
+  json_extract(payload,'$.import_shas') AS import_shas,
+  json_extract(payload,'$.model.sha') AS model, json_extract(payload,'$.model.format') AS format,
+  json_extract(payload,'$.duration_s') AS duration_s
+FROM event WHERE type='fit_computed';
+
+CREATE VIEW IF NOT EXISTS prediction AS SELECT seq, id, at, stream AS dataset,
+  json_extract(payload,'$.fit') AS fit, json_extract(payload,'$.range[0]') AS range_start,
+  json_extract(payload,'$.range[1]') AS range_end, json_extract(payload,'$.fold') AS fold,
+  json_extract(payload,'$.age') AS age, json_extract(payload,'$.blob.sha') AS blob
+FROM event WHERE type='predictions_computed';
+
+CREATE VIEW IF NOT EXISTS entry AS SELECT seq, id, at, actor, stream AS evaluation,
+  json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run
+FROM event WHERE type='entry_scored';
+
+CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS entry, e.stream AS evaluation,
+  json_extract(e.payload,'$.pipeline') AS pipeline, json_extract(f.value,'$.fold') AS fold,
+  json_extract(f.value,'$.age') AS age, m.key AS metric, m.value AS value
+FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
+WHERE e.type='entry_scored';
+
+CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS entry, e.stream AS evaluation,
+  json_extract(e.payload,'$.pipeline') AS pipeline, CAST(a.key AS INTEGER) AS age,
+  m.key AS metric, m.value AS value
+FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
+WHERE e.type='entry_scored';
+
+CREATE VIEW IF NOT EXISTS decision AS SELECT seq, id, at, actor, stream AS evaluation, key AS entry,
+  json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.kind') AS kind,
+  json_extract(payload,'$.why') AS why, json_extract(payload,'$.against.entry') AS against_entry,
+  json_extract(payload,'$.against.verdict') AS verdict
+FROM event WHERE type='decision_recorded';
+
+CREATE VIEW IF NOT EXISTS latest_entry AS SELECT evaluation, pipeline, id AS entry, run, seq
+FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
+      FROM entry) WHERE rn = 1;
+
+CREATE VIEW IF NOT EXISTS baseline AS SELECT d.evaluation, d.entry, d.pipeline, d.seq
+FROM decision d
+WHERE d.kind='promote'
+  AND d.seq = (SELECT MAX(seq) FROM decision WHERE evaluation=d.evaluation AND kind='promote');
+
+CREATE VIEW IF NOT EXISTS status AS SELECT e.id AS entry, e.evaluation, e.pipeline,
+  CASE WHEN b.entry = e.id THEN 'baseline'
+       WHEN last.kind = 'promote' THEN 'superseded'
+       WHEN last.kind = 'reject' THEN 'rejected'
+       ELSE 'scored' END AS status
+FROM entry e
+LEFT JOIN baseline b ON b.evaluation = e.evaluation
+LEFT JOIN decision last ON last.entry = e.id
+  AND last.seq = (SELECT MAX(seq) FROM decision WHERE entry = e.id);
+
+CREATE VIEW IF NOT EXISTS board AS SELECT l.evaluation, l.pipeline, p.name, l.entry, l.run,
+  s.status, b.entry AS baseline, json_extract(le.payload,'$.aggregate') AS aggregate,
+  json_extract(be.payload,'$.aggregate') AS baseline_aggregate
+FROM latest_entry l
+JOIN status s ON s.entry = l.entry
+JOIN pipeline p ON p.id = l.pipeline
+JOIN event le ON le.id = l.entry
+LEFT JOIN baseline b ON b.evaluation = l.evaluation
+LEFT JOIN event be ON be.id = b.entry;
+
+CREATE VIEW IF NOT EXISTS history AS SELECT d.seq, d.id, d.at, d.actor, d.evaluation, d.entry,
+  d.pipeline, p.name, d.why, d.against_entry, d.verdict
+FROM decision d JOIN pipeline p ON p.id = d.pipeline WHERE d.kind='promote';
+"""
 
 
 class Ledger:
-    """Rows keyed by id per kind; decisions take an increasing integer id."""
+    """One event table plus a content-addressed blob store under a root directory."""
 
     def __init__(self, root: pathlib.Path):
         self.root = root
         self.blobs = root / "blobs" / "sha256"
         self._db = sqlite3.connect(root / "forestry.sqlite")
+        self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
-        for kind in ALL_KINDS:
-            self._db.execute(
-                f"CREATE TABLE IF NOT EXISTS {kind} (seq INTEGER PRIMARY KEY AUTOINCREMENT, "
-                "id TEXT UNIQUE, created REAL, body TEXT)"
-            )
-        self._db.commit()
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, SCHEMA_VERSION):
+            raise RuntimeError(f"ledger schema {version}, this build is {SCHEMA_VERSION}")
+        self._db.executescript(DDL + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};")
 
     def __repr__(self) -> str:
         return f"Ledger({self.root})"
@@ -59,50 +170,90 @@ class Ledger:
         (root / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
         return cls(root)
 
-    # Rows -----------------------------------------------------------------------------------------
+    # Events ---------------------------------------------------------------------------------------
 
-    def put(self, kind: str, id: str, body: dict[str, Any]) -> bool:
-        """Insert a row; returns False and writes nothing when the id exists."""
-        if self.get(kind, id) is not None:
-            return False
+    def append(
+        self, type: str, stream: str, key: str, payload: dict[str, Any], *, id: str | None = None
+    ) -> str:
+        """Insert one event; an id that already exists writes nothing. Returns the id."""
+        event_id = id or hashing.ulid()
         self._db.execute(
-            f"INSERT INTO {kind} (id, created, body) VALUES (?, ?, ?)",
-            (id, time.time(), json.dumps({"id": id, **body}, default=_jsonable)),
+            "INSERT OR IGNORE INTO event (id, type, stream, key, at, actor, host, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                type,
+                stream,
+                key,
+                time.time(),
+                actor(),
+                platform.node(),
+                json.dumps(payload, default=hashing.canonical),
+            ),
         )
         self._db.commit()
-        return True
+        return event_id
 
-    def get(self, kind: str, id: str) -> dict[str, Any] | None:
-        cur = self._db.execute(f"SELECT body FROM {kind} WHERE id = ?", (str(id),))
-        row = cur.fetchone()
-        return json.loads(row[0]) if row else None
+    def get(self, id: str) -> dict[str, Any] | None:
+        rows = self.sql("SELECT * FROM event WHERE id = ?", (id,))
+        return _event(rows[0]) if rows else None
 
-    def all(self, kind: str) -> list[dict[str, Any]]:
-        """Every row of a kind in insertion order."""
-        cur = self._db.execute(f"SELECT body FROM {kind} ORDER BY seq")
-        return [json.loads(r[0]) for r in cur.fetchall()]
+    def events(
+        self,
+        type: str | None = None,
+        stream: str | None = None,
+        key: str | None = None,
+        upto: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Events in seq order, filtered by any of type, stream, key and a seq bound."""
+        clauses, params = [], []
+        for column, value in (("type", type), ("stream", stream), ("key", key)):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if upto is not None:
+            clauses.append("seq <= ?")
+            params.append(upto)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return [_event(r) for r in self.sql(f"SELECT * FROM event {where} ORDER BY seq", params)]
 
-    def where(self, kind: str, **equals: Any) -> list[dict[str, Any]]:
-        """Rows whose fields equal the given values."""
-        return [r for r in self.all(kind) if all(r.get(k) == v for k, v in equals.items())]
+    def latest(self, type: str, key: str) -> dict[str, Any] | None:
+        rows = self.events(type=type, key=key)
+        return rows[-1] if rows else None
 
-    def next_decision_id(self) -> str:
-        cur = self._db.execute(f"SELECT COUNT(*) FROM {Kinds.DECISION}")
-        return str(cur.fetchone()[0] + 1)
+    def sql(self, query: str, params: tuple | list = ()) -> list[dict[str, Any]]:
+        """Rows of any query or view as dicts."""
+        return [dict(r) for r in self._db.execute(query, params).fetchall()]
 
     # Blobs ----------------------------------------------------------------------------------------
 
     def put_blob(self, payload: bytes) -> str:
-        """Store bytes under their sha256; returns the hash."""
+        """Store bytes under their sha256 atomically; returns the sha."""
         sha = hashing.bytes_hash(payload)
         path = self.blobs / sha
-        if not path.exists():
-            path.write_bytes(payload)
+        if path.exists():
+            return sha
+        tmp = self.blobs / f".tmp-{hashing.ulid()}"
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
         return sha
 
     def get_blob(self, sha: str) -> bytes:
         return (self.blobs / sha).read_bytes()
 
+    def has_blob(self, sha: str) -> bool:
+        return (self.blobs / sha).exists()
 
-def _jsonable(obj: Any) -> Any:
-    return hashing.canonical(obj)
+
+def actor() -> str:
+    """Who is writing: ``FORESTRY_ACTOR`` or the login name."""
+    return os.environ.get(ACTOR_ENV) or getpass.getuser()
+
+
+def _event(row: dict[str, Any]) -> dict[str, Any]:
+    out = dict(row)
+    out["payload"] = json.loads(out["payload"])
+    return out

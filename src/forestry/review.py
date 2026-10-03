@@ -1,4 +1,4 @@
-"""Read-only views over the ledger: the board, one pipeline in detail, the promotions.
+"""Read-only views over the log: the board, one pipeline in detail, the promotions.
 
 Examples
 --------
@@ -8,42 +8,78 @@ Examples
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from forestry import harness
 from forestry.declare import Evaluation
-from forestry.ledger import Kinds, Ledger
-
-
-class Status:
-    SCORED = "scored"
-    BASELINE = "baseline"
-    SUPERSEDED = "superseded"
-    REJECTED = "rejected"
+from forestry.ledger import Event, Ledger
 
 
 def board(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
-    """One row per scored pipeline: status, verdict and deltas against the baseline, metrics."""
-    current = harness.baseline(ledger, evaluation)
-    rows = [
-        _row(ledger, evaluation, s["pipeline"], current)
-        for s in ledger.where(Kinds.SCORE, evaluation=evaluation.id)
-    ]
-    rows.sort(key=lambda r: r["id"] != current)
-    return rows
+    """One row per pipeline's latest entry: status, verdict and deltas against the baseline."""
+    rows = ledger.sql("SELECT * FROM board WHERE evaluation = ?", (evaluation.id,))
+    age = str(evaluation.ages[0])
+    out = []
+    for row in rows:
+        metrics = json.loads(row["aggregate"])[age]
+        against = json.loads(row["baseline_aggregate"])[age] if row["baseline_aggregate"] else None
+        compared = against is not None and row["entry"] != row["baseline"]
+        out.append(
+            {
+                "entry": row["entry"],
+                "id": row["pipeline"],
+                "pipeline": row["name"],
+                "status": row["status"],
+                "verdict": harness.dominance(metrics, against, evaluation.directions)
+                if compared
+                else None,
+                "deltas": harness.relative_deltas(metrics, against, evaluation.directions)
+                if compared
+                else {},
+                "metrics": metrics,
+                "why": _last_why(ledger, row["entry"]),
+            }
+        )
+    out.sort(key=lambda r: r["status"] != "baseline")
+    return out
 
 
 def detail(ledger: Ledger, evaluation: Evaluation, pipeline_id: str) -> dict[str, Any]:
-    """One pipeline: config against the baseline's, per-fold scores, every decision on it."""
-    row = _row(ledger, evaluation, pipeline_id, harness.baseline(ledger, evaluation))
-    base = ledger.get(Kinds.PIPELINE, row["baseline"]) if row["baseline"] else None
-    config = ledger.get(Kinds.PIPELINE, pipeline_id)["config"]
+    """One pipeline: config against the baseline's, its entries with runs, folds, decisions."""
+    rows = [r for r in board(ledger, evaluation) if r["id"] == pipeline_id]
+    if not rows:
+        raise KeyError(f"pipeline {pipeline_id} has no entry under this evaluation")
+    row = rows[0]
+    config = ledger.get(pipeline_id)["payload"]["config"]
+    head = harness.baseline(ledger, evaluation)
+    base_config = (
+        ledger.get(ledger.get(head)["payload"]["pipeline"])["payload"]["config"] if head else None
+    )
+    entries = [
+        e
+        for e in ledger.events(Event.ENTRY, stream=evaluation.id)
+        if e["payload"]["pipeline"] == pipeline_id
+    ]
     return {
         **row,
         "config": config,
-        "config_diff": _diff(config, base["config"]) if base else {},
-        "folds": harness.score(ledger, pipeline_id, evaluation)["folds"],
-        "decisions": _decisions(ledger, evaluation, pipeline_id),
+        "config_diff": _diff(config, base_config) if base_config else {},
+        "entries": [
+            {"entry": e["id"], "run": e["payload"]["run"], "at": e["at"], "actor": e["actor"]}
+            for e in entries
+        ],
+        "folds": ledger.get(row["entry"])["payload"]["folds"],
+        "decisions": [
+            {
+                "id": d["id"],
+                "entry": d["key"],
+                "kind": d["payload"]["kind"],
+                "why": d["payload"]["why"],
+            }
+            for d in ledger.events(Event.DECISION, stream=evaluation.id)
+            if d["payload"]["pipeline"] == pipeline_id
+        ],
     }
 
 
@@ -52,44 +88,25 @@ def history(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
     return [
         {
             **d,
-            "pipeline_id": d["pipeline"],
-            "pipeline": ledger.get(Kinds.PIPELINE, d["pipeline"])["name"],
+            "against": d["payload"].get("against"),
+            "why": d["payload"]["why"],
+            "pipeline": _name(ledger, d),
         }
-        for d in ledger.where(Kinds.DECISION, evaluation=evaluation.id)
-        if d["kind"] == harness.Decision.PROMOTE
+        for d in ledger.events(Event.DECISION, stream=evaluation.id)
+        if d["payload"]["kind"] == harness.Decision.PROMOTE
     ]
 
 
 # Private Functions ================================================================================
 
 
-def _row(ledger: Ledger, evaluation: Evaluation, pipeline_id: str, current: str | None):
-    decisions = _decisions(ledger, evaluation, pipeline_id)
-    against = harness.compare(ledger, pipeline_id, evaluation) or {}
-    return {
-        "id": pipeline_id,
-        "pipeline": ledger.get(Kinds.PIPELINE, pipeline_id)["name"],
-        "status": _status(pipeline_id, current, decisions),
-        "baseline": current,
-        "verdict": against.get("verdict"),
-        "deltas": against.get("deltas", {}),
-        "metrics": harness.aggregate(ledger, pipeline_id, evaluation),
-        "why": decisions[-1]["why"] if decisions else None,
-    }
+def _name(ledger: Ledger, decision: dict[str, Any]) -> str:
+    return ledger.get(decision["payload"]["pipeline"])["payload"]["name"]
 
 
-def _status(pipeline_id: str, current: str | None, decisions: list[dict[str, Any]]) -> str:
-    if pipeline_id == current:
-        return Status.BASELINE
-    if not decisions:
-        return Status.SCORED
-    if decisions[-1]["kind"] == harness.Decision.REJECT:
-        return Status.REJECTED
-    return Status.SUPERSEDED
-
-
-def _decisions(ledger: Ledger, evaluation: Evaluation, pipeline_id: str) -> list[dict[str, Any]]:
-    return ledger.where(Kinds.DECISION, evaluation=evaluation.id, pipeline=pipeline_id)
+def _last_why(ledger: Ledger, entry_id: str) -> str | None:
+    decisions = ledger.events(Event.DECISION, key=entry_id)
+    return decisions[-1]["payload"]["why"] if decisions else None
 
 
 def _diff(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:

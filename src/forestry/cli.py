@@ -1,9 +1,10 @@
-"""``fy``: the command line over the ledger.
+"""``fy``: the command line over the log.
 
 A campaign is a declarations module exposing ``pipelines`` (a list of ``Pipeline``) and
 ``evaluation`` (an ``Evaluation`` or a function of the dataset id returning one). Every campaign
 command takes the module and ``--dataset``. The ledger root comes from ``--root`` or
-``FORESTRY_ROOT`` (default ``.forestry``). Pipelines are named by name or id prefix.
+``FORESTRY_ROOT`` (default ``.forestry``); the actor from ``FORESTRY_ACTOR``. Pipelines are named
+by name or id prefix.
 
 Examples
 --------
@@ -29,14 +30,14 @@ from typing import Any
 
 from forestry import harness, review
 from forestry.declare import Evaluation
-from forestry.ledger import Kinds, Ledger
+from forestry.ledger import Event, Ledger
 
 DEFAULT_ROOT = ".forestry"
-BOARD_COLUMNS = ("id", "pipeline", "status", "verdict", "deltas", "metrics", "why")
-HISTORY_COLUMNS = ("id", "pipeline", "pipeline_id", "against", "why")
+BOARD_COLUMNS = ("entry", "pipeline", "status", "verdict", "deltas", "metrics", "why")
+HISTORY_COLUMNS = ("id", "pipeline", "key", "against", "why", "actor")
 COMMANDS = {
     "run": "fit, predict and score every pipeline under the evaluation",
-    "board": "every scored pipeline against the baseline; one name for its detail",
+    "board": "every pipeline's latest entry against the baseline; one name for its detail",
     "decide": "record promote or reject on a pipeline",
     "history": "the chain of promotions",
 }
@@ -80,8 +81,8 @@ def _dispatch(args: argparse.Namespace, ledger: Ledger) -> int:
     if args.command == "run":
         report = harness.run(ledger, list(module.pipelines), evaluation)
         print(
-            f"fits {report.fits_computed}, predictions {report.predictions_computed}, "
-            f"pipelines {len(report.scored)}"
+            f"run {report.run}: fits {report.fits_computed}, predictions "
+            f"{report.predictions_computed}, entries {report.entries_scored}"
         )
     elif args.command == "board" and args.pipeline:
         pipeline = _resolve(ledger, evaluation, args.pipeline)
@@ -97,11 +98,12 @@ def _dispatch(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _resolve(ledger: Ledger, evaluation: Evaluation, name: str) -> str:
-    """A pipeline id from its name or an id prefix, among those scored under the evaluation."""
-    scored = [s["pipeline"] for s in ledger.where(Kinds.SCORE, evaluation=evaluation.id)]
+    """A pipeline id from its name or an id prefix, among those with an entry here."""
+    entries = ledger.events(Event.ENTRY, stream=evaluation.id)
+    scored = sorted({e["payload"]["pipeline"] for e in entries})
     matches = [p for p in scored if p.startswith(name)]
     if not matches:
-        matches = [p for p in scored if ledger.get(Kinds.PIPELINE, p)["name"] == name]
+        matches = [p for p in scored if ledger.get(p)["payload"]["name"] == name]
     if len(matches) != 1:
         raise harness.Refused(f"pipeline {name!r}: {len(matches)} matches under this evaluation")
     return matches[0]
@@ -149,10 +151,10 @@ def _cell(column: str, value: Any) -> str:
     if column == "deltas":
         return " ".join(f"{k} {v:+.1%}" for k, v in value.items())
     if column == "against":
-        return f"{value['verdict']} {value['baseline'][:8]}: " + _cell("deltas", value["deltas"])
+        return f"{value['verdict']} {value['entry'][:8]}: " + _cell("deltas", value["deltas"])
     if isinstance(value, dict):
         return " ".join(f"{k}={v:.3g}" for k, v in value.items())
-    if isinstance(value, str) and len(value) == 16:
+    if isinstance(value, str) and len(value) in (16, 26):
         return value[:8]
     return str(value)
 

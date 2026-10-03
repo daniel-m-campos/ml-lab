@@ -1,12 +1,15 @@
-"""Content hashing of declarations: canonical JSON over values and registered step references.
+"""Identities: canonical serialization of declarations, content hashes, ULIDs, code identity.
 
-A declaration may hold values, dataclasses, and references to registered steps or scorers. A
-function without a registration is refused, so closures and lambdas never reach a hash.
+A declaration is hashed by its canonical form: dataclass fields minus labels, registered steps by
+dotted path. Code identity is separate: ``import_shas`` gives the git blob sha of every repo
+module a set of steps imports, computed the way ``git hash-object`` does, so dirty files count.
 
 Examples
 --------
->>> content_hash({"b": 1, "a": [1, 2]}) == content_hash({"a": [1, 2], "b": 1})
+>>> content_hash({"a": 1}) == content_hash({"a": 1})
 True
+>>> len(ulid())
+26
 """
 
 from __future__ import annotations
@@ -14,41 +17,41 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
-import inspect
 import json
+import os
 import pathlib
-from collections.abc import Callable
+import subprocess
+import sys
+import time
+import types
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import numpy as np
 
 STEP_ATTR = "__forestry_step__"
 HASH_LEN = 16
+CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
 @dataclasses.dataclass(frozen=True)
 class StepRef:
-    """Where a registered function lives and the sha of the file that defines it."""
+    """Where a registered function lives: ``module:qualname``."""
 
     module: str
     qualname: str
-    file_sha: str
 
     @property
     def path(self) -> str:
         return f"{self.module}:{self.qualname}"
 
 
-# Public Functions =================================================================================
+# Declarations =====================================================================================
 
 
 def register(func: Callable, kind: str, **meta: Any) -> Callable:
     """Mark a function as a hashable step or scorer and return it unchanged."""
-    source = pathlib.Path(inspect.getsourcefile(func) or "")
-    file_sha = (
-        hashlib.sha256(source.read_bytes()).hexdigest()[:HASH_LEN] if source.is_file() else "nofile"
-    )
-    setattr(func, STEP_ATTR, StepRef(func.__module__, func.__qualname__, file_sha))
+    setattr(func, STEP_ATTR, StepRef(func.__module__, func.__qualname__))
     func.__forestry_kind__ = kind  # type: ignore[attr-defined]
     func.__forestry_meta__ = meta  # type: ignore[attr-defined]
     return func
@@ -71,7 +74,7 @@ def canonical(obj: Any) -> Any:
     if isinstance(obj, (datetime.date, datetime.datetime)):
         return obj.isoformat()
     if callable(obj):
-        return {"__step__": step_ref(obj).path, "sha": step_ref(obj).file_sha}
+        return {"__step__": step_ref(obj).path}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         fields = {
             f.name: canonical(getattr(obj, f.name))
@@ -95,3 +98,80 @@ def content_hash(obj: Any) -> str:
 def bytes_hash(payload: bytes) -> str:
     """Full sha256 hex of raw bytes, the blob store key."""
     return hashlib.sha256(payload).hexdigest()
+
+
+# Ids ==============================================================================================
+
+_last_ulid: list[int] = [0, 0]
+
+
+def ulid() -> str:
+    """A 26-character ULID, monotonic within the process."""
+    ms = int(time.time() * 1000)
+    if ms <= _last_ulid[0]:
+        ms = _last_ulid[0]
+        rand = _last_ulid[1] + 1
+    else:
+        rand = int.from_bytes(os.urandom(10), "big")
+    _last_ulid[0], _last_ulid[1] = ms, rand
+    value = (ms << 80) | rand
+    return "".join(CROCKFORD[(value >> (5 * i)) & 31] for i in reversed(range(26)))
+
+
+# Code identity ====================================================================================
+
+
+def git_blob_sha(data: bytes) -> str:
+    """The sha git would give these bytes as a blob."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def repo_root(start: pathlib.Path) -> pathlib.Path:
+    """The git toplevel containing ``start``, or ``start``'s directory outside a repo."""
+    directory = start if start.is_dir() else start.parent
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=directory,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return pathlib.Path(out.stdout.strip()).resolve()
+    except (OSError, subprocess.CalledProcessError):
+        return directory.resolve()
+
+
+def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
+    """Git blob shas of every module under ``code_root`` reachable from the steps' modules."""
+    root = code_root.resolve()
+    seen: dict[str, str] = {}
+    queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
+    visited: set[str] = set()
+    while queue:
+        module = queue.pop()
+        if module.__name__ in visited:
+            continue
+        visited.add(module.__name__)
+        path = _module_path(module, root)
+        if path is None:
+            continue
+        seen[path.relative_to(root).as_posix()] = git_blob_sha(path.read_bytes())
+        for value in vars(module).values():
+            if isinstance(value, types.ModuleType):
+                queue.append(value)
+            elif isinstance(getattr(value, "__module__", None), str):
+                owner = sys.modules.get(value.__module__)
+                if owner is not None:
+                    queue.append(owner)
+    return dict(sorted(seen.items()))
+
+
+def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path | None:
+    file = getattr(module, "__file__", None)
+    if not file:
+        return None
+    path = pathlib.Path(file).resolve()
+    if root not in path.parents or ".venv" in path.parts or not path.suffix == ".py":
+        return None
+    return path
