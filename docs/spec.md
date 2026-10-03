@@ -48,7 +48,7 @@ CREATE TABLE event (
 | pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, scorer path, config, metric directions, cadence, the expanded folds and eval windows |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, env lock, host facts |
-| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock) | run id, model sha and format, duration |
+| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock) | run id, cutoff, model sha and format, import shas, env lock, duration |
 | predictions_computed | dataset | hash(fit id, range) | blob sha and format |
 | entry_scored | evaluation | entry id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per age |
 | decision_recorded | evaluation | entry id | kind (promote, reject), why, against (baseline entry at the time, verdict, deltas) |
@@ -57,7 +57,7 @@ Fits and predictions live on the dataset stream because a scoring change reuses 
 
 ### Views
 
-Shipped as SQL in the same file so `sqlite3` shows them as tables. Every one takes `WHERE seq <= N` to read the log as it stood.
+Shipped as SQL in the same file so `sqlite3` shows them as tables. The per-type views take `WHERE seq <= N` to read the log as it stood; the ranking views (latest_entry, baseline, status, board) read the whole log, and an as-of board is `ledger.events(upto=N)` folded in Python.
 
 | view | definition |
 |---|---|
@@ -75,24 +75,26 @@ The payload is JSON so a shape change is a new payload version and an edited vie
 
 Memo: a fit is reused when one exists for (dataset, pipeline, train range) whose recorded import shas and environment lock all match the current tree. Dirty files hash like any other; the run records the diff. A dependency bump changes the lock and refits. Predictions are reused per (fit, range).
 
+The import closure is every module under the repo root reachable from the step modules' top-level imports, with `.venv` excluded. `declarations.py` is in it only if a step imports it, so editing a config there changes the pipeline id, not the fit shas. A repo module imported lazily inside a step grows the closure after the first fit; the run refuses it and names the module, because the memo would otherwise have missed its edits.
+
 Review: a decision is made on one entry and carries the baseline entry, verdict and deltas it saw. The baseline is the last promote. New content for a pipeline is a new entry with no decisions, so the board asks for review again. Nothing is deleted; a refutation is a new decision.
 
 Comparability: an entry compares only against the baseline of its own evaluation. A scorer or schedule change is a new evaluation.
 
 Embargo: no fit's train range ends after its fold's eval start minus the embargo. The folds are in the evaluation payload, written once.
 
-Day one, because rows written wrong cannot be repaired: ids that merge across hosts (content hashes and ULIDs, no serial counters); the blob store writes to a temp file, fsyncs and renames; every fit carries its import shas and env lock. Two logs from two hosts merge by `INSERT OR IGNORE` on id, decisions on one host.
+Day one, because rows written wrong cannot be repaired: ids that merge across hosts (content hashes and ULIDs, no serial counters); the blob store writes to a temp file, fsyncs and renames; every fit carries its import shas and env lock. Two logs from two hosts merge by `INSERT OR IGNORE` on id, decisions on one host. The schema version is `PRAGMA user_version`; a log at another version is refused with the instruction to delete and rerun, since the log is a cache of the code plus the data.
 
 ## Blobs
 
 Every blob opens without this Python environment, and every sha reference in a payload carries a `format`. Pickle is never written.
 
-| blob | format |
-|---|---|
-| dataset rows | Parquet, timestamp as a column |
-| predictions | Parquet, one column; the row range is in the event |
-| model | what the pipeline declares: `save(model) -> bytes` and `load(bytes) -> model` as registered steps, with helpers for a dict of arrays (Arrow IPC) and a bonsai model (its msgpack wire format); a pipeline without them is refused at run |
-| dirty diff | text |
+| blob | format name | bytes |
+|---|---|---|
+| dataset rows | `parquet` | Parquet, `ts` as a timestamp column plus one float64 column per field |
+| predictions | `parquet` | Parquet, one column `prediction`; the row range is in the event |
+| model | what the pipeline's `save` step declares | `save(model) -> bytes` and `load(bytes) -> model` as registered steps; `formats.py` ships `arrow-arrays` (a dict of arrays as an Arrow IPC file) and the temp-file round trip the Optiver example uses for `bonsai-msgpack`; a pipeline without them is refused at run |
+| dirty diff | `text/x-diff` | the `git diff HEAD` text |
 | declarations | not a blob: the JSON payload, re-imported by dotted path |
 
 A blob's name is the sha256 of its bytes as stored, so identical content is written once and `fsck` can rehash and compare. The database cannot enforce a pointer into the filesystem; a missing blob is found by read or by `fsck`.
