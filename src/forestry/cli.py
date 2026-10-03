@@ -16,6 +16,7 @@ $ fy seal optiver.declarations --dataset "$DS"
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import importlib.util
 import json
@@ -26,7 +27,7 @@ from typing import Any
 
 from forestry import harness, review
 from forestry.declare import Evaluation
-from forestry.ledger import Ledger
+from forestry.ledger import Kinds, Ledger
 
 DEFAULT_ROOT = ".forestry"
 TYPE_KEY = "__type__"
@@ -70,7 +71,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     ledger = Ledger.open(pathlib.Path(args.root))
-    return _dispatch(args, ledger)
+    try:
+        return _dispatch(args, ledger)
+    except (harness.Refused, KeyError) as refused:
+        print(f"fy {args.command}: {refused}", file=sys.stderr)
+        return 1
 
 
 # Private Functions ================================================================================
@@ -100,31 +105,46 @@ def _dispatch(args: argparse.Namespace, ledger: Ledger) -> int:
         print(_table(HISTORY_COLUMNS, rows))
     elif args.command == "seal":
         _, evaluation = _campaign(args)
-        current = review.baseline(ledger, evaluation)
-        if current is None:
-            print("no baseline to seal")
-            return 1
-        verdict = harness.seal(ledger, current["candidate"], evaluation)
-        print(f"{verdict.kind}  {_metrics(verdict.metrics)}")
+        print(_seal(ledger, evaluation))
     elif args.command == "gate":
         for cand in _gate_targets(args, ledger):
             harness.gate(ledger, cand, advance=args.advance and not args.stop, why=args.why)
             print(cand)
     elif args.command == "decide":
-        print(harness.decide(ledger, kind=args.kind, candidate=args.candidate, why=args.why))
+        candidate = _resolve(ledger, args.candidate)
+        print(harness.decide(ledger, kind=args.kind, candidate=candidate, why=args.why))
     elif args.command == "why":
-        print(json.dumps(review.why(ledger, args.candidate), indent=2, default=str))
+        print(json.dumps(review.why(ledger, _resolve(ledger, args.candidate)), indent=2))
     return 0
+
+
+def _seal(ledger: Ledger, evaluation: Evaluation) -> str:
+    current = review.baseline(ledger, evaluation)
+    if current is None:
+        raise harness.Refused("no baseline to seal")
+    recorded = review.sealed(ledger, current["candidate"])
+    if recorded is None:
+        verdict = harness.seal(ledger, current["candidate"], evaluation)
+        recorded = dataclasses.asdict(verdict)
+    return f"{recorded['kind']}  {_metrics(recorded['metrics'])}  (decision {recorded['decision']})"
 
 
 def _gate_targets(args: argparse.Namespace, ledger: Ledger) -> list[str]:
     if not args.pending:
-        return [args.target]
+        return [_resolve(ledger, args.target)]
     if args.dataset is None:
         raise SystemExit("fy gate --pending needs the declarations module and --dataset")
     args.declarations = args.target
     _, evaluation = _campaign(args)
     return [r["id"] for r in review.board(ledger, evaluation) if r["status"] == "pending"]
+
+
+def _resolve(ledger: Ledger, prefix: str) -> str:
+    """A full candidate id from the prefix the board prints."""
+    matches = [c["id"] for c in ledger.all(Kinds.CANDIDATE) if c["id"].startswith(prefix)]
+    if len(matches) != 1:
+        raise harness.Refused(f"candidate {prefix}: {len(matches)} matches")
+    return matches[0]
 
 
 def _campaign(args: argparse.Namespace) -> tuple[Any, Evaluation]:

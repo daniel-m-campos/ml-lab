@@ -9,6 +9,7 @@ Examples
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from forestry import hashing
@@ -64,6 +65,18 @@ def history(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def sealed(ledger: Ledger, candidate_id: str) -> dict[str, Any] | None:
+    """The recorded seal verdict for a candidate: kind, metrics, decision id; None if unsealed."""
+    for decision in ledger.all(Kinds.DECISION):
+        if decision.get("candidate") == candidate_id and decision["kind"].startswith("seal"):
+            return {
+                "kind": decision["kind"],
+                "metrics": json.loads(decision["why"])["sealed"],
+                "decision": decision["id"],
+            }
+    return None
 
 
 def why(ledger: Ledger, candidate_id: str) -> dict[str, Any]:
