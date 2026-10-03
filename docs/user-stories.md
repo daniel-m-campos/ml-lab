@@ -18,9 +18,9 @@ Done when: the printed id is stable across reruns.
 Context: `project/declarations.py` lists the pipelines and declares the evaluation.
 
 1. `fy run $C` appends `evaluation_declared` with the metric directions and the schedule expanded into folds and windows; then `run_started` with the commit, dirty flag, environment lock and host; then, per pipeline, `fit_computed` per cutoff carrying the import shas, `predictions_computed` per eval window, and one `entry_scored` keyed by the prediction ids.
-2. `fy run $C` again appends one `run_started` and nothing else: every fit and prediction is reused and every entry already exists. Adding a pipeline to the module fits only the new one.
+2. `fy run $C` again writes nothing: every fit and prediction is reused and every entry already exists, and the report says so. Adding a pipeline to the module fits only the new one; the other pipelines cost nothing.
 
-Log after: one evaluation, N pipelines, two runs, N entries, fits, predictions.
+Log after: one evaluation, N pipelines, one run, N entries, fits, predictions.
 
 Done when: the second run prints zero fits and zero predictions.
 

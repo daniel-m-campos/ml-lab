@@ -105,7 +105,7 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
 # Run ==============================================================================================
 
 
-def test_a_run_posts_fits_predictions_and_one_entry_and_a_rerun_posts_one_event(
+def test_a_run_posts_fits_predictions_and_one_entry_and_a_rerun_writes_nothing(
     ledger, dataset, evaluation
 ):
     folds = runs.expand(evaluation, data.session(ledger, dataset))
@@ -116,8 +116,21 @@ def test_a_run_posts_fits_predictions_and_one_entry_and_a_rerun_posts_one_event(
     before = len(ledger.events())
     second = _run(ledger, evaluation, synthetic.ridge(3))
     assert (second.fits_computed, second.predictions_computed, second.entries_scored) == (0, 0, 0)
-    appended = ledger.events()[before:]
-    assert [e["type"] for e in appended] == [Event.RUN]
+    assert (second.fits_reused, second.predictions_reused, second.entries_existing) == (
+        len(folds),
+        len(folds) * len(evaluation.ages),
+        1,
+    )
+    assert second.run == "" and ledger.events()[before:] == []
+
+
+def test_adding_a_pipeline_costs_only_its_own_fits(ledger, dataset, evaluation):
+    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    _run(ledger, evaluation, synthetic.ridge(3))
+    report = _run(ledger, evaluation, synthetic.ridge(3), synthetic.ridge(6))
+    assert report.fits_computed == len(folds) and report.entries_scored == 1
+    assert report.fits_reused == len(folds) and report.entries_existing == 1
+    assert len(ledger.events(Event.RUN)) == 2
 
 
 def test_fits_land_on_the_dataset_stream_and_entries_on_the_evaluation_stream(

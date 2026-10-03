@@ -108,7 +108,7 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'forestry.sqlite' (TYPE sql
 1. A project is a git repo exposing three module attributes, in one file or several: `dataset(ledger, *args)`, `pipelines` and `evaluation` (a value or a function of the dataset id). `fy` reads them by name, so a file holding only new pipelines runs beside the project's declarations.
 2. `fy ingest` appends `dataset_recorded` and stores the rows under their sha. Same recipe, same id, no write.
 3. The first `fy run` appends `evaluation_declared` with the schedule expanded once.
-4. Every `fy run` appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `entry_scored` per pipeline whose predictions are new.
+4. A `fy run` with work appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `entry_scored` per pipeline whose predictions are new. A rerun of an unchanged tree writes nothing and prints what it reused; adding one pipeline costs only that pipeline's fits, predictions and entry.
 5. `fy decide <pipeline> --kind promote --why "incumbent"` appends the first decision; the baseline view resolves to that entry.
 6. Add a `Pipeline`, commit, `fy run`, `fy board`, `fy decide`. `fy history` is the reflog; `fy board <pipeline>` is one pipeline with every entry, run and decision.
 7. Code evolves: changed import shas refit, new entries appear as scored, old entries and their decisions stand with their commit and shas.

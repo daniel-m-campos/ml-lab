@@ -69,12 +69,12 @@ def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
     assert '"config_diff"' in fy(root, "board", *decl, "ridge_1m")
 
 
-def test_a_rerun_appends_one_event_and_keeps_the_baseline(root, dataset):
+def test_a_rerun_writes_nothing_and_keeps_the_baseline(root, dataset):
     ledger = Ledger.open(root)
     before = len(ledger.events())
     out = fy(root, "run", DECL, "--dataset", dataset)
-    assert "fits 0, predictions 0, entries 0" in out
-    assert [e["type"] for e in ledger.events()[before:]] == ["run_started"]
+    assert out.startswith("up to date: 5 entries") or out.startswith("up to date: 3 entries")
+    assert ledger.events()[before:] == []
     assert "baseline" in fy(root, "board", DECL, "--dataset", dataset)
 
 

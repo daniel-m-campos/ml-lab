@@ -21,6 +21,7 @@ import platform
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -41,10 +42,15 @@ class Fold:
 
 @dataclasses.dataclass
 class RunReport:
+    """What a run wrote; ``run`` is empty when every fit, prediction and entry already existed."""
+
     run: str = ""
     fits_computed: int = 0
     predictions_computed: int = 0
     entries_scored: int = 0
+    fits_reused: int = 0
+    predictions_reused: int = 0
+    entries_existing: int = 0
     pipelines: list[str] = dataclasses.field(default_factory=list)
 
 
@@ -79,7 +85,12 @@ def run(
     *,
     code_root: pathlib.Path | None = None,
 ) -> RunReport:
-    """Post a run: fit, predict and score each pipeline, reusing what the memo rule allows."""
+    """Fit, predict and score each pipeline, reusing what the memo rule allows.
+
+    ``run_started`` is appended only when something is computed, right before the first write,
+    so a rerun of an unchanged tree writes nothing and adding one pipeline costs only its own
+    fits, predictions and entry.
+    """
     if not pipelines:
         raise Refused("no pipelines declared")
     for pipeline in pipelines:
@@ -92,23 +103,29 @@ def run(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
     )
     env_lock = _env_lock()
-    report = RunReport(run=hashing.ulid())
-    ledger.append(
-        Event.RUN,
-        evaluation.id,
-        report.run,
-        {
-            "git": _git(ledger, root),
-            "env_lock": env_lock,
-            "host": _host(),
-            "pipelines": [{"id": p.id, "name": p.name} for p in pipelines],
-        },
-        id=report.run,
-    )
+    report = RunReport()
+
+    def start() -> str:
+        if not report.run:
+            report.run = hashing.ulid()
+            ledger.append(
+                Event.RUN,
+                evaluation.id,
+                report.run,
+                {
+                    "git": _git(ledger, root),
+                    "env_lock": env_lock,
+                    "host": _host(),
+                    "pipelines": [{"id": p.id, "name": p.name} for p in pipelines],
+                },
+                id=report.run,
+            )
+        return report.run
+
     for pipeline in pipelines:
         _declare_pipeline(ledger, pipeline)
         report.pipelines.append(pipeline.id)
-        _run_pipeline(ledger, session, folds, pipeline, evaluation, root, env_lock, report)
+        _run_pipeline(ledger, session, folds, pipeline, evaluation, root, env_lock, report, start)
     return report
 
 
@@ -124,20 +141,21 @@ def _run_pipeline(
     root: pathlib.Path,
     env_lock: str,
     report: RunReport,
+    start: Callable[[], str],
 ):
     shas = hashing.import_shas(pipeline.steps, root)
     models: dict[str, Any] = {}
     predictions: dict[str, str] = {}
     for fold in folds:
         fit_id = _ensure_fit(
-            ledger, session, evaluation, pipeline, fold, shas, env_lock, models, report
+            ledger, session, evaluation, pipeline, fold, shas, env_lock, models, report, start
         )
         if report.fits_computed and shas != hashing.import_shas(pipeline.steps, root):
             grown = sorted(set(hashing.import_shas(pipeline.steps, root)) - set(shas))
             raise Refused(f"fit imported repo modules lazily: {grown}; import them at module level")
         for age, rng in fold.evals.items():
             predictions[f"{fold.index}:{age}"] = _ensure_predictions(
-                ledger, session, pipeline, fit_id, rng, fold, age, models, report
+                ledger, session, pipeline, fit_id, rng, fold, age, models, report, start
             )
     entry_id = hashing.content_hash(
         {
@@ -147,6 +165,7 @@ def _run_pipeline(
         }
     )
     if ledger.latest(Event.ENTRY, entry_id) is not None:
+        report.entries_existing += 1
         return
     per_fold, series = [], {}
     for fold in folds:
@@ -168,7 +187,7 @@ def _run_pipeline(
         entry_id,
         {
             "pipeline": pipeline.id,
-            "run": report.run,
+            "run": start(),
             "predictions": predictions,
             "folds": per_fold,
             "aggregate": {
@@ -190,6 +209,7 @@ def _ensure_fit(
     env_lock: str,
     models: dict[str, Any],
     report: RunReport,
+    start: Callable[[], str],
 ) -> str:
     fit_id = hashing.content_hash(
         {
@@ -201,7 +221,9 @@ def _ensure_fit(
         }
     )
     if ledger.latest(Event.FIT, fit_id) is not None:
+        report.fits_reused += 1
         return fit_id
+    run_id = start()
     started = time.perf_counter()
     model = pipeline.fit(session, fold.train, pipeline.config)
     duration = time.perf_counter() - started
@@ -212,7 +234,7 @@ def _ensure_fit(
         fit_id,
         {
             "pipeline": pipeline.id,
-            "run": report.run,
+            "run": run_id,
             "train": list(fold.train),
             "cutoff": str(fold.cutoff),
             "import_shas": shas,
@@ -236,10 +258,13 @@ def _ensure_predictions(
     age: int,
     models: dict[str, Any],
     report: RunReport,
+    start: Callable[[], str],
 ) -> str:
     pred_id = hashing.content_hash({"fit": fit_id, "range": list(rng)})
     if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
+        report.predictions_reused += 1
         return pred_id
+    start()
     if fit_id not in models:
         fit = ledger.latest(Event.FIT, fit_id)
         models[fit_id] = pipeline.load(ledger.get_blob(fit["payload"]["model"]["sha"]))

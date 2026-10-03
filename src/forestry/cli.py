@@ -95,6 +95,12 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     pipelines, evaluation = _declarations(args)
     report = runs.run(ledger, pipelines, evaluation)
+    if not report.run:
+        print(
+            f"up to date: {report.entries_existing} entries; {report.fits_reused} fits and "
+            f"{report.predictions_reused} predictions reused, nothing written"
+        )
+        return 0
     print(
         f"run {report.run}: fits {report.fits_computed}, predictions "
         f"{report.predictions_computed}, entries {report.entries_scored}"
