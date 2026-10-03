@@ -36,19 +36,18 @@ Ledger after: one protocol with a hash over every input.
 
 Done when: changing any input, including the simulator version, yields a different protocol id.
 
-## S3. Researcher runs a feature idea end to end so that the result is comparable to everything else on the dataset
+## S3. Researcher runs a modeling idea end to end so that the result is comparable to everything else on the dataset
 
 Context: a new order-book imbalance feature set, depthwise bonsai, five seeds, data resident on the GPU box.
 
 Steps:
-1. Edit `pipelines/imbalance-v2.yaml`: steps feature-imbalance -> select-topk -> cv-fit-bonsai -> bundle.
-2. `fy run --dataset <id> --pipeline pipelines/imbalance-v2.yaml --seeds 5 --executor gpubox` writes a trial row with code sha, env lock, host fingerprint, cutoff; steps cache by (inputs, config, code).
-3. The pipeline's last step writes a bundle (`model.msgpack` + `bundle.json`) into `blobs/`; `fy candidate add --trial <id> --exec-config exec/es-taker-a.yaml` writes a candidate row.
-4. `fy eval --candidate <id> --protocol <id>` runs the simulator harness-side and writes an eval row with the metric vector.
+1. Edit `recipes/imbalance-v2.yaml`: steps feature-imbalance -> select-topk -> bonsai-depthwise, train window 1y. The recipe implements fit/predict and knows nothing about folds.
+2. `fy run --dataset <id> --recipe recipes/imbalance-v2.yaml --protocol <id> --seeds 5 --executor gpubox`: the harness expands the protocol's schedule, writes one fit row per cutoff (memoized by dataset, recipe, train_range) and one predictions row per eval window and age, all on the resident session.
+3. `fy candidate add --dataset <id> --recipe <id> --exec-config exec/es-taker-a.yaml` names the prediction column to trade; `fy eval --candidate <id> --protocol <id>` runs the simulator harness-side and writes per-fold and aggregate eval rows.
 
-Ledger after: one trial, one candidate, one eval.
+Ledger after: N fits, N predictions, one candidate, N+1 evals.
 
-Done when: `fy trials --dataset <id>` lists the trial beside every earlier one with the same columns, and rerunning step 2 unchanged hits the cache for every step.
+Done when: `fy evals --dataset <id> --protocol <id>` lists the candidate beside every earlier one, and rerunning step 2 unchanged computes no fit.
 
 ## S4. Researcher compares the new candidate to the baseline so that the baseline moves only on evidence
 
@@ -66,12 +65,12 @@ Done when: `fy baseline --family ES --protocol <id>` names the candidate and the
 
 ## S5. Researcher asks what has been tried so that no idea is rerun or lost
 
-Context: three months into the campaign, 140 trials.
+Context: three months into the campaign, 140 fits.
 
 Steps:
-1. `fy trials --dataset <id> --sort sharpe` lists trials with pipeline name, seeds, metric vector, verdict against the baseline at the time.
+1. `fy fits --dataset <id> --sort sharpe` lists fits with recipe name, seeds, metric vector, verdict against the baseline at the time.
 2. `fy history --baseline ES/<protocol>` prints the chain of promotions with their decisions and rationales.
-3. `fy why <trial>` prints the pipeline, step configs and diffs against the baseline's trial.
+3. `fy why <fit>` prints the recipe, step configs and diffs against the baseline's fit.
 
 Ledger after: unchanged.
 
@@ -87,7 +86,7 @@ Steps:
 
 Ledger after: one decision, one deployment.
 
-Done when: `fy deployments --env prod-es` shows the bundle hash, and the bundle's `bundle.json` names the dataset, pipeline, protocol and metrics that justified it.
+Done when: `fy deployments --env prod-es` shows the bundle hash, and the bundle's `bundle.json` names the dataset, recipe, protocol and metrics that justified it.
 
 ## S7. Researcher refreshes a deployed model so that the incumbent is the bar to clear
 
@@ -105,21 +104,21 @@ Done when: the incumbent's eval on the new window exists before any challenger's
 
 ## S8. Agent runs a night of experiments so that the human reviews evidence, not transcripts
 
-Context: a contract file sets the protocol, a budget of 12 GPU-hours, a stop rule of 40 trials or three consecutive dominated comparisons, and "promotion requires a human".
+Context: a contract file sets the protocol, a budget of 12 GPU-hours, a stop rule of 40 fits or three consecutive dominated comparisons, and "promotion requires a human".
 
 Steps:
 1. `fy campaign open --dataset <id> --protocol <id> --contract contracts/night-1.yaml` writes the campaign and its contract.
-2. The agent loops S3 and S4 through the same CLI; each trial row carries the journal node (parent, plan, diff, outcome, is_buggy). Evals run harness-side; the eval window is outside the agent's writable tree.
-3. The run stops on the contract's rule. `fy campaign report <id>` prints trials, comparisons, cost and the incomparable set awaiting decisions.
+2. The agent loops S3 and S4 through the same CLI; each fit row carries the journal node (parent, plan, diff, outcome, is_buggy). Evals run harness-side; the eval window is outside the agent's writable tree.
+3. The run stops on the contract's rule. `fy campaign report <id>` prints fits, comparisons, cost and the incomparable set awaiting decisions.
 4. The human works through S4 step 3 on the incomparable set.
 
-Ledger after: one campaign, N trials with journal nodes, N comparisons, zero promotions.
+Ledger after: one campaign, N fits with journal nodes, N comparisons, zero promotions.
 
-Done when: every claim in the agent's report resolves to a trial id and an eval row, and nothing moved the baseline without a human decision.
+Done when: every claim in the agent's report resolves to a fit id and an eval row, and nothing moved the baseline without a human decision.
 
 ## S9. Researcher changes the simulator so that stale comparisons cannot pass as current
 
-Context: taker-sim 1.5 corrects fee handling.
+Context: taker-sim 1.5 corrects fee handling. No refit happens: evals derive from cached predictions.
 
 Steps:
 1. `fy protocol declare ... --sim taker-sim@1.5` yields a new protocol id.

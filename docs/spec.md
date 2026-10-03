@@ -1,64 +1,97 @@
-# forestry: design spec (draft 1, 2026-10-03)
+# forestry: design spec (draft 2, 2026-10-03)
 
-A local-first ledger for the lifecycle of experimentation on frozen datasets: compose pipelines, compare candidates under a declared protocol, move a baseline only through a recorded comparison, deploy, refresh. Agents and humans write to the same ledger. Companion: `reports/Forestry MLOps landscape survey.md`.
+A local-first ledger for the lifecycle of experimentation on frozen, time-ordered datasets: compose recipes, judge them under a declared protocol, move a baseline only through a recorded comparison, deploy, refresh. Agents and humans write to the same ledger. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
 
 ## Scope
 
-In: dataset recipes and hashes, pipeline composition and step caching, trials, economic evals, Pareto comparisons, human decisions, baselines, deployments, refreshes, remote execution on a GPU box or a pod, an agent journal. Out: a DAG runner (DVC or plain Python drives steps), a dashboard, the prod compile, feature stores, drift monitoring.
+In: dataset recipes and hashes, modeling recipes, protocols, memoized fits and predictions, economic evals, Pareto comparisons, human decisions, baselines, deployments, refreshes, remote execution on a GPU box or a pod, an agent journal. Out: a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
+
+## The pattern
+
+An experiment is a triple on three independent, content-addressed axes. Nothing on one axis references another; a harness composes them.
+
+| axis | holds | changes when |
+|---|---|---|
+| dataset | capture, filters, targets and horizons | new data or a labeling idea |
+| recipe | the fit/predict implementation and its config, including how much history to train on | a modeling idea |
+| protocol | schedule of cutoffs and eval windows, ages, embargo, sealed window, simulator and config, metrics, rule | a validation or eval idea |
+
+Two memo points keep the cross product from materializing. A fit is keyed by (dataset, recipe, train_range). A prediction set is keyed by (fit, eval_range). Evals derive from predictions plus simulator config, so an eval change refits nothing, and schedules that share a cutoff share the fit. Model bytes are optional: predictions and the fit key are kept always; bytes only for baselines, deployments and pins, since a fit is reproducible from its key, code sha and env lock.
+
+Comparability is "same dataset, same protocol". The harness refuses anything else.
+
+## Recipe contract
+
+```
+fit(session, train_range, config) -> model
+predict(model, session, range) -> predictions   # one column per target or horizon
+```
+
+`session` is the dataset resident on device; ranges are time-ordered row ranges. Feature construction, selection and the training window live inside `fit`, which may use less of `train_range` than it is given. Recipes are configs over a versioned step library; the library's code sha is in every fit key. A second contract, `fit_sequence(session, schedule, config) -> models`, exists for online or cross-fold ideas; a protocol lists the contracts it accepts. No third contract.
+
+## Protocol
+
+| field | meaning | default |
+|---|---|---|
+| schedule | cutoffs and eval windows, by calendar date | monthly cutoffs, one-month eval windows |
+| ages | eval windows at increasing distance from each cutoff, to measure decay | 1, 2, 3 months |
+| embargo | gap between train end and eval start | longest horizon; practice is day splits, so zero overlap |
+| min_folds | folds required before a comparison is valid | 3 |
+| sealed | final window scored once at decision time | last month of the dataset |
+| pass_rule | sealed-window metrics must fall inside the candidate's per-fold band | empirical fold range |
+| fail_outcome | chosen before unsealing: no deploy, deploy incumbent, or re-seal next month | no deploy |
+| simulator | name, version, config hash | |
+| metrics | vector, business-oriented (pnl, sharpe, max drawdown, turnover) | |
+| aggregate | over folds: concatenated series for pnl and sharpe, worst drawdown, equal weights | |
+| rule | pareto on the aggregate; tie policy human | |
+| contracts | fit/predict, fit_sequence | fit/predict |
+
+Any field change is a new protocol id. A scored sealed window becomes a public fold; time supplies the next seal.
 
 ## Objects
 
 | object | identity | fields |
 |---|---|---|
-| capture | hash(process, instrument, window) | process name and params, instrument, window [t0, t1), bytes hash, size, rows |
-| dataset | hash(capture, filters, target) | capture id, filter recipe, target definition and horizons, bytes hash; family = (process, instrument) |
-| pipeline | hash(step graph) | ordered steps, each: name, code sha, config hash, inputs |
-| protocol | hash(dataset id, window, simulator, sim config, metric names, rule) | eval dataset, eval window, simulator version and config, metric vector, dominance rule (pareto), tie policy (human) |
-| trial | uuid | dataset id, pipeline id, seeds, cutoff, code sha, env lock hash, host fingerprint, executor, cost, duration, status, parent trial |
-| candidate | hash(model bundle, execution config) | trial id, bundle hash, execution config hash |
-| eval | (candidate, protocol) | metric vector, per-fold or per-window values, run id |
-| comparison | uuid | challenger candidate, baseline candidate, protocol id, verdict: dominates / dominated / incomparable, decision id if human |
-| decision | integer, append-only | text rationale, comparison ids, kind: promote / reject / deploy / retire, prod feedback links |
+| capture | hash(process, instrument, window) | process params, instrument, window, bytes hash, rows |
+| dataset | hash(capture, filters, targets) | capture id, filter recipe, targets and horizons, bytes hash; family = (process, instrument) |
+| recipe | hash(step graph, config, library sha) | steps, config, contract |
+| protocol | hash(all fields above) | see table |
+| fit | hash(dataset, recipe, train_range) | code sha, env lock, host fingerprint, executor, cost, duration, bundle hash or null |
+| predictions | hash(fit, eval_range) | columns, blob hash |
+| candidate | hash(dataset, recipe, exec config) | which prediction column the simulator trades, execution params |
+| eval | (candidate, protocol, fold, age) | metric vector; aggregate rows flagged |
+| comparison | uuid | challenger, baseline, protocol, verdict: dominates / dominated / incomparable, decision id |
+| decision | integer, append-only | rationale, comparison ids, kind: promote / reject / deploy / retire / seal-pass / seal-fail, prod feedback links |
 | baseline | per (family, protocol) | current candidate, since decision |
-| deployment | uuid | bundle hash, target env, deployed at, retired at, decision id |
+| deployment | uuid | bundle hash, env, deployed at, retired at, decision id |
+| campaign | uuid | dataset, protocol, contract (budget, stop rule, approvals, fail_outcome) |
 
-Invariants: a baseline moves only through a comparison whose verdict is dominates or whose decision is promote. Two candidates compare only under one protocol id. A trial's inputs carry no rows past its cutoff. A changed simulator yields a new protocol id, so old comparisons go stale instead of silently comparable. Refutations are recorded comparisons, not deletions.
-
-## Dataset layers
-
-capture (sampling process, instrument, window) -> filtered (outliers, broken captures, blackouts) -> labeled (target, horizons). Each layer hashes its recipe and bytes. Features are pipeline steps, never dataset identity. Parquet is hashed as stored bytes once at freeze.
-
-## Pipelines and caching
-
-A step is a pure function of (input hashes, config hash, code sha). Cache key is that triple. Cache value is bytes on disk or "resident in this device session". A session holds a dataset on device across steps (CV, selection, fit) and records each step boundary without forcing a host round trip. The economic simulation is a step like any other.
+Invariants: a baseline moves only through a comparison with verdict dominates or a promote decision. Two candidates compare only under one protocol id and with at least min_folds folds each. No fit's train_range ends after its fold's eval start minus embargo. Nothing scores the sealed window before a seal decision. A simulator or schedule change is a new protocol, so old comparisons go stale rather than silently comparable. Refutations are comparison rows, never deletions.
 
 ## Workflows
 
-Campaign: freeze a dataset, declare a protocol, run trials, eval candidates, compare against the baseline, decide. Ends in a deploy or reject decision.
+Campaign: freeze dataset, declare protocol, run recipes (harness expands the schedule, memoizes fits and predictions on the resident session, runs the simulator, writes evals), compare against the baseline, decide, score the sealed window once, deploy or apply fail_outcome.
 
-Refresh: new capture from the same family with a later window, new dataset id, same or new protocol. The deployed candidate is seated as baseline. Same campaign otherwise.
+Deployment model: the protocol names it, last fold's fit or a refit on the full window after promotion; that refit is a fit with no eval.
 
-Comparison: compute the metric vector for both candidates under the protocol. Pareto dominance resolves automatically. Incomparable opens a decision for a human; its rationale is text; prod feedback attaches to it later so the rule can formalize from evidence.
+Refresh: new capture from the same family with a later window; the deployed candidate is seated as baseline and scored on the new folds first; the previous sealed month is now public; the newest month is sealed. Prod evals attach to the deploy decision as feedback.
+
+Comparison: dominance on the aggregate vector. Incomparable opens a human decision with a written rationale.
 
 ## Storage
 
-One directory in a git repo: `forestry.sqlite` (objects above), `blobs/sha256/` (bundles, manifests, eval outputs), `decisions.md` (rendered from the decision table). Run events are emitted as OpenLineage RunEvent JSON with a `forestry_*` facet pinned to a schema sha. The bundle is `model.msgpack` plus `bundle.json` (dataset id, pipeline id, feature list, execution config, protocol id, metric vector, code sha, env lock, host fingerprint).
+One git repo: `forestry.sqlite`, `blobs/sha256/` (predictions, bundles, manifests, eval outputs), `decisions.md` rendered from the decision table. Run events emitted as OpenLineage RunEvent JSON with a `forestry_*` facet pinned to a schema sha. Bundle: `model.msgpack` plus `bundle.json` (dataset, recipe, fit key, exec config, protocol, metric vector, code sha, env lock, host fingerprint).
 
 ## Execution
 
-One executor interface: submit(step graph, dataset ref) -> job handle with poll, logs, pull, teardown. Instances: local, ssh (the GPU box), runpod (REST v2 with stock ladder, idle watchdog that terminates, cost and duration into the trial). Host fingerprint on every trial: CPU model, cores, caches, RAM, GPU and driver, cgroup cpu.max and cpuset, container image digest.
+One executor interface: submit(work, dataset ref) -> handle with poll, logs, pull, teardown. Instances: local, ssh (the GPU box), runpod (REST v2 stock ladder, idle watchdog that terminates, cost and duration into the fit row). Host fingerprint on every fit.
 
 ## Agents
 
-An agent is a user of the CLI and Python API. The journal is the trial table plus a node record: parent, plan, diff, outcome, is_buggy, verdict. The eval split and simulator run harness-side, outside the agent's writable tree. A trial without a run id counts for nothing. A campaign carries a contract file the human writes first: protocol, budget, stop rule, what needs approval.
-
-## Not now
-
-Generic non-temporal splits. Multi-user server. Dashboard. Feature store. Drift monitoring. Prod compile. Cross-protocol comparison.
+An agent uses the CLI and Python API. The journal is a node per attempt: parent, plan, diff, fit ids, outcome, is_buggy, verdict. The harness owns ranges, the clock, the simulator and the sealed window; the agent writes `fit` and `predict`. A claim without an eval row counts for nothing. The campaign contract is written by the human first.
 
 ## Open
 
-1. Pareto with how many objectives before the incomparable set swamps the human; a cap or a priority order per protocol.
-2. Trial granularity for CV: one trial per fold set or one per seed.
-3. Whether bonsai's bench harness becomes forestry's first executor or stays a consumer.
-4. Minimum viable slice: capture, dataset, pipeline, trial, candidate, eval, comparison, baseline, decision on SQLite with the local executor; remote executors and the agent journal second.
+1. Objective count before the incomparable set swamps the human; a cap or priority order per protocol.
+2. Whether bonsai's bench harness becomes the first local executor or stays a consumer.
+3. Minimum slice: dataset, recipe, protocol, fit, predictions, candidate, eval, comparison, baseline, decision on SQLite with the local executor; remote executors and the journal second.
