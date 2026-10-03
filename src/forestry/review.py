@@ -53,7 +53,16 @@ def history(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
             if decision.get("comparison")
             else None
         )
-        out.append({**decision, "verdict": comparison["verdict"] if comparison else "seated"})
+        pipeline = ledger.get(Kinds.PIPELINE, cand["pipeline"])
+        out.append(
+            {
+                **decision,
+                "pipeline": pipeline["name"],
+                "head": cand["head"],
+                "exec": cand["exec"],
+                "how": comparison["verdict"] if comparison else "seated",
+            }
+        )
     return out
 
 

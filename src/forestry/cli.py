@@ -30,7 +30,8 @@ from forestry.ledger import Ledger
 
 DEFAULT_ROOT = ".forestry"
 TYPE_KEY = "__type__"
-BOARD_COLUMNS = ("seq", "id", "pipeline", "head", "exec", "stage", "status", "reason")
+BOARD_COLUMNS = ("seq", "id", "pipeline", "head", "exec", "stage", "status", "reason", "metrics")
+HISTORY_COLUMNS = ("decision", "candidate", "pipeline", "head", "exec", "how", "why")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,11 +93,11 @@ def _dispatch(args: argparse.Namespace, ledger: Ledger) -> int:
         )
     elif args.command == "board":
         _, evaluation = _campaign(args)
-        print(_table(review.board(ledger, evaluation)))
+        print(_table(BOARD_COLUMNS, review.board(ledger, evaluation)))
     elif args.command == "history":
         _, evaluation = _campaign(args)
-        for row in review.history(ledger, evaluation):
-            print(f"{row['candidate'][:8]}  {row['verdict']}  {row['why']}")
+        rows = [{**r, "decision": r["id"]} for r in review.history(ledger, evaluation)]
+        print(_table(HISTORY_COLUMNS, rows))
     elif args.command == "seal":
         _, evaluation = _campaign(args)
         current = review.baseline(ledger, evaluation)
@@ -146,15 +147,20 @@ def _load(spec: str) -> Any:
     return getattr(module, name) if name else module
 
 
-def _table(rows: list[dict[str, Any]]) -> str:
-    cells = [
-        [_cell(row.get(c)) for c in BOARD_COLUMNS] + [_metrics(row["metrics"])] for row in rows
-    ]
-    header = [*BOARD_COLUMNS, "metrics"]
-    widths = [max(len(h), *(len(r[i]) for r in cells)) for i, h in enumerate(header)]
-    lines = ["  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True))]
-    lines += ["  ".join(c.ljust(w) for c, w in zip(r, widths, strict=True)) for r in cells]
-    return "\n".join(lines)
+def _table(columns: tuple[str, ...], rows: list[dict[str, Any]]) -> str:
+    cells = [[_cell(row.get(c)) for c in columns] for row in rows]
+    widths = [max(len(c), *(len(r[i]) for r in cells)) for i, c in enumerate(columns)]
+
+    def line(left: str, mid: str, right: str) -> str:
+        return left + mid.join("─" * (w + 2) for w in widths) + right
+
+    def row(values: list[str]) -> str:
+        return "│ " + " │ ".join(v.ljust(w) for v, w in zip(values, widths, strict=True)) + " │"
+
+    body = [row(r) for r in cells] or [row([""] * len(columns))]
+    return "\n".join(
+        [line("┌", "┬", "┐"), row(list(columns)), line("├", "┼", "┤"), *body, line("└", "┴", "┘")]
+    )
 
 
 def _cell(value: Any) -> str:
@@ -162,7 +168,7 @@ def _cell(value: Any) -> str:
         return ""
     if isinstance(value, dict):
         return " ".join(
-            f"{k}={v:g}" if isinstance(v, float) else f"{k}={v}"
+            f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}"
             for k, v in value.items()
             if k != TYPE_KEY
         )

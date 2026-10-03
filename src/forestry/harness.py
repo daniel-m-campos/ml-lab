@@ -590,15 +590,12 @@ def _gate_vs_baseline(ledger: Ledger, evaluation: Evaluation, cand: dict[str, An
         return
     comparison = compare(ledger, cand["id"], evaluation)
     if comparison["verdict"] == Verdict.DOMINATES:
+        margin = _margin(comparison, evaluation.directions, evaluation.rule)
         decision = _decision(
-            ledger,
-            kind="promote",
-            why="dominates the baseline",
-            candidate=cand["id"],
-            comparison=comparison["id"],
+            ledger, kind="promote", why=margin, candidate=cand["id"], comparison=comparison["id"]
         )
         _set_baseline(ledger, evaluation.id, evaluation.dataset, cand["id"], decision)
-        ledger.update(Kinds.CANDIDATE, cand["id"], status=Status.ADVANCED, reason="dominates")
+        ledger.update(Kinds.CANDIDATE, cand["id"], status=Status.ADVANCED, reason=margin)
         ledger.update(Kinds.COMPARISON, comparison["id"], decision=decision)
     elif comparison["verdict"] == Verdict.DOMINATED:
         ledger.update(
@@ -790,6 +787,22 @@ def _fold_bands(
     return {
         m: (min(r["metrics"][m] for r in rows), max(r["metrics"][m] for r in rows)) for m in names
     }
+
+
+def _margin(comparison: dict[str, Any], directions: dict[str, str], rule: Rule) -> str:
+    """One phrase naming what decided a dominating comparison, e.g. ``pnl +2.4% over 09a18fbf``."""
+    a, b = comparison["challenger_metrics"], comparison["baseline_metrics"]
+    over = f"over {comparison['baseline'][:8]}"
+
+    def relative(m: str) -> float:
+        sign = 1.0 if directions[m] == "max" else -1.0
+        return sign * (a[m] - b[m]) / max(abs(b[m]), 1e-12)
+
+    if rule.kind == "priority":
+        decider = next(m for m in rule.order if abs(relative(m)) > rule.band)
+        return f"{decider} {relative(decider):+.1%} {over}"
+    better = [m for m in directions if relative(m) > 0]
+    return f"better on {', '.join(better)} {over}"
 
 
 def _ranked(
