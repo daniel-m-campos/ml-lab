@@ -6,6 +6,7 @@ import dataclasses
 
 import numpy as np
 
+from forestry import formats
 from forestry.declare import scorer, step
 from forestry.session import Range, Session, add_months
 
@@ -86,6 +87,17 @@ def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray
     return features(session, rng) @ model.weights + model.bias
 
 
+@step(format=formats.Format.ARROW_ARRAYS)
+def ridge_save(model: RidgeModel) -> bytes:
+    return formats.arrays_save({"weights": model.weights, "bias": np.array([model.bias])})
+
+
+@step
+def ridge_load(payload: bytes) -> RidgeModel:
+    arrays = formats.arrays_load(payload)
+    return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
+
+
 # bonsai ===========================================================================================
 
 
@@ -119,6 +131,18 @@ def bonsai_fit(session: Session, train: Range, config: BonsaiConfig):
 @step
 def bonsai_predict(model, session: Session, rng: Range) -> np.ndarray:
     return model.predict(features(session, rng))
+
+
+@step(format="bonsai-msgpack")
+def bonsai_save(model) -> bytes:
+    return formats.bytes_via_file(model.save, ".msgpack")
+
+
+@step
+def bonsai_load(payload: bytes):
+    import bonsai
+
+    return formats.load_via_file(payload, bonsai.BonsaiRegressor.from_file, ".msgpack")
 
 
 # Scorers ==========================================================================================

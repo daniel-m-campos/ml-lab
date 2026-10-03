@@ -5,17 +5,19 @@ Skipped when the Kaggle data is absent.
 
 from __future__ import annotations
 
+import io
 import os
 import pathlib
 import subprocess
 import sys
 
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "examples"))
 
-from forestry import harness  # noqa: E402
 from forestry.ledger import Ledger  # noqa: E402
 from optiver import capture, declarations  # noqa: E402
 
@@ -46,10 +48,14 @@ def fy(root: pathlib.Path, *argv: str) -> str:
     return done.stdout
 
 
-def test_the_capture_is_time_ordered_with_a_null_free_target(root, dataset):
-    row = Ledger.open(root).get("dataset", dataset)
+def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
+    ledger = Ledger.open(root)
+    event = ledger.latest("dataset_frozen", dataset)
+    table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
+    assert table.num_rows > 100_000 and table.num_rows == event["payload"]["rows"]
+    assert not pc.any(pc.is_nan(table[capture.TARGET])).as_py()
+    row = ledger.sql("SELECT process, instrument FROM dataset")[0]
     assert (row["process"], row["instrument"]) == (capture.PROCESS, capture.INSTRUMENT)
-    assert row["rows"] > 100_000
 
 
 def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
@@ -63,9 +69,26 @@ def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
     assert '"config_diff"' in fy(root, "board", *campaign, "ridge_1m")
 
 
-def test_a_rerun_computes_nothing(root, dataset):
+def test_a_rerun_appends_one_event_and_keeps_the_baseline(root, dataset):
     ledger = Ledger.open(root)
-    evaluation = declarations.evaluation(dataset)
-    report = harness.run(ledger, declarations.pipelines, evaluation)
-    assert report.fits_computed == 0
-    assert harness.baseline(ledger, evaluation) is not None
+    before = len(ledger.events())
+    out = fy(root, "run", DECL, "--dataset", dataset)
+    assert "fits 0, predictions 0, entries 0" in out
+    assert [e["type"] for e in ledger.events()[before:]] == ["run_started"]
+    assert "baseline" in fy(root, "board", DECL, "--dataset", dataset)
+
+
+@pytest.mark.skipif(not declarations.bonsai_available, reason="bonsai not installed")
+def test_a_bonsai_model_blob_opens_with_bonsai_alone(root, dataset, tmp_path):
+    import bonsai
+
+    ledger = Ledger.open(root)
+    fits = [
+        f
+        for f in ledger.events("fit_computed")
+        if f["payload"]["model"]["format"] == "bonsai-msgpack"
+    ]
+    assert fits
+    path = tmp_path / "model.msgpack"
+    path.write_bytes(ledger.get_blob(fits[0]["payload"]["model"]["sha"]))
+    assert bonsai.load(str(path)).n_iters > 0

@@ -2,8 +2,6 @@ __pycache__/
 *.sqlite
 blobs/
 .venv/
-.forestry-toy/
-.venv/
 *.egg-info/
 data/
 .forestry-optiver/

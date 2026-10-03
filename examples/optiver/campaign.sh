@@ -6,6 +6,7 @@ cd "$(dirname "$0")/../.."
 [ -x .venv/bin/fy ] && PATH=".venv/bin:$PATH"
 command -v fy >/dev/null || { echo "fy not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
 export PYTHONPATH=examples FORESTRY_ROOT=.forestry-optiver
+export FORESTRY_ACTOR="${FORESTRY_ACTOR:-$USER}"
 
 echo "== freeze"
 DS=$(fy freeze optiver.capture:freeze "${1:-20}")

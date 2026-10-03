@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv
 
-from forestry import data
+from forestry import data, formats
 from forestry.declare import step
 from forestry.ledger import Ledger
 from forestry.session import Session
@@ -38,14 +38,16 @@ def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Sess
         + CLOSE_AUCTION_START_S
         + table["seconds_in_bucket"].to_numpy()
     )
-    order = np.lexsort((table["stock_id"].to_numpy(), seconds))
-    ts = np.datetime64(BASE_DATE, "s") + seconds[order].astype("timedelta64[s]")
-    columns = {
-        name: table[name].to_numpy(zero_copy_only=False).astype(np.float64)[order]
-        for name in table.column_names
-        if name not in DROPPED
-    }
-    return Session(ts, columns)
+    order = pa.array(np.lexsort((table["stock_id"].to_numpy(), seconds)))
+    ts = np.datetime64(BASE_DATE, "s") + seconds.astype("timedelta64[s]")
+    kept = table.drop_columns(list(DROPPED)).append_column("ts", pa.array(ts, pa.timestamp("s")))
+    floats = pa.table(
+        {
+            name: pc.cast(kept[name], pa.float64()) if name != "ts" else kept[name]
+            for name in kept.column_names
+        }
+    )
+    return formats.session_from_table(floats.take(order))
 
 
 @step

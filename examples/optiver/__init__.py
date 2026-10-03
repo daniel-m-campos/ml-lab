@@ -8,5 +8,7 @@ about thirty trading days wide.
 Data: ``data/optiver/optiver-trading-at-the-close/train.csv`` (Kaggle, competition rules or a
 public mirror). Run ``examples/optiver/campaign.sh 20``; the script is the template, the modules
 here are the per-project code: ``capture`` (how to read the raw data), ``steps`` (features,
-models, scorers), ``declarations`` (the pipelines and the evaluation).
+models, scorers, and how a model becomes bytes), ``declarations`` (the pipelines and the
+evaluation). The dataset and predictions are Parquet; ridge models are Arrow arrays; bonsai
+models are bonsai's own msgpack, so every blob opens without this environment.
 """

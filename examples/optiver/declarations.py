@@ -11,6 +11,8 @@ ridge = Pipeline(
     name="ridge_3m",
     fit=steps.ridge_fit,
     predict=steps.ridge_predict,
+    save=steps.ridge_save,
+    load=steps.ridge_load,
     config=steps.RidgeConfig(train_window_months=3, alpha=1.0),
 )
 ridge_windows = [ridge.with_config(train_window_months=m).named(f"ridge_{m}m") for m in (1, 3, 6)]
@@ -19,6 +21,8 @@ bonsai_depthwise = Pipeline(
     name="bonsai_dw",
     fit=steps.bonsai_fit,
     predict=steps.bonsai_predict,
+    save=steps.bonsai_save,
+    load=steps.bonsai_load,
     config=steps.BonsaiConfig(
         train_window_months=3,
         grower="depthwise",
