@@ -48,7 +48,7 @@ def main() -> int:
     _show("board after stage 1", review.board(ledger, evaluation))
 
     for row in review.board(ledger, evaluation):
-        if row["status"] != "pending":
+        if row["status"] != "pending" or row["stage"] != 0:
             continue
         corr = row["metrics"]["corr"]
         harness.gate(ledger, row["id"], advance=corr >= args.min_corr, why=f"corr {corr:.3f}")
