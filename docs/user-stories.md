@@ -1,59 +1,65 @@
 # User stories
 
-Each story: a context, the steps as `fy` commands, what the ledger holds afterwards, and when it is done. Pipelines are named by name when unique, else by id prefix.
+Each story: a context, the steps as `fy` commands, what the ledger holds afterwards, and when it is done. `C="project.declarations --dataset $DS"` throughout. Pipelines are named by name when unique, else by id prefix.
 
-## S1: freeze a dataset
+## S1: open the dataset account
 
 Context: a new month of order-book captures for one instrument and sampling process.
 
-1. `DS=$(fy freeze project.capture:freeze <args>)` calls the project's freeze function: it loads the rows, applies the declared filters, checks the targets and writes one dataset row (process, params, instrument, window, filters, targets, rows, blob).
+1. `DS=$(fy freeze project.capture:freeze <args>)` loads the rows, applies the declared filter steps, checks the targets, stores the bytes under their sha and writes one dataset row with the recipe.
 2. The same call with the same inputs returns the same id and writes nothing.
 
-Ledger after: one dataset, one blob.
+Ledger after: one dataset row, one blob.
 
 Done when: the printed id is stable across reruns.
 
-## S2: run the pipelines
+## S2: the first run opens the evaluation and posts entries
 
-Context: `project/declarations.py` lists the pipelines and declares the evaluation (schedule, scorer, scorer config, min_folds).
+Context: `project/declarations.py` lists the pipelines and declares the evaluation.
 
-1. `fy run project.declarations --dataset $DS` expands the schedule to folds, fits once per (pipeline, cutoff), predicts once per (fit, eval window), and writes one score row per pipeline holding every fold's vector and one aggregate per age.
-2. Rerunning computes nothing. Adding a pipeline to the module and rerunning fits only the new one.
+1. `fy run $C` writes the evaluation row, its metrics with directions, and the schedule as fold and eval_window rows; then a run row with the git commit, dirty flag, environment lock and host; then, per pipeline, fits per cutoff, predictions per eval window, and one entry with fold_score and aggregate_score rows.
+2. `fy run $C` again posts a new run whose entries reuse every fit and prediction. Adding a pipeline to the module fits only the new one.
 
-Ledger after: one evaluation, N pipelines, N score rows, fits, predictions.
+Ledger after: one evaluation, N pipelines, two runs, 2N entries, fits, predictions.
 
-Done when: the second run prints `fits 0, predictions 0`.
+Done when: the second run prints zero fits and zero predictions.
 
 ## S3: seat the incumbent and decide
 
 Context: one of the pipelines is the model in production.
 
-1. `fy decide project.declarations --dataset $DS ridge_3m --kind promote --why "incumbent"` records the first promotion; the baseline is now whatever was promoted last.
-2. `fy board project.declarations --dataset $DS` shows every scored pipeline with its Pareto verdict and relative delta per metric against the baseline. Reading it writes nothing.
-3. The person records `fy decide ... bonsai_lw --kind promote --why "..."` or `--kind reject --why "..."`. The decision row keeps the verdict and deltas it was made against.
+1. `fy decide $C ridge_3m --kind promote --why "incumbent"` writes a decision on that pipeline's latest entry with nothing to compare against. The baseline view resolves to it.
+2. `fy board $C` reads the comparison view: each pipeline's latest entry against the baseline, Pareto verdict, relative delta per metric. Reading writes nothing.
+3. `fy decide $C bonsai_lw --kind promote --why "..."` or `--kind reject --why "..."` writes a decision carrying the baseline entry, verdict and deltas it saw.
 
-Done when: `fy history` shows the chain of promotions, each with what it was made against.
+Done when: `fy history $C` shows the promotes in order, each with what it was made against, and the old baseline reads as superseded.
 
 ## S4: a scoring idea
 
 Context: the cost assumption in the simulator changes.
 
 1. Edit the scorer config in `declarations.py`; the evaluation id changes.
-2. `fy run` again: zero fits, every candidate rescored under the new evaluation.
-3. `fy decide` refuses a pipeline that has no score under the new evaluation.
+2. `fy run $C`: a new evaluation account, zero fits, every pipeline rescored from its memoized predictions.
+3. `fy decide` on the new evaluation starts its own baseline; entries under the old evaluation are untouched and never compare across.
 
-Done when: both evaluations' boards are readable and nothing is overwritten.
+Done when: both boards read and nothing was overwritten.
 
-## S5: iteration 100
+## S5: code evolves
+
+Context: a feature in `steps.py` changes.
+
+1. Commit, `fy run $C`. Git reports which step files moved since each fit's commit; the pipelines that use them refit at HEAD as new fit rows and post new entries in the new run. The rest reuse.
+2. `fy board $C` shows the new entries. Decisions made on the old entries stand, pointing at their run and commit.
+
+Done when: the board's deltas reflect the new code and `fy board $C <pipeline>` shows both entries' runs.
+
+## S6: iteration 100
 
 Context: three months in.
 
-1. `fy board` lists every scored pipeline with status, verdict and deltas against the baseline, aggregate metrics and the last recorded reason.
-2. `fy history` prints the promotions in order.
-3. `fy board <pipeline>` prints one pipeline: config against the baseline's, per-fold scores, every decision on it.
+1. `fy board $C` lists every pipeline's latest entry with status, verdict, deltas, aggregate metrics and the last recorded reason.
+2. `fy history $C` prints the promotes in order.
+3. `fy board $C <pipeline>` prints one pipeline: config against the baseline's, per-fold scores, every entry with its commit, every decision on it.
+4. To reproduce a score: its run names the commit and environment, its fit names the dataset blob and train range. Check out, load, rerun the declaration.
 
-Done when: a newcomer can say what was tried, why each one lost, and what moved the baseline, from the ledger alone.
-
-## Later
-
-Stories removed with draft 4, kept as one line each: a staged funnel with recorded gates (S6), a sealed held-out month scored once (S7), deploy with a bundle naming its justification (S8), refresh seating the deployed candidate on the next dataset (S9), an agent campaign under a written contract (S10). Reopeners are in `docs/spec.md`, section "Later".
+Done when: a newcomer can say what was tried, why each one lost, what moved the baseline, and can rebuild any number, from the ledger and git alone.

@@ -1,87 +1,114 @@
-# forestry: design spec (draft 5, 2026-10-03)
+# forestry: design spec (draft 6, 2026-10-03)
 
-A local-first ledger for experimentation on frozen, time-ordered datasets. It records what was tried, under which evaluation, with what scores, and which recorded decision moved the baseline. People and agents write to the same ledger. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
-
-Drafts 4 and 5 trim draft 3 to record keeping. Staged funnels, gates, ordering rules, tune steps, heads, the sealed window, deployment bundles, campaign contracts, and then the capture layer, candidate, comparison and baseline tables were built, found to be more surface than record, and removed; the first group is listed under "Later" with what would bring each back, the second became derived views.
+A local-first ledger for experimentation on frozen, time-ordered datasets. Git owns the code, a content-addressed blob store owns the bytes, a relational ledger owns what happened and what was decided. Nothing in the ledger is updated in place. People and agents write to the same ledger through the same five commands. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
 
 ## Scope
 
-In: dataset layers and hashes, pipeline and evaluation declarations, memoized fits and predictions, per-fold scores and aggregates, comparisons against a baseline, recorded decisions, read-back views, a shell command line. Out: automation that moves a baseline, a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
+In: frozen datasets, pipeline and evaluation declarations, runs that memoize fits and predictions, per-fold and aggregate scores, decisions that move a baseline, read-back views, a shell command line. Out: automation that moves a baseline, a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
 
-## The pattern
+## Three systems and a boundary
 
-An experiment is a triple on three independent, content-addressed axes. Nothing on one axis references another; the harness composes them.
-
-| axis | holds | changes when |
+| concern | owner | what the ledger stores |
 |---|---|---|
-| dataset | process, params, instrument, window, filters, targets | new data or a labeling idea |
-| pipeline | `fit` and `predict` steps and their config, including the training window | a modeling idea |
-| evaluation | dataset id, scorer and its config, first cutoff, cadence, eval window, ages, embargo, min_folds | a validation or scoring idea |
+| code | git | on every run: commit, dirty flag, environment lock, host |
+| bytes | the blob store, `blobs/sha256/` | dataset rows, models, predictions, each under its sha |
+| facts | the ledger, `forestry.sqlite` | accounts and entries, below |
 
-Two memo points keep the cross product from materializing. A fit is keyed by (dataset, pipeline, train_range). Predictions are keyed by (fit, eval_range). Scores derive from predictions, the session's columns over the eval range and the scorer's config, so a scoring change refits nothing.
+The ledger never stores what a function is, only how to find it: a dotted path inside a declaration. It never stores a file hash of code; it asks git. The three declarations (dataset recipe, pipeline, evaluation) are opaque documents whose canonical serialization is their identity. Everything else is a column.
 
-A pipeline under an evaluation has one score row. Comparability is "same evaluation id"; a decision can only be recorded on a pipeline scored under that evaluation.
+## Declarations
 
-## Contracts
+A pipeline is `fit(session, train_range, config) -> model` and `predict(model, session, range) -> predictions`. A scorer is `score(predictions, session, range, config) -> series`, one row per prediction, plus `metrics(series) -> {name: value}` and a direction per metric, declared once on the scorer. The same `metrics` runs per fold and over the concatenated folds, so the aggregate needs no second definition.
 
-```
-fit(session, train_range, config) -> model
-predict(model, session, range) -> predictions
-score(predictions, session, range, config) -> series      # one row per prediction
-metrics(series) -> {name: value}                          # declared on the scorer
-```
+`session` is the frozen dataset's columns, resident in memory, read by row range; it is not any library's object. Anything that learns from data lives inside `fit` over `train_range`: features, binning, scaling, the training window. Declarations are frozen dataclasses referencing step and scorer functions by dotted path. Formatting changes nothing, a value change changes the id, a pipeline's name is a label outside the hash. No YAML, no closures.
 
-`session` is the frozen dataset's raw columns, resident in memory; it is not any library's object. Anything that learns from data lives inside `fit` over `train_range`: features, binning, scaling, the training window. Bin edges are a fit artifact, refit per fold. A scorer returns a per-row series (pnl and flips, or prediction and truth) and declares `metrics` and a direction per metric. The same `metrics` runs per fold and over the concatenated folds, so the aggregate needs no second definition.
+Identity is declaration only. A behaviour change in code is a declared change: a version field in the config, or a new step name. The memo rule below catches the undeclared ones.
 
-Declarations are frozen dataclasses referencing registered step and scorer functions. An object is hashed by its canonical serialization: formatting changes nothing, a value change changes the id, a pipeline's name is a label outside the hash. No YAML, no closures. The step library's file sha is in every fit row.
+## Schema
 
-## Objects
+Accounts are set up once and content-addressed. Entries are posted by runs.
 
-| object | identity | fields |
+### Accounts
+
+| table | key | columns |
 |---|---|---|
-| dataset | hash(process, params, instrument, window, filters, targets) | rows, blob |
-| pipeline | hash(fit, predict, config) | name, declaration, pickle |
-| evaluation | hash(all fields) | declaration, pickle |
-| fit | hash(dataset, pipeline, train_range) | cutoff, code sha, env lock, host fingerprint, duration, model blob |
-| predictions | hash(fit, range) | fold, age, blob |
-| score | hash(pipeline, evaluation) | one vector per (fold, age); one aggregate per age |
-| decision | integer, append-only | kind (promote, reject), why, pipeline, evaluation, against: the baseline at the time with verdict and relative deltas |
+| dataset | dataset_id = hash(recipe) | process, instrument, window_start, window_end, rows, blob_sha, recipe (document: params, filter paths, targets) |
+| pipeline | pipeline_id = hash(declaration) | name, declaration (document: fit path, predict path, config) |
+| evaluation | evaluation_id = hash(declaration) | dataset_id FK, first_cutoff, every_months, eval_months, embargo_seconds, min_folds, declaration (document: scorer path, config) |
+| evaluation_metric | (evaluation_id, metric) | direction |
+| fold | (evaluation_id, fold_index) | cutoff, train_start, train_end |
+| eval_window | (evaluation_id, fold_index, age) | range_start, range_end |
 
-Nothing is updated in place. The baseline is the latest promote decision under the evaluation. A pipeline's status (scored, baseline, superseded, rejected) is derived from the decisions. A comparison is a function of two aggregates, computed on read; the decision row keeps the one it acted on.
+### Entries
 
-Invariants: a baseline moves only through a promote decision. A decision needs a score under the same evaluation. No fit's train_range ends after its fold's eval start minus the embargo. A scorer or schedule change is a new evaluation, so old scores stay readable and never compare across. Nothing is deleted.
+| table | key | columns |
+|---|---|---|
+| host | host_id | hostname, system, machine, cpu_count, cgroup_cpu_max, python |
+| run | run_id | evaluation_id FK, git_commit, git_dirty, env_lock, host_id FK, at |
+| fit | fit_id | dataset_id FK, pipeline_id FK, train_start, train_end, git_commit, duration_s, model_sha |
+| prediction | prediction_id | fit_id FK, range_start, range_end, blob_sha |
+| entry | (run_id, pipeline_id) | the transaction: this pipeline was scored in this run |
+| fold_score | (run_id, pipeline_id, fold_index, age, metric) | value |
+| aggregate_score | (run_id, pipeline_id, age, metric) | value |
+| decision | decision_id (serial) | run_id, pipeline_id (FK entry), kind (promote, reject), why, against_run_id, against_pipeline_id, verdict, at |
+| decision_delta | (decision_id, metric) | relative_delta |
 
-## Workflow
+### Views
 
-Freeze a dataset. Declare pipelines and one evaluation in a Python module. `run` fits, predicts and scores every pipeline, memoized. `decide promote` seats the incumbent. `board` shows every scored pipeline with its verdict and per-metric deltas against the baseline. A person or an agent reads it and records `promote` or `reject` with a reason. `history` is the chain of promotions; `board <pipeline>` is one pipeline in full.
+| view | definition |
+|---|---|
+| latest_entry | per (evaluation, pipeline), the entry from the newest run |
+| baseline | per evaluation, the entry of the last promote decision |
+| status | per entry: baseline, superseded, rejected, scored, from its decisions |
+| comparison | latest_entry aggregates against the baseline's, with the direction from evaluation_metric: verdict and relative delta per metric |
+
+The board is `comparison`. Foreign keys are enforced. The only non-atomic columns are the three declaration documents.
+
+## Rules
+
+Memo: a fit is reused for (dataset, pipeline, train range) unless git reports that the pipeline's step files changed between the fit's commit and HEAD; then it is fit again at HEAD as a new fit row. Predictions are reused per (fit, range). A dirty worktree is recorded and warned about, not refused.
+
+Comparability: an entry compares only against the baseline of its own evaluation. A scorer or schedule change is a new evaluation, so old entries stay readable and never compare across.
+
+Decisions: a baseline moves only through a promote decision. A decision is made on one entry and carries the baseline entry, verdict and deltas it saw. Reject closes an entry. Nothing is deleted; a refutation is a new decision.
+
+Embargo: no fit's train range ends after its fold's eval start minus the embargo. The fold table is written once and is the proof.
+
+## From inception to experimentation
+
+1. A project is three modules in a git repo: how to read the raw data, the steps, the declarations (`pipelines` and `evaluation(dataset)`).
+2. `fy freeze` opens the dataset account: load, filter, check targets, store the rows under their sha, write one row. Same recipe, same id, no write.
+3. The first `fy run` opens the evaluation account: the evaluation row, its metrics and directions, the schedule expanded once into folds and eval windows.
+4. Every `fy run` posts a run (commit, dirty, env, host) and one entry per declared pipeline, fitting and predicting only what the memo rule does not cover.
+5. `fy decide <pipeline> --kind promote --why "incumbent"` seats the first baseline.
+6. Add a `Pipeline` to the declarations, commit, `fy run`. `fy board` reads the comparison view. `fy decide` records promote or reject with a reason; `fy history` is the chain of promotes; `fy board <pipeline>` is one pipeline in full.
+7. Code evolves: git names the step files that moved, affected pipelines refit in a new run, old entries and their decisions stand, pointing at their commit.
+8. Any score joins to its run, commit and environment, and to the fit's dataset blob and train range. Check out, load, rerun.
+
+## Command line
 
 ```
-DS=$(fy freeze optiver.capture:freeze 20)
-C="optiver.declarations --dataset $DS"
+DS=$(fy freeze project.capture:freeze <args>)
+C="project.declarations --dataset $DS"
 fy run $C
-fy decide $C ridge_3m --kind promote --why "incumbent"
+fy decide $C <pipeline> --kind promote --why "incumbent"
 fy board $C
-fy decide $C bonsai_lw --kind promote --why "pnl +7.6%, drawdown accepted"
+fy board $C <pipeline>
+fy decide $C <pipeline> --kind promote|reject --why "..."
 fy history $C
 ```
 
-Per project, three modules: how to read the raw data, the steps (features, models, scorers), the declarations (pipelines and the evaluation). Per idea, one more `Pipeline` in the declarations and `fy run` again.
-
-## Storage
-
-One directory: `forestry.sqlite` (seven tables, JSON bodies, insert only) and `blobs/sha256/` (datasets, models, predictions). Rows are few, so filtering happens in Python.
+Five verbs. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`.
 
 ## Later
 
-Each item was removed from draft 3 and returns only with a reason written here first.
+Each item returns only with a reason written here first.
 
 | item | reopener |
 |---|---|
-| ordering rule for incomparable sets (priority order with a band) | when reading the board's deltas by hand costs more than the rule hides; the band made dominance intransitive, so any rule needs a seating story |
-| staged scoring with gates (fit metrics, quick sim, full sim) | when a full simulation is expensive enough that screening must be recorded, not just done; until then two evaluations do it |
-| execution config grids | when one fit must be scored under several thresholds in one evaluation; today a threshold is scorer config, so a different threshold is a different evaluation |
-| tune step, heads | when a refresh tunes knobs per fold or a grid over readouts is the bottleneck; today a different n_iters is a different pipeline |
+| ordering rule for incomparable sets | when reading the board's deltas by hand costs more than a rule hides; a band makes dominance intransitive, so a rule needs a seating story |
+| staged scoring with recorded gates | when a full simulation is expensive enough that screening must be recorded; until then two evaluations do it |
+| execution config grids, tune steps, heads | when one fit must be scored under several settings in one evaluation; today a different setting is a different evaluation or pipeline |
 | sealed window with a pass rule | when a deploy decision needs a one-shot held-out month; today a second evaluation whose schedule covers it |
-| deploy, bundle, refresh seating | when a candidate goes to production from the ledger |
-| remote executors (ssh, RunPod), agent journal, OpenLineage events | when a run leaves the laptop |
-| capture layer under the dataset, candidate, comparison and baseline tables | when raw bytes must be shared across filter variants, or when a derived status is too slow to compute on read |
+| deploy, bundle, refresh seating | when a pipeline goes to production from the ledger |
+| remote executors, agent journal, lineage events, a blob remote | when a run leaves the laptop |
