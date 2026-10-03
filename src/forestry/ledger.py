@@ -22,19 +22,13 @@ from forestry import hashing
 class Kinds:
     """Object kinds, one table each."""
 
-    CAPTURE: Final = "capture"
     DATASET: Final = "dataset"
     PIPELINE: Final = "pipeline"
     EVALUATION: Final = "evaluation"
     FIT: Final = "fit"
     PREDICTIONS: Final = "predictions"
-    CANDIDATE: Final = "candidate"
     SCORE: Final = "score"
-    COMPARISON: Final = "comparison"
     DECISION: Final = "decision"
-    BASELINE: Final = "baseline"
-    DEPLOYMENT: Final = "deployment"
-    CAMPAIGN: Final = "campaign"
 
 
 ALL_KINDS = tuple(v for k, v in vars(Kinds).items() if k.isupper())
@@ -77,17 +71,6 @@ class Ledger:
         )
         self._db.commit()
         return True
-
-    def update(self, kind: str, id: str, **changes: Any):
-        """Replace fields on an existing row."""
-        row = self.get(kind, id)
-        if row is None:
-            raise KeyError(f"{kind} {id} not found")
-        row.update(changes)
-        self._db.execute(
-            f"UPDATE {kind} SET body = ? WHERE id = ?", (json.dumps(row, default=_jsonable), id)
-        )
-        self._db.commit()
 
     def get(self, kind: str, id: str) -> dict[str, Any] | None:
         cur = self._db.execute(f"SELECT body FROM {kind} WHERE id = ?", (str(id),))

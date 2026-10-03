@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One Optiver campaign: freeze, run, seat the incumbent, compare the rest.
+# One Optiver campaign: freeze, run, seat the incumbent, read the board.
 # Usage: examples/optiver/campaign.sh [stocks]   ("all", a count such as "20", or "0,1,2,3")
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -14,16 +14,14 @@ echo "dataset $DS"
 
 echo "== run"
 fy run $C
-fy board $C
 
-echo "== seat the incumbent"
+echo "== seat the incumbent, then read every pipeline against it"
 fy decide $C ridge_3m --kind promote --why "incumbent: the model in production" >/dev/null
-
-echo "== compare every scored candidate to it"
-fy compare $C
+fy board $C
 
 echo "== history"
 fy history $C
 
 echo
-echo "Next: read the comparisons, then  fy decide $C <pipeline> --kind promote|reject --why '...'"
+echo "Next: fy board $C <pipeline> for one in detail, then"
+echo "      fy decide $C <pipeline> --kind promote|reject --why '...'"

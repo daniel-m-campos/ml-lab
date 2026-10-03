@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 
-from forestry.declare import Evaluation, Pipeline, Schedule
+from forestry.declare import Evaluation, Pipeline
 from optiver import steps
 
 ridge = Pipeline(
@@ -38,15 +38,12 @@ def evaluation(dataset: str) -> Evaluation:
     """Monthly walk-forward with three ages, scored by the taker simulation."""
     return Evaluation(
         dataset=dataset,
-        schedule=Schedule(
-            first_cutoff="2021-05-04",
-            every_months=1,
-            eval_months=1,
-            ages=(1, 2, 3),
-            embargo_seconds=60,
-        ),
         scorer=steps.taker_sim,
         config=steps.SimConfig(cost_bps=0.5, threshold_bps=0.0),
+        first_cutoff="2021-05-04",
+        every_months=1,
+        eval_months=1,
+        ages=(1, 2, 3),
+        embargo_seconds=60,
         min_folds=3,
-        compare_age=1,
     )

@@ -15,7 +15,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "examples"))
 
-from forestry import harness, review  # noqa: E402
+from forestry import harness  # noqa: E402
 from forestry.ledger import Ledger  # noqa: E402
 from optiver import capture, declarations  # noqa: E402
 
@@ -48,19 +48,19 @@ def fy(root: pathlib.Path, *argv: str) -> str:
 
 def test_the_capture_is_time_ordered_with_a_null_free_target(root, dataset):
     row = Ledger.open(root).get("dataset", dataset)
-    assert row["family"] == [capture.PROCESS, capture.INSTRUMENT]
+    assert (row["process"], row["instrument"]) == (capture.PROCESS, capture.INSTRUMENT)
     assert row["rows"] > 100_000
 
 
-def test_the_script_steps_seat_an_incumbent_and_compare_the_rest(root, dataset):
+def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
     campaign = (DECL, "--dataset", dataset)
     fy(root, "run", *campaign)
     assert "scored" in fy(root, "board", *campaign)
     fy(root, "decide", *campaign, "ridge_3m", "--kind", "promote", "--why", "incumbent")
-    compared = fy(root, "compare", *campaign)
-    assert "pnl " in compared and "ridge_1m" in compared and "ridge_3m" not in compared
-    assert "seated" in fy(root, "history", *campaign)
-    assert '"config_diff"' in fy(root, "why", *campaign, "ridge_1m")
+    board = fy(root, "board", *campaign)
+    assert "baseline" in board and "pnl " in board and "ridge_1m" in board
+    assert "incumbent" in fy(root, "history", *campaign)
+    assert '"config_diff"' in fy(root, "board", *campaign, "ridge_1m")
 
 
 def test_a_rerun_computes_nothing(root, dataset):
@@ -68,4 +68,4 @@ def test_a_rerun_computes_nothing(root, dataset):
     evaluation = declarations.evaluation(dataset)
     report = harness.run(ledger, declarations.pipelines, evaluation)
     assert report.fits_computed == 0
-    assert review.baseline(ledger, evaluation) is not None
+    assert harness.baseline(ledger, evaluation) is not None

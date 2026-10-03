@@ -3,17 +3,16 @@
 A campaign is a declarations module exposing ``pipelines`` (a list of ``Pipeline``) and
 ``evaluation`` (an ``Evaluation`` or a function of the dataset id returning one). Every campaign
 command takes the module and ``--dataset``. The ledger root comes from ``--root`` or
-``FORESTRY_ROOT`` (default ``.forestry``). Candidates are named by id, id prefix or pipeline name.
+``FORESTRY_ROOT`` (default ``.forestry``). Pipelines are named by name or id prefix.
 
 Examples
 --------
 $ DS=$(fy freeze optiver.capture:freeze 20)
 $ C="optiver.declarations --dataset $DS"
 $ fy run $C
-$ fy board $C
 $ fy decide $C ridge_3m --kind promote --why "the model in production"
-$ fy compare $C
-$ fy decide $C bonsai_lw --kind promote --why "pnl +2.4%, drawdown within tolerance"
+$ fy board $C
+$ fy decide $C bonsai_lw --kind promote --why "pnl +7.6%, drawdown accepted"
 $ fy history $C
 """
 
@@ -33,16 +32,13 @@ from forestry.declare import Evaluation
 from forestry.ledger import Kinds, Ledger
 
 DEFAULT_ROOT = ".forestry"
-BOARD_COLUMNS = ("seq", "id", "pipeline", "status", "verdict", "metrics", "reason")
-COMPARE_COLUMNS = ("id", "pipeline", "verdict", "deltas", "metrics")
-HISTORY_COLUMNS = ("decision", "candidate", "pipeline", "verdict", "deltas", "why")
+BOARD_COLUMNS = ("id", "pipeline", "status", "verdict", "deltas", "metrics", "why")
+HISTORY_COLUMNS = ("id", "pipeline", "pipeline_id", "against", "why")
 COMMANDS = {
     "run": "fit, predict and score every pipeline under the evaluation",
-    "board": "every candidate with its status and aggregate metrics",
-    "compare": "write a comparison of each named candidate (default: all) to the baseline",
-    "decide": "record promote or reject on a candidate",
+    "board": "every scored pipeline against the baseline; one name for its detail",
+    "decide": "record promote or reject on a pipeline",
     "history": "the chain of promotions",
-    "why": "one candidate: config against the baseline, folds, comparisons, decisions",
 }
 
 
@@ -57,11 +53,10 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name, help=text)
         p.add_argument("declarations", help="module name or .py path")
         p.add_argument("--dataset", required=True, help="dataset id from fy freeze")
-        if name == "compare":
-            p.add_argument("candidates", nargs="*")
-        if name in ("decide", "why"):
-            p.add_argument("candidate")
+        if name == "board":
+            p.add_argument("pipeline", nargs="?")
         if name == "decide":
+            p.add_argument("pipeline")
             p.add_argument("--kind", required=True, choices=["promote", "reject"])
             p.add_argument("--why", required=True)
 
@@ -86,56 +81,30 @@ def _dispatch(args: argparse.Namespace, ledger: Ledger) -> int:
         report = harness.run(ledger, list(module.pipelines), evaluation)
         print(
             f"fits {report.fits_computed}, predictions {report.predictions_computed}, "
-            f"candidates {len(report.candidates)}"
+            f"pipelines {len(report.scored)}"
         )
+    elif args.command == "board" and args.pipeline:
+        pipeline = _resolve(ledger, evaluation, args.pipeline)
+        print(json.dumps(review.detail(ledger, evaluation, pipeline), indent=2, default=str))
     elif args.command == "board":
         print(_table(BOARD_COLUMNS, review.board(ledger, evaluation)))
-    elif args.command == "compare":
-        rows = [
-            harness.compare(ledger, cid, evaluation)
-            for cid in _compare_targets(args, ledger, evaluation)
-        ]
-        for row in rows:
-            row["id"] = row["challenger"]
-            row["pipeline"] = _pipeline_name(ledger, row["challenger"])
-            row["metrics"] = row["challenger_metrics"]
-        print(_table(COMPARE_COLUMNS, rows))
     elif args.command == "decide":
-        candidate = _resolve(ledger, evaluation, args.candidate)
-        print(harness.decide(ledger, candidate, kind=args.kind, why=args.why))
+        pipeline = _resolve(ledger, evaluation, args.pipeline)
+        print(harness.decide(ledger, pipeline, evaluation, kind=args.kind, why=args.why))
     elif args.command == "history":
-        rows = [{**r, "decision": r["id"]} for r in review.history(ledger, evaluation)]
-        print(_table(HISTORY_COLUMNS, rows))
-    elif args.command == "why":
-        candidate = _resolve(ledger, evaluation, args.candidate)
-        print(json.dumps(review.why(ledger, candidate), indent=2, default=str))
+        print(_table(HISTORY_COLUMNS, review.history(ledger, evaluation)))
     return 0
 
 
-def _compare_targets(args: argparse.Namespace, ledger: Ledger, evaluation: Evaluation) -> list[str]:
-    if args.candidates:
-        return [_resolve(ledger, evaluation, c) for c in args.candidates]
-    return [
-        c["id"]
-        for c in ledger.where(Kinds.CANDIDATE, evaluation=evaluation.id)
-        if c["status"] == harness.Status.SCORED
-    ]
-
-
 def _resolve(ledger: Ledger, evaluation: Evaluation, name: str) -> str:
-    """A candidate id from an id, an id prefix or a pipeline name under the evaluation."""
-    candidates = ledger.where(Kinds.CANDIDATE, evaluation=evaluation.id)
-    matches = [c["id"] for c in candidates if c["id"].startswith(name)]
+    """A pipeline id from its name or an id prefix, among those scored under the evaluation."""
+    scored = [s["pipeline"] for s in ledger.where(Kinds.SCORE, evaluation=evaluation.id)]
+    matches = [p for p in scored if p.startswith(name)]
     if not matches:
-        matches = [c["id"] for c in candidates if _pipeline_name(ledger, c["id"]) == name]
+        matches = [p for p in scored if ledger.get(Kinds.PIPELINE, p)["name"] == name]
     if len(matches) != 1:
-        raise harness.Refused(f"candidate {name!r}: {len(matches)} matches")
+        raise harness.Refused(f"pipeline {name!r}: {len(matches)} matches under this evaluation")
     return matches[0]
-
-
-def _pipeline_name(ledger: Ledger, candidate_id: str) -> str:
-    cand = ledger.get(Kinds.CANDIDATE, candidate_id)
-    return ledger.get(Kinds.PIPELINE, cand["pipeline"])["name"]
 
 
 def _campaign(args: argparse.Namespace) -> tuple[Any, Evaluation]:
@@ -179,6 +148,8 @@ def _cell(column: str, value: Any) -> str:
         return ""
     if column == "deltas":
         return " ".join(f"{k} {v:+.1%}" for k, v in value.items())
+    if column == "against":
+        return f"{value['verdict']} {value['baseline'][:8]}: " + _cell("deltas", value["deltas"])
     if isinstance(value, dict):
         return " ".join(f"{k}={v:.3g}" for k, v in value.items())
     if isinstance(value, str) and len(value) == 16:

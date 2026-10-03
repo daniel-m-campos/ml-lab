@@ -6,7 +6,7 @@ import dataclasses
 
 import numpy as np
 
-from forestry.declare import ScoreResult, scorer, step
+from forestry.declare import scorer, step
 from forestry.session import Range, Session, add_months
 
 TARGET = "target"
@@ -51,7 +51,7 @@ def features(session: Session, rng: Range) -> np.ndarray:
 
 
 def window(session: Session, train: Range, months: int) -> Range:
-    end_date = session.frame.ts[train[1] - 1].astype("datetime64[D]").astype(object)
+    end_date = session.date_at(train[1] - 1)
     return (max(train[0], session.index_of(add_months(end_date, -months))), train[1])
 
 
@@ -124,18 +124,20 @@ def bonsai_predict(model, session: Session, rng: Range) -> np.ndarray:
 # Scorers ==========================================================================================
 
 
-@scorer(directions={"corr": "max", "hit_rate": "max", "rmse": "min"})
-def fit_metrics(pred: np.ndarray, session: Session, rng: Range, config: None) -> ScoreResult:
-    """Prediction quality against the target, no trading."""
-    truth = session.column(TARGET, rng)
+def fit_metrics(series: np.ndarray) -> dict[str, float]:
+    """Prediction quality from a (pred, truth) series, no trading."""
+    pred, truth = series[:, 0], series[:, 1]
     corr = float(np.corrcoef(pred, truth)[0, 1]) if pred.std() > 0 else 0.0
-    return ScoreResult(
-        {
-            "corr": corr,
-            "hit_rate": float(np.mean(np.sign(pred) == np.sign(truth))),
-            "rmse": float(np.sqrt(np.mean((pred - truth) ** 2))),
-        }
-    )
+    return {
+        "corr": corr,
+        "hit_rate": float(np.mean(np.sign(pred) == np.sign(truth))),
+        "rmse": float(np.sqrt(np.mean((pred - truth) ** 2))),
+    }
+
+
+@scorer(metrics=fit_metrics, directions={"corr": "max", "hit_rate": "max", "rmse": "min"})
+def fit_quality(pred: np.ndarray, session: Session, rng: Range, config: None) -> np.ndarray:
+    return np.column_stack([pred, session.column(TARGET, rng)])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,11 +165,11 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
 
 
 @scorer(
+    metrics=sim_metrics,
     directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
-    from_series=sim_metrics,
 )
-def taker_sim(pred: np.ndarray, session: Session, rng: Range, config: SimConfig) -> ScoreResult:
-    """Per-stock taker simulation in bps."""
+def taker_sim(pred: np.ndarray, session: Session, rng: Range, config: SimConfig) -> np.ndarray:
+    """Per-stock taker simulation in bps: a (pnl, flips) series."""
     truth = session.column(TARGET, rng)
     stock = session.column("stock_id", rng)
     position = np.sign(pred) * (np.abs(pred) > config.threshold_bps)
@@ -175,5 +177,4 @@ def taker_sim(pred: np.ndarray, session: Session, rng: Range, config: SimConfig)
     for sid in np.unique(stock):
         rows = np.flatnonzero(stock == sid)
         flips[rows] = np.abs(np.diff(position[rows], prepend=0.0))
-    series = np.column_stack([position * truth - config.cost_bps * flips, flips])
-    return ScoreResult(sim_metrics(series), series)
+    return np.column_stack([position * truth - config.cost_bps * flips, flips])

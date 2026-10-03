@@ -1,4 +1,4 @@
-"""Capture and dataset for the Optiver close auction data."""
+"""Reading the Optiver close auction CSV and freezing it as a dataset."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import pyarrow.csv
 from forestry import data
 from forestry.declare import step
 from forestry.ledger import Ledger
-from forestry.session import Frame
+from forestry.session import Session
 
 TRAIN_CSV = pathlib.Path("data/optiver/optiver-trading-at-the-close/train.csv")
 BASE_DATE = datetime.date(2021, 1, 4)
@@ -28,8 +28,8 @@ def available() -> bool:
     return TRAIN_CSV.is_file()
 
 
-def load_frame(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Frame:
-    """Read the competition CSV into a frame on a synthetic calendar axis."""
+def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Session:
+    """Read the competition CSV onto a synthetic calendar axis."""
     table = pyarrow.csv.read_csv(path)
     if stocks is not None:
         table = table.filter(pc.is_in(table["stock_id"], pa.array(stocks)))
@@ -39,41 +39,33 @@ def load_frame(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -
         + table["seconds_in_bucket"].to_numpy()
     )
     order = np.lexsort((table["stock_id"].to_numpy(), seconds))
-    ts = (np.datetime64(BASE_DATE, "s") + seconds[order].astype("timedelta64[s]")).astype(
-        "datetime64[s]"
-    )
+    ts = np.datetime64(BASE_DATE, "s") + seconds[order].astype("timedelta64[s]")
     columns = {
         name: table[name].to_numpy(zero_copy_only=False).astype(np.float64)[order]
         for name in table.column_names
         if name not in DROPPED
     }
-    return Frame(ts, columns)
+    return Session(ts, columns)
 
 
 @step
-def drop_null_target(frame: Frame) -> Frame:
-    keep = ~np.isnan(frame.columns[TARGET])
-    return Frame(frame.ts[keep], {k: v[keep] for k, v in frame.columns.items()})
+def drop_null_target(session: Session) -> Session:
+    keep = ~np.isnan(session.columns[TARGET])
+    return Session(session.ts[keep], {k: v[keep] for k, v in session.columns.items()})
 
 
 def freeze(ledger: Ledger, stocks: str = "all") -> str:
-    """Freeze the capture for a stock subset and the dataset with null targets dropped.
-
-    Parameters
-    ----------
-    stocks
-        ``"all"``, a count ``"20"`` (the first twenty ids) or a list ``"0,1,2,3"``.
-    """
+    """Freeze a stock subset with null targets dropped; ``stocks`` is "all", "20" or "0,1,2"."""
     selected = parse_stocks(stocks)
-    frame = load_frame(selected)
-    capture = data.freeze_capture(
+    return data.freeze(
         ledger,
-        frame,
-        params={"stocks": list(selected) if selected else "all", "base_date": str(BASE_DATE)},
+        load(selected),
         process=PROCESS,
+        params={"stocks": list(selected) if selected else "all", "base_date": str(BASE_DATE)},
         instrument=INSTRUMENT,
+        filters=(drop_null_target,),
+        targets=(TARGET,),
     )
-    return data.freeze_dataset(ledger, capture, filters=(drop_null_target,), targets=(TARGET,))
 
 
 def parse_stocks(spec: str) -> tuple[int, ...] | None:
