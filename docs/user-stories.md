@@ -30,7 +30,7 @@ Done when: `fy dataset show <id>` prints the pipeline, hashes and row count, and
 Context: the campaign on S1's dataset will be judged by the taker simulator on the last month of the window.
 
 Steps:
-1. `fy evaluation declare --dataset <id> --eval-window 2026-09-01:2026-10-01 --sim taker-sim@1.4 --sim-config sim/es-taker.yaml --metrics pnl,sharpe,max_dd,turnover --rule pareto --tie human` writes a evaluation row.
+1. `fy evaluation declare --dataset <id> --eval-window 2026-09-01:2026-10-01 --sim taker-sim@1.4 --sim-config sim/es-taker.yaml --metrics pnl,sharpe,max_dd,turnover --rule pareto --tie human` writes an evaluation row.
 
 Ledger after: one evaluation with a hash over every input.
 
