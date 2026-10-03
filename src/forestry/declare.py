@@ -1,4 +1,4 @@
-"""Typed declarations: steps, scorers, pipelines, evaluations, stages and gates.
+"""Typed declarations: steps, scorers, pipelines and evaluations.
 
 Declarations are frozen dataclasses hashed by canonical serialization; see docs/spec.md. A
 pipeline's name is a label and does not enter its hash.
@@ -13,7 +13,7 @@ Examples
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from forestry import hashing
@@ -22,20 +22,20 @@ from forestry import hashing
 
 
 def step(func: Callable) -> Callable:
-    """Register a fit, predict, filter or loss function as a hashable step."""
+    """Register a fit, predict or filter function as a hashable step."""
     return hashing.register(func, kind="step")
 
 
 def scorer(directions: Mapping[str, str], from_series: Callable | None = None) -> Callable:
-    """Register a scorer: ``score(pred, session, range, exec, config) -> ScoreResult``.
+    """Register a scorer: ``score(pred, session, range, config) -> ScoreResult``.
 
     Parameters
     ----------
     directions : Mapping[str, str]
-        Metric name to ``"max"`` or ``"min"``; the Pareto rule reads it.
+        Metric name to ``"max"`` or ``"min"``; comparisons read it.
     from_series : Callable, optional
-        ``from_series(series) -> dict`` recomputing metrics over concatenated fold series; when
-        absent the aggregate is the mean over folds.
+        ``from_series(series) -> dict`` recomputing metrics over the concatenated fold series;
+        when absent the aggregate is the mean over folds.
     """
 
     def decorate(func: Callable) -> Callable:
@@ -58,15 +58,6 @@ class ScoreResult:
 
 
 @dataclasses.dataclass(frozen=True)
-class Tune:
-    """Search a space over an inner time-ordered split of the training range, then refit."""
-
-    space: Mapping[str, Sequence[Any]]
-    inner_months: int
-    loss: Callable
-
-
-@dataclasses.dataclass(frozen=True)
 class Pipeline:
     """How a training range becomes a model and how a model becomes predictions."""
 
@@ -74,8 +65,6 @@ class Pipeline:
     predict: Callable
     config: Any
     name: str = dataclasses.field(default="", metadata={"label": True})
-    heads: tuple[Any, ...] | None = None
-    tune: Tune | None = None
 
     @property
     def id(self) -> str:
@@ -104,94 +93,20 @@ class Schedule:
 
 
 @dataclasses.dataclass(frozen=True)
-class Sealed:
-    """The final window, scored once at decision time."""
-
-    months: int = 1
-    pass_rule: str = "fold_range"
-    fail: str = "no_deploy"
-
-
-@dataclasses.dataclass(frozen=True)
-class Gate:
-    """What a candidate must do to leave a stage."""
-
-    kind: str
-    n: int | None = None
-    metric: str | None = None
-    minimum: float | None = None
-
-
-class gates:
-    """Gate constructors."""
-
-    human = Gate("human")
-    vs_baseline = Gate("vs_baseline")
-
-    @staticmethod
-    def pareto_front(n: int) -> Gate:
-        return Gate("pareto_front", n=n)
-
-    @staticmethod
-    def top_k(n: int, metric: str) -> Gate:
-        return Gate("top_k", n=n, metric=metric)
-
-    @staticmethod
-    def threshold(metric: str, minimum: float) -> Gate:
-        return Gate("threshold", metric=metric, minimum=minimum)
-
-
-@dataclasses.dataclass(frozen=True)
-class Rule:
-    """How two metric vectors are ordered: Pareto, or a priority order with a relative band."""
-
-    kind: str = "pareto"
-    order: tuple[str, ...] = ()
-    band: float = 0.0
-
-
-class rules:
-    """Rule constructors."""
-
-    pareto = Rule("pareto")
-
-    @staticmethod
-    def priority(*order: str, band: float = 0.02) -> Rule:
-        """Decide on the first metric whose relative difference exceeds ``band``."""
-        return Rule("priority", order=tuple(order), band=band)
-
-
-@dataclasses.dataclass(frozen=True)
-class Stage:
-    """A scorer, its config, an optional execution grid and the gate out."""
-
-    scorer: Callable
-    gate: Gate
-    config: Any = None
-    grid: tuple[Any, ...] | None = None
-
-
-@dataclasses.dataclass(frozen=True)
 class Evaluation:
-    """How every candidate on a dataset is judged."""
+    """How every pipeline on a dataset is scored and compared."""
 
     dataset: str
     schedule: Schedule
-    stages: tuple[Stage, ...]
+    scorer: Callable
+    config: Any = None
     min_folds: int = 3
-    sealed: Sealed = Sealed()
-    rule: Rule = Rule()
     compare_age: int = 1
-    contracts: tuple[str, ...] = ("fit_predict",)
 
     @property
     def id(self) -> str:
         return hashing.content_hash(self)
 
     @property
-    def final(self) -> Stage:
-        return self.stages[-1]
-
-    @property
     def directions(self) -> dict[str, str]:
-        return self.final.scorer.__forestry_meta__["directions"]
+        return self.scorer.__forestry_meta__["directions"]

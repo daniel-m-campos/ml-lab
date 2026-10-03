@@ -5,7 +5,6 @@ Skipped when the Kaggle data is absent.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import pathlib
 import subprocess
@@ -16,7 +15,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "examples"))
 
-from forestry import data, harness, review  # noqa: E402
+from forestry import harness, review  # noqa: E402
 from forestry.ledger import Ledger  # noqa: E402
 from optiver import capture, declarations  # noqa: E402
 
@@ -53,31 +52,20 @@ def test_the_capture_is_time_ordered_with_a_null_free_target(root, dataset):
     assert row["rows"] > 100_000
 
 
-def test_the_script_steps_reach_a_sealed_baseline(root, dataset):
-    fy(root, "run", DECL, "--dataset", dataset)
-    board = fy(root, "board", DECL, "--dataset", dataset)
-    assert "pending" in board and "corr=" in board
-    fy(root, "gate", DECL, "--dataset", dataset, "--pending", "--advance", "--why", "test")
-    fy(root, "run", DECL, "--dataset", dataset)
-    assert "seated" in fy(root, "history", DECL, "--dataset", dataset)
-    assert fy(root, "seal", DECL, "--dataset", dataset).startswith("seal")
+def test_the_script_steps_seat_an_incumbent_and_compare_the_rest(root, dataset):
+    campaign = (DECL, "--dataset", dataset)
+    fy(root, "run", *campaign)
+    assert "scored" in fy(root, "board", *campaign)
+    fy(root, "decide", *campaign, "ridge_3m", "--kind", "promote", "--why", "incumbent")
+    compared = fy(root, "compare", *campaign)
+    assert "pnl " in compared and "ridge_1m" in compared and "ridge_3m" not in compared
+    assert "seated" in fy(root, "history", *campaign)
+    assert '"config_diff"' in fy(root, "why", *campaign, "ridge_1m")
 
 
 def test_a_rerun_computes_nothing(root, dataset):
     ledger = Ledger.open(root)
-    report = harness.run(ledger, declarations.pipelines, declarations.evaluation(dataset))
-    assert report.fits_computed == 0
-    assert review.baseline(ledger, declarations.evaluation(dataset)) is not None
-
-
-@pytest.mark.skipif(not declarations.bonsai_available, reason="bonsai not installed")
-def test_bonsai_heads_cost_one_fit_per_fold(root, dataset):
-    ledger = Ledger.open(root)
     evaluation = declarations.evaluation(dataset)
-    small = dataclasses.replace(
-        declarations.bonsai_depthwise.with_config(n_iters=50), name="bonsai_small", heads=(25, 50)
-    )
-    folds, _ = harness.expand(evaluation, data.session(ledger, dataset))
-    report = harness.run(ledger, [small], evaluation)
-    assert report.fits_computed == len(folds)
-    assert report.predictions_computed == len(folds) * len(evaluation.schedule.ages) * 2
+    report = harness.run(ledger, declarations.pipelines, evaluation)
+    assert report.fits_computed == 0
+    assert review.baseline(ledger, evaluation) is not None

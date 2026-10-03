@@ -1,130 +1,59 @@
 # User stories
 
-Template. One story per heading. Keep each under fifteen lines.
+Each story: a context, the steps as `fy` commands, what the ledger holds afterwards, and when it is done. Candidates are named by pipeline name when unique, else by id prefix.
 
-```
-## S<n>. <who> <does what> so that <why>
-Context: one or two lines of situation.
-Steps: numbered, each naming the command or API call and the object it writes.
-Ledger after: which rows exist that did not before.
-Done when: the observable fact that closes the story.
-```
+## S1: freeze a dataset
 
-Commands below are the proposed CLI; names are provisional. `fy` is the binary.
+Context: a new month of order-book captures for one instrument and sampling process.
 
-## S1. Researcher freezes a dataset so that every later result points at one set of bytes
+1. `DS=$(fy freeze project.capture:freeze <args>)` calls the project's freeze function: it writes a capture row (process, params, instrument, bytes hash, rows), applies the declared filters and targets, and writes a dataset row.
+2. The same call with the same inputs returns the same id and writes nothing.
 
-Context: a new capture of ES futures, 2026-07 to 2026-09, from the standard sampler, with the usual blackout and broken-capture filters, labeled with a 30 s and a 120 s horizon.
+Ledger after: one capture, one dataset, two blobs.
 
-Steps:
-1. `fy capture freeze --process sampler-v3 --instrument ES --window 2026-07-01:2026-10-01 es-q3.parquet` writes a capture row with the bytes hash.
-2. `fy dataset freeze --capture <id> --filters filters/std.yaml --target targets/ret-30s-120s.yaml` writes a dataset row; the filtered and labeled bytes land in `blobs/`.
-3. `git commit` the two manifests.
+Done when: the printed id is stable across reruns.
 
-Ledger after: one capture, one dataset, both with pipeline and bytes hashes.
+## S2: run the pipelines
 
-Done when: `fy dataset show <id>` prints the pipeline, hashes and row count, and a rerun of step 2 with the same inputs returns the same id and writes nothing.
+Context: `project/declarations.py` lists the pipelines and declares the evaluation (schedule, scorer, scorer config, min_folds).
 
-## S2. Researcher declares how candidates will be judged so that no comparison is argued after the fact
+1. `fy run project.declarations --dataset $DS` expands the schedule to folds, fits once per (pipeline, cutoff), predicts once per (fit, eval window), scores every fold and age, and writes one aggregate per age.
+2. Rerunning computes nothing. Adding a pipeline to the module and rerunning fits only the new one.
 
-Context: the campaign on S1's dataset will be judged by the taker simulator on the last month of the window.
+Ledger after: one evaluation, N pipelines, N candidates, fits, predictions, scores.
 
-Steps:
-1. `fy evaluation declare --dataset <id> --eval-window 2026-09-01:2026-10-01 --sim taker-sim@1.4 --sim-config sim/es-taker.yaml --metrics pnl,sharpe,max_dd,turnover --rule pareto --tie human` writes an evaluation row.
+Done when: the second run prints `fits 0, predictions 0`.
 
-Ledger after: one evaluation with a hash over every input.
+## S3: seat the incumbent and compare
 
-Done when: changing any input, including the simulator version, yields a different evaluation id.
+Context: one of the pipelines is the model in production.
 
-## S3. Researcher runs a modeling idea end to end so that the result is comparable to everything else on the dataset
+1. `fy decide project.declarations --dataset $DS ridge_3m --kind promote --why "incumbent"` records the decision and sets the baseline.
+2. `fy compare project.declarations --dataset $DS` writes one comparison row per scored candidate: verdict, relative delta per metric, both metric vectors. Nothing moves.
+3. The person reads the table and records `fy decide ... bonsai_lw --kind promote --why "..."` or `--kind reject --why "..."`. A promote links the comparison, moves the baseline and marks the old one superseded.
 
-Context: a new order-book imbalance feature set, depthwise bonsai, five seeds, data resident on the GPU box.
+Done when: `fy history` shows the chain of promotions with the verdict and deltas each one acted on.
 
-Steps:
-1. Edit `pipelines/imbalance-v2.yaml`: steps feature-imbalance -> select-topk -> bonsai-depthwise, train window 1y. The pipeline implements fit/predict and knows nothing about folds.
-2. `fy run --dataset <id> --pipeline pipelines/imbalance-v2.yaml --evaluation <id> --seeds 5 --executor gpubox`: the harness expands the evaluation's schedule, writes one fit row per cutoff (memoized by dataset, pipeline, train_range) and one predictions row per eval window and age, all on the resident session.
-3. `fy candidate add --dataset <id> --pipeline <id> --exec-config exec/es-taker-a.yaml` names the prediction column to trade; `fy score --candidate <id> --evaluation <id>` runs the simulator harness-side and writes per-fold and aggregate score rows.
+## S4: a scoring idea
 
-Ledger after: N fits, N predictions, one candidate, N+1 scores.
+Context: the cost assumption in the simulator changes.
 
-Done when: `fy scores --dataset <id> --evaluation <id>` lists the candidate beside every earlier one, and rerunning step 2 unchanged computes no fit.
+1. Edit the scorer config in `declarations.py`; the evaluation id changes.
+2. `fy run` again: zero fits, every candidate rescored under the new evaluation.
+3. `fy compare` refuses a candidate scored under the old evaluation against a baseline under the new one.
 
-## S4. Researcher compares the new candidate to the baseline so that the baseline moves only on evidence
+Done when: both evaluations' boards are readable and nothing is overwritten.
 
-Context: S3's candidate against the current baseline for (ES, evaluation from S2).
+## S5: iteration 100
 
-Steps:
-1. `fy compare --challenger <cand> --baseline current --evaluation <id>` computes dominance over the metric vector and writes a comparison row.
-2. If `dominates`: the baseline row advances and a decision row of kind promote is written with the comparison id.
-3. If `incomparable` (higher pnl, higher drawdown): `fy decide <comparison> --kind promote|reject --why "..."` writes the decision with the rationale; the baseline moves only on promote.
-4. If `dominated`: nothing moves; the comparison stays as the record that the idea was tried.
+Context: three months in.
 
-Ledger after: one comparison, zero or one decision, baseline possibly advanced.
+1. `fy board` lists every candidate with status, latest verdict, aggregate metrics and the recorded reason.
+2. `fy history` prints the promotions in order.
+3. `fy why <candidate>` prints its config against the baseline's, its per-fold scores, its comparisons and decisions.
 
-Done when: `fy baseline --family ES --evaluation <id>` names the candidate and the decision that seated it.
+Done when: a newcomer can say what was tried, why each one lost, and what moved the baseline, from the ledger alone.
 
-## S5. Researcher asks what has been tried so that no idea is rerun or lost
+## Later
 
-Context: three months into the campaign, 140 fits.
-
-Steps:
-1. `fy fits --dataset <id> --sort sharpe` lists fits with pipeline name, seeds, metric vector, verdict against the baseline at the time.
-2. `fy history --baseline ES/<evaluation>` prints the chain of promotions with their decisions and rationales.
-3. `fy why <fit>` prints the pipeline, step configs and diffs against the baseline's fit.
-
-Ledger after: unchanged.
-
-Done when: the answer to "did we try X" is one query, and every rejected idea has a comparison row saying why.
-
-## S6. Researcher deploys the baseline so that prod and the ledger agree on what is running
-
-Context: the campaign ends; the baseline candidate goes to prod.
-
-Steps:
-1. `fy decide --kind deploy --candidate <id> --why "..."` writes the decision.
-2. `fy deploy --candidate <id> --env prod-es` writes a deployment row with the bundle hash and time; the proprietary compile step reads the bundle from `blobs/` and is out of scope.
-
-Ledger after: one decision, one deployment.
-
-Done when: `fy deployments --env prod-es` shows the bundle hash, and the bundle's `bundle.json` names the dataset, pipeline, evaluation and metrics that justified it.
-
-## S7. Researcher refreshes a deployed model so that the incumbent is the bar to clear
-
-Context: a quarter has passed; a new capture of ES from the same sampler.
-
-Steps:
-1. S1 again with the new window: new capture and dataset ids, same family (sampler-v3, ES).
-2. `fy evaluation declare ...` on the new dataset; `fy baseline seat --family ES --evaluation <new> --candidate <deployed>` seats the deployed candidate as baseline.
-3. `fy score --candidate <deployed> --evaluation <new>` scores the incumbent on the new window.
-4. S3 and S4 for each challenger. A promote decision leads to S6.
-
-Ledger after: new dataset, evaluation, baseline seat, scores, comparisons.
-
-Done when: the incumbent's eval on the new window exists before any challenger's, and the deployment row for the old bundle gains a retired-at time when a new one goes out.
-
-## S8. Agent runs a night of experiments so that the human reviews evidence, not transcripts
-
-Context: a contract file sets the evaluation, a budget of 12 GPU-hours, a stop rule of 40 fits or three consecutive dominated comparisons, and "promotion requires a human".
-
-Steps:
-1. `fy campaign open --dataset <id> --evaluation <id> --contract contracts/night-1.yaml` writes the campaign and its contract.
-2. The agent loops S3 and S4 through the same CLI; each fit row carries the journal node (parent, plan, diff, outcome, is_buggy). Evals run harness-side; the eval window is outside the agent's writable tree.
-3. The run stops on the contract's rule. `fy campaign report <id>` prints fits, comparisons, cost and the incomparable set awaiting decisions.
-4. The human works through S4 step 3 on the incomparable set.
-
-Ledger after: one campaign, N fits with journal nodes, N comparisons, zero promotions.
-
-Done when: every claim in the agent's report resolves to a fit id and an score row, and nothing moved the baseline without a human decision.
-
-## S9. Researcher changes the simulator so that stale comparisons cannot pass as current
-
-Context: taker-sim 1.5 corrects fee handling. No refit happens: scores derive from cached predictions.
-
-Steps:
-1. `fy evaluation declare ... --sim taker-sim@1.5` yields a new evaluation id.
-2. `fy score` re-scores the baseline and any candidates still of interest under the new evaluation.
-3. Old comparisons remain in the ledger under the old evaluation id and are not consulted for the new baseline.
-
-Ledger after: new evaluation, new scores, new baseline seat.
-
-Done when: `fy compare` refuses a challenger evaluated under 1.4 against a baseline evaluated under 1.5.
+Stories removed with draft 4, kept as one line each: a staged funnel with recorded gates (S6), a sealed held-out month scored once (S7), deploy with a bundle naming its justification (S8), refresh seating the deployed candidate on the next dataset (S9), an agent campaign under a written contract (S10). Reopeners are in `docs/spec.md`, section "Later".

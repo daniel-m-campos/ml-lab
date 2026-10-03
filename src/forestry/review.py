@@ -4,12 +4,11 @@ Examples
 --------
 >>> rows = board(ledger, evaluation)  # doctest: +SKIP
 >>> rows[0]["status"]  # doctest: +SKIP
-'advanced'
+'baseline'
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from forestry import hashing
@@ -25,7 +24,7 @@ def baseline(ledger: Ledger, evaluation: Evaluation) -> dict[str, Any] | None:
 
 
 def board(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
-    """One row per candidate: pipeline, head, exec, furthest stage, status, metrics, reason."""
+    """One row per candidate: pipeline, status, aggregate metrics, latest verdict, reason."""
     current = baseline(ledger, evaluation)
     top = current["candidate"] if current else None
     rows = [
@@ -37,16 +36,12 @@ def board(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
 
 
 def history(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
-    """Promotions under an evaluation, oldest first, with their comparison verdicts."""
+    """Promotions under an evaluation, oldest first, with the verdict each one acted on."""
     out = []
     for decision in ledger.all(Kinds.DECISION):
         if decision["kind"] != "promote":
             continue
-        cand = (
-            ledger.get(Kinds.CANDIDATE, decision["candidate"])
-            if decision.get("candidate")
-            else None
-        )
+        cand = ledger.get(Kinds.CANDIDATE, decision["candidate"])
         if cand is None or cand["evaluation"] != evaluation.id:
             continue
         comparison = (
@@ -54,33 +49,19 @@ def history(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
             if decision.get("comparison")
             else None
         )
-        pipeline = ledger.get(Kinds.PIPELINE, cand["pipeline"])
         out.append(
             {
                 **decision,
-                "pipeline": pipeline["name"],
-                "head": cand["head"],
-                "exec": cand["exec"],
-                "how": comparison["verdict"] if comparison else "seated",
+                "pipeline": ledger.get(Kinds.PIPELINE, cand["pipeline"])["name"],
+                "verdict": comparison["verdict"] if comparison else "seated",
+                "deltas": comparison["deltas"] if comparison else {},
             }
         )
     return out
 
 
-def sealed(ledger: Ledger, candidate_id: str) -> dict[str, Any] | None:
-    """The recorded seal verdict for a candidate: kind, metrics, decision id; None if unsealed."""
-    for decision in ledger.all(Kinds.DECISION):
-        if decision.get("candidate") == candidate_id and decision["kind"].startswith("seal"):
-            return {
-                "kind": decision["kind"],
-                "metrics": json.loads(decision["why"])["sealed"],
-                "decision": decision["id"],
-            }
-    return None
-
-
 def why(ledger: Ledger, candidate_id: str) -> dict[str, Any]:
-    """A candidate's config against the baseline's, its per-fold scores, what stopped it."""
+    """A candidate's config against the baseline's, its per-fold scores, its decisions."""
     cand = ledger.get(Kinds.CANDIDATE, candidate_id)
     if cand is None:
         raise KeyError(candidate_id)
@@ -93,19 +74,23 @@ def why(ledger: Ledger, candidate_id: str) -> dict[str, Any]:
     )
     folds = [
         {"fold": s["fold"], "age": s["age"], **s["metrics"]}
-        for s in ledger.where(Kinds.SCORE, candidate=candidate_id, stage=cand["stage"])
+        for s in ledger.where(Kinds.SCORE, candidate=candidate_id)
         if s["fold"] is not None
     ]
-    decisions = [d for d in ledger.all(Kinds.DECISION) if d.get("candidate") == candidate_id]
+    decisions = [
+        {"id": d["id"], "kind": d["kind"], "why": d["why"]}
+        for d in ledger.all(Kinds.DECISION)
+        if d.get("candidate") == candidate_id
+    ]
     return {
         "candidate": candidate_id,
         "pipeline": pipeline["name"],
         "config": pipeline["config"],
         "config_diff": _diff(pipeline["config"], base_pipeline["config"]) if base_pipeline else {},
-        "exec": cand["exec"],
-        "stage": cand["stage"],
         "status": cand["status"],
-        "reason": cand.get("reason") or " ".join(d["why"] for d in decisions),
+        "reason": cand.get("reason"),
+        "comparisons": ledger.where(Kinds.COMPARISON, challenger=candidate_id),
+        "decisions": decisions,
         "folds": folds,
     }
 
@@ -130,18 +115,17 @@ def _board_row(ledger: Ledger, evaluation: Evaluation, cand: dict[str, Any]) -> 
     pipeline = ledger.get(Kinds.PIPELINE, cand["pipeline"])
     aggregate = [
         s
-        for s in ledger.where(Kinds.SCORE, candidate=cand["id"], stage=cand["stage"], fold=None)
+        for s in ledger.where(Kinds.SCORE, candidate=cand["id"], fold=None)
         if s["age"] == evaluation.compare_age
     ]
-    seq = ledger.all(Kinds.CANDIDATE).index(cand)
+    comparisons = ledger.where(Kinds.COMPARISON, challenger=cand["id"])
+    latest = comparisons[-1] if comparisons else None
     return {
         "id": cand["id"],
-        "seq": seq,
+        "seq": ledger.all(Kinds.CANDIDATE).index(cand),
         "pipeline": pipeline["name"],
-        "head": cand["head"],
-        "exec": cand["exec"],
-        "stage": cand["stage"],
         "status": cand["status"],
+        "verdict": latest["verdict"] if latest else None,
         "metrics": aggregate[0]["metrics"] if aggregate else {},
         "reason": cand.get("reason"),
     }

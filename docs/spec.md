@@ -1,117 +1,87 @@
-# forestry: design spec (draft 3, 2026-10-03)
+# forestry: design spec (draft 4, 2026-10-03)
 
-A local-first ledger for the lifecycle of experimentation on frozen, time-ordered datasets: compose pipelines, judge them under a declared evaluation, move a baseline only through a recorded comparison, deploy, refresh. Agents and humans write to the same ledger. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
+A local-first ledger for experimentation on frozen, time-ordered datasets. It records what was tried, under which evaluation, with what scores, and which recorded decision moved the baseline. People and agents write to the same ledger. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
+
+Draft 4 trims draft 3 to record keeping. Staged funnels, gates, ordering rules, tune steps, heads, the sealed window, deployment bundles and campaign contracts were built, found to be too much surface, and removed; they are listed under "Later" with what would bring each back.
 
 ## Scope
 
-In: dataset layers and hashes, pipelines, evaluations, memoized fits and predictions, economic scores (simulations), Pareto comparisons, human decisions, baselines, deployments, refreshes, remote execution on a GPU box or a pod, an agent journal. Out: a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
+In: dataset layers and hashes, pipeline and evaluation declarations, memoized fits and predictions, per-fold scores and aggregates, comparisons against a baseline, recorded decisions, read-back views, a shell command line. Out: automation that moves a baseline, a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
 
 ## The pattern
 
-An experiment is a triple on three independent, content-addressed axes. Nothing on one axis references another; a harness composes them.
+An experiment is a triple on three independent, content-addressed axes. Nothing on one axis references another; the harness composes them.
 
 | axis | holds | changes when |
 |---|---|---|
-| dataset | capture, filters, targets and horizons | new data or a labeling idea |
-| pipeline | the fit/predict implementation and its config, including how much history to train on | a modeling idea |
-| evaluation | schedule of cutoffs and eval windows, ages, embargo, sealed window, staged scorers and gates, metrics, rule | a validation or scoring idea |
+| dataset | capture (process, instrument, window), filters, targets | new data or a labeling idea |
+| pipeline | `fit` and `predict` steps and their config, including the training window | a modeling idea |
+| evaluation | dataset id, schedule (cutoffs, eval windows, ages, embargo), scorer and its config, min_folds, compare_age | a validation or scoring idea |
 
-Two memo points keep the cross product from materializing. A fit is keyed by (dataset, pipeline, train_range); the pipeline hash covers its binning and preprocessing steps, so two pipelines that bin differently never share a fit. A prediction set is keyed by (fit, eval_range, head). Scores derive from predictions, the session's columns over the eval range and a scorer's config, so a scoring change refits nothing, and schedules that share a cutoff share the fit. Model bytes are optional: predictions and the fit key are kept always; bytes only for baselines, deployments and pins, since a fit is reproducible from its key, code sha and env lock.
+Two memo points keep the cross product from materializing. A fit is keyed by (dataset, pipeline, train_range). Predictions are keyed by (fit, eval_range). Scores derive from predictions, the session's columns over the eval range and the scorer's config, so a scoring change refits nothing.
 
-Comparability is "same dataset, same evaluation". The harness refuses anything else.
+A candidate is (dataset, pipeline, evaluation). Comparability is "same evaluation id"; the harness refuses anything else.
 
-## Knobs
-
-| knob kind | lives in | cost |
-|---|---|---|
-| changes training: depth, learning rate, features, binning, training window | pipeline config, or a tune step's space | one fit per setting, or inner fits |
-| readout of a trained model: iteration count, horizon column | head, declared by the pipeline | zero extra fits |
-| changes trading, not the model: thresholds, sizing | execution config on the candidate | zero extra fits, one sim per setting |
-
-## Pipeline contract
+## Contracts
 
 ```
 fit(session, train_range, config) -> model
-predict(model, session, range, head) -> predictions   # one column per target or horizon
+predict(model, session, range) -> predictions
+score(predictions, session, range, config) -> ScoreResult(metrics, series)
 ```
 
-A head is a cheap readout of one trained model: an iteration count for a boosted model, a horizon column. The pipeline declares the heads it emits; a grid over heads costs one fit. Anything that changes training is a different pipeline, not a head.
+`session` is the frozen dataset's raw columns, resident in memory; it is not any library's object. Anything that learns from data lives inside `fit` over `train_range`: features, binning, scaling, the training window. Bin edges are a fit artifact, refit per fold. A scorer declares a direction per metric and may declare `from_series`, which recomputes the aggregate over the concatenated fold series; otherwise the aggregate is the mean over folds.
 
-`session` is the frozen dataset's raw columns held resident by the executor (host or device arrays); it is not a bonsai `Dataset` or any library's object. Ranges are time-ordered row ranges. Anything that learns from data lives inside `fit` over `train_range`: feature construction, binning, scaling, selection, the training window. Bin edges are therefore a fit artifact, refit per fold by default so no score row informs them; a pipeline may cache a binned view keyed by (dataset, binning step, train_range) and bonsai's resident-bin reuse is one such step, chosen by the pipeline, never assumed by the harness. `fit` may use less of `train_range` than it is given. A `tune` step inside `fit` searches a space (hyperparameters, early-stopping patience, training window) over an inner time-ordered split of `train_range` with the embargo applied, then refits on the full `train_range` with the chosen setting; the setting per fold is a fit artifact, recorded like bin edges. Selection inside the process is scored by walk-forward as part of the process; selection outside it is a grid of pipelines, whose contamination the sealed window catches. Rule: a knob tuned per refresh belongs in a tune step; a knob learned once about the dataset is a grid. Pipelines, evaluations, stages and gates are typed Python objects (dataclasses) referencing registered step and scorer functions; there is no YAML. An object is hashed by its canonical serialization, so formatting changes nothing and a value change changes the id; a declaration may hold only values and references to registered steps, never closures, and the harness rejects what it cannot serialize. The step library's code sha is in every fit key. Grids are comprehensions over `with_config`. A second contract, `fit_sequence(session, schedule, config) -> models`, exists for online or cross-fold ideas; an evaluation lists the contracts it accepts. No third contract.
-
-## Evaluation
-
-| field | meaning | default |
-|---|---|---|
-| schedule | cutoffs and eval windows, by calendar date | monthly cutoffs, one-month eval windows |
-| ages | eval windows at increasing distance from each cutoff, to measure decay | 1, 2, 3 months |
-| embargo | gap between train end and eval start | longest horizon; practice is day splits, so zero overlap |
-| min_folds | folds required before a comparison is valid | 3 |
-| sealed | final window scored once at decision time | last month of the dataset |
-| pass_rule | sealed-window metrics must fall inside the candidate's per-fold band | empirical fold range |
-| fail_outcome | chosen before unsealing: no deploy, deploy incumbent, or re-seal next month | no deploy |
-| stages | ordered scorers, each with a cost class and a gate; see below | fit metrics (human gate), quick sim grid (Pareto front, cap 5), full sim |
-| metrics | per stage; the last stage's vector is business-oriented (pnl, sharpe, max drawdown, turnover) | |
-| aggregate | over folds: concatenated series for pnl and sharpe, worst drawdown, equal weights | |
-| rule | pareto on the aggregate, or a priority order over metrics with a relative band (the next metric decides only inside the band); tie policy human | priority pnl, sharpe, max_dd, turnover, band 2% |
-| contracts | fit/predict, fit_sequence | fit/predict |
-
-Any field change is a new evaluation id. A scored sealed window becomes a public fold; time supplies the next seal.
-
-### Stages
-
-| stage | scorer | reads | gate |
-|---|---|---|---|
-| 1 | fit metrics from predictions: correlation with target, hit rate, per-horizon loss, setting stability across folds | predictions | human, or threshold and top-k once one is known |
-| 2 | quick simulator over a grid of execution configs; one fit yields one candidate per grid point | predictions | Pareto front of the grid, capped at 5 |
-| 3 | full simulator on the survivors | predictions | dominance against the baseline |
-
-Gate kinds: threshold, top-k, Pareto front, human. A human gate writes a decision row. A candidate that stops at a stage keeps its score rows there and a `stopped_at` with the gate's reason, so screening is recorded, not just done. Comparisons against the baseline are valid only at the stage the baseline holds, normally the last.
+Declarations are frozen dataclasses referencing registered step and scorer functions. An object is hashed by its canonical serialization: formatting changes nothing, a value change changes the id, a pipeline's name is a label outside the hash. No YAML, no closures. The step library's file sha is in every fit row.
 
 ## Objects
 
 | object | identity | fields |
 |---|---|---|
-| capture | hash(process, instrument, window) | process params, instrument, window, bytes hash, rows |
-| dataset | hash(capture, filters, targets) | capture id, filter rules, targets and horizons, bytes hash; family = (process, instrument) |
-| pipeline | hash(step graph, config, library sha) | steps incl. tune, config, heads, contract |
-| evaluation | hash(all fields above) | see table |
-| fit | hash(dataset, pipeline, train_range) | code sha, env lock, host fingerprint, executor, cost, duration, artifacts (bin edges, chosen settings), bundle hash or null |
-| predictions | hash(fit, eval_range, head) | columns, blob hash |
-| candidate | hash(dataset, pipeline, head, exec config) | which prediction column the simulator trades, execution params, stopped_at |
-| score | (candidate, evaluation, stage, fold, age) | metric vector; aggregate rows flagged |
-| comparison | uuid | challenger, baseline, evaluation, verdict: dominates / dominated / incomparable, decision id |
-| decision | integer, append-only | rationale, comparison or candidate ids, kind: gate / promote / reject / deploy / retire / seal-pass / seal-fail, prod feedback links |
-| baseline | per (family, evaluation) | current candidate, since decision |
-| deployment | uuid | bundle hash, env, deployed at, retired at, decision id |
-| campaign | uuid | dataset, evaluation, contract (budget, stop rule, approvals, fail_outcome) |
+| capture | hash(process, params, instrument, bytes) | rows, blob |
+| dataset | hash(capture, filters, targets) | family = (process, instrument), rows, blob |
+| pipeline | hash(fit, predict, config) | name, declaration, pickle |
+| evaluation | hash(all fields) | declaration, pickle |
+| fit | hash(dataset, pipeline, train_range) | cutoff, code sha, env lock, host fingerprint, duration, model blob |
+| predictions | hash(fit, range) | fold, age, blob |
+| candidate | hash(dataset, pipeline, evaluation) | status: scored, baseline, superseded, rejected; reason |
+| score | hash(candidate, fold, age) | metric vector; fold null marks the aggregate |
+| comparison | uuid | challenger, baseline, verdict (dominates, dominated, incomparable), relative deltas, both metric vectors, decision id once acted on |
+| decision | integer, append-only | kind (promote, reject), why, candidate, comparison |
+| baseline | per evaluation | candidate, since decision |
 
-Invariants: a baseline moves only through a comparison with verdict dominates or a promote decision. Two candidates compare only under one evaluation id, at the same stage, with at least min_folds folds each. No fit's train_range ends after its fold's eval start minus embargo. Nothing scores the sealed window before a seal decision. A simulator or schedule change is a new evaluation, so old comparisons go stale rather than silently comparable. Refutations are comparison rows, never deletions.
+Invariants: a baseline moves only through a promote decision. Two candidates compare only under one evaluation id with at least min_folds folds each. No fit's train_range ends after its fold's eval start minus the embargo. A scorer or schedule change is a new evaluation, so old comparisons go stale rather than silently comparable. Nothing is deleted; a refutation is a comparison row.
 
-## Workflows
+## Workflow
 
-Campaign: freeze dataset, declare evaluation, run pipelines (harness expands the schedule, memoizes fits and predictions per head on the resident session, scores stage by stage, applies gates, writes scores), compare survivors against the baseline, decide, score the sealed window once, deploy or apply fail_outcome.
+Freeze a dataset. Declare pipelines and one evaluation in a Python module. `run` fits, predicts and scores every pipeline, memoized. `decide promote` seats the incumbent. `compare` writes a verdict and per-metric deltas for each scored candidate against the baseline and moves nothing. A person or an agent reads the comparisons and records `promote` or `reject` with a reason. `board`, `history` and `why` read it back.
 
-Deployment model: the evaluation names it, last fold's fit or a refit on the full window after promotion; that refit is a fit with no score.
+```
+DS=$(fy freeze optiver.capture:freeze 20)
+C="optiver.declarations --dataset $DS"
+fy run $C
+fy decide $C ridge_3m --kind promote --why "incumbent"
+fy compare $C
+fy decide $C bonsai_lw --kind promote --why "pnl +7.6%, drawdown accepted"
+fy history $C
+```
 
-Refresh: new capture from the same family with a later window; the deployed candidate is seated as baseline and scored on the new folds first; the previous sealed month is now public; the newest month is sealed. Prod scores attach to the deploy decision as feedback.
-
-Comparison: dominance on the aggregate vector. Incomparable opens a human decision with a written rationale.
+Per project, three modules: how to read the raw data, the steps (features, models, scorers), the declarations (pipelines and the evaluation). Per idea, one more `Pipeline` in the declarations and `fy run` again.
 
 ## Storage
 
-One git repo: `forestry.sqlite`, `blobs/sha256/` (predictions, bundles, manifests, eval outputs), `decisions.md` rendered from the decision table. Run events emitted as OpenLineage RunEvent JSON with a `forestry_*` facet pinned to a schema sha. Bundle: `model.msgpack` plus `bundle.json` (dataset, pipeline, fit key, exec config, evaluation, metric vector, code sha, env lock, host fingerprint).
+One directory: `forestry.sqlite` (one table per object kind, JSON bodies) and `blobs/sha256/` (frames, models, predictions). Rows are few, so filtering happens in Python.
 
-## Execution
+## Later
 
-One executor interface: submit(work, dataset ref) -> handle with poll, logs, pull, teardown. Instances: local, ssh (the GPU box), runpod (REST v2 stock ladder, idle watchdog that terminates, cost and duration into the fit row). Host fingerprint on every fit.
+Each item was removed from draft 3 and returns only with a reason written here first.
 
-## Agents
-
-An agent uses the CLI and Python API. The journal is a node per attempt: parent, plan, diff, fit ids, outcome, is_buggy, verdict. The harness owns ranges, the clock, the scorers, the gates and the sealed window; the agent writes `fit` and `predict`. The stages are the agent's budget: many stage-1 attempts, few stage-2 grids, stage 3 behind a human gate when the contract says so. A claim without a score row counts for nothing. The campaign contract is written by the human first.
-
-## Open
-
-1. Resolved 2026-10-03: the Optiver run left 17 of 20 final candidates incomparable under Pareto on four metrics; the evaluation now declares a priority order with a 2% band, Pareto remains available. With no incumbent the best of the first final-stage batch is seated at the end of the run, ranked by pairwise wins under the rule because the band makes dominance intransitive.
-2. Whether bonsai's bench harness becomes the first local executor or stays a consumer.
-3. Minimum slice: dataset, pipeline, evaluation, fit, predictions, candidate, score, comparison, baseline, decision on SQLite with the local executor; remote executors and the journal second.
+| item | reopener |
+|---|---|
+| ordering rule for incomparable sets (priority order with a band) | when reading `compare` deltas by hand costs more than the rule hides; the band made dominance intransitive, so any rule needs a seating story |
+| staged scoring with gates (fit metrics, quick sim, full sim) | when a full simulation is expensive enough that screening must be recorded, not just done; until then two evaluations do it |
+| execution config grids | when one fit must be scored under several thresholds in one evaluation; today a threshold is scorer config, so a different threshold is a different evaluation |
+| tune step, heads | when a refresh tunes knobs per fold or a grid over readouts is the bottleneck; today a different n_iters is a different pipeline |
+| sealed window with a pass rule | when a deploy decision needs a one-shot held-out month; today a second evaluation whose schedule covers it |
+| deploy, bundle, refresh seating | when a candidate goes to production from the ledger |
+| remote executors (ssh, RunPod), agent journal, OpenLineage events | when a run leaves the laptop |

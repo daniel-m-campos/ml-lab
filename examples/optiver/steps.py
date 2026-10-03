@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any
 
 import numpy as np
 
 from forestry.declare import ScoreResult, scorer, step
 from forestry.session import Range, Session, add_months
-from forestry.toy import sim_metrics
 
 TARGET = "target"
 BPS = 1e4
@@ -84,7 +82,7 @@ def ridge_fit(session: Session, train: Range, config: RidgeConfig) -> RidgeModel
 
 
 @step
-def ridge_predict(model: RidgeModel, session: Session, rng: Range, head: Any) -> np.ndarray:
+def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
     return features(session, rng) @ model.weights + model.bias
 
 
@@ -119,17 +117,16 @@ def bonsai_fit(session: Session, train: Range, config: BonsaiConfig):
 
 
 @step
-def bonsai_predict(model, session: Session, rng: Range, head: Any) -> np.ndarray:
-    return model.predict(features(session, rng), num_iteration=0 if head is None else int(head))
+def bonsai_predict(model, session: Session, rng: Range) -> np.ndarray:
+    return model.predict(features(session, rng))
 
 
 # Scorers ==========================================================================================
 
 
 @scorer(directions={"corr": "max", "hit_rate": "max", "rmse": "min"})
-def fit_metrics(
-    pred: np.ndarray, session: Session, rng: Range, exec: Any, config: Any
-) -> ScoreResult:
+def fit_metrics(pred: np.ndarray, session: Session, rng: Range, config: None) -> ScoreResult:
+    """Prediction quality against the target, no trading."""
     truth = session.column(TARGET, rng)
     corr = float(np.corrcoef(pred, truth)[0, 1]) if pred.std() > 0 else 0.0
     return ScoreResult(
@@ -142,33 +139,41 @@ def fit_metrics(
 
 
 @dataclasses.dataclass(frozen=True)
-class Exec:
-    """Trade the sign of the predicted move when it exceeds ``threshold_bps``."""
+class SimConfig:
+    """Trade the sign of the predicted move above ``threshold_bps``; a flip costs ``cost_bps``."""
 
+    cost_bps: float
     threshold_bps: float
 
 
-@dataclasses.dataclass(frozen=True)
-class SimConfig:
-    cost_bps: float
-    fidelity: str
+def sim_metrics(series: np.ndarray) -> dict[str, float]:
+    """pnl, sharpe, max drawdown and turnover from a (pnl, flips) series."""
+    pnl, flips = series[:, 0], series[:, 1]
+    equity = np.cumsum(pnl)
+    drawdown = float(np.max(np.maximum.accumulate(equity) - equity)) if equity.size else 0.0
+    sharpe = (
+        float(pnl.mean() / pnl.std() * np.sqrt(pnl.size)) if pnl.size > 1 and pnl.std() > 0 else 0.0
+    )
+    return {
+        "pnl": float(pnl.sum()),
+        "sharpe": sharpe,
+        "max_dd": drawdown,
+        "turnover": float(flips.sum()),
+    }
 
 
 @scorer(
     directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
     from_series=sim_metrics,
 )
-def taker_sim(
-    pred: np.ndarray, session: Session, rng: Range, exec: Exec, config: SimConfig
-) -> ScoreResult:
-    """Per-stock taker simulation in bps: position flips cost ``cost_bps`` each."""
+def taker_sim(pred: np.ndarray, session: Session, rng: Range, config: SimConfig) -> ScoreResult:
+    """Per-stock taker simulation in bps."""
     truth = session.column(TARGET, rng)
     stock = session.column("stock_id", rng)
-    position = np.sign(pred) * (np.abs(pred) > exec.threshold_bps)
+    position = np.sign(pred) * (np.abs(pred) > config.threshold_bps)
     flips = np.zeros_like(position)
     for sid in np.unique(stock):
         rows = np.flatnonzero(stock == sid)
         flips[rows] = np.abs(np.diff(position[rows], prepend=0.0))
-    pnl = position * truth - config.cost_bps * flips
-    series = np.column_stack([pnl, flips])
+    series = np.column_stack([position * truth - config.cost_bps * flips, flips])
     return ScoreResult(sim_metrics(series), series)

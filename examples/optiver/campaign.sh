@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
-# One Optiver campaign, start to seal. Usage: examples/optiver/campaign.sh [stocks]
-# stocks: "all", a count ("20", the default) or a list ("0,1,2,3").
+# One Optiver campaign: freeze, run, seat the incumbent, compare the rest.
+# Usage: examples/optiver/campaign.sh [stocks]   ("all", a count such as "20", or "0,1,2,3")
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 [ -x .venv/bin/fy ] && PATH=".venv/bin:$PATH"
 command -v fy >/dev/null || { echo "fy not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
 export PYTHONPATH=examples FORESTRY_ROOT=.forestry-optiver
-DECL=optiver.declarations
 
 echo "== freeze"
 DS=$(fy freeze optiver.capture:freeze "${1:-20}")
+C="optiver.declarations --dataset $DS"
 echo "dataset $DS"
 
-echo "== screen: fit metrics, human gate"
-fy run "$DECL" --dataset "$DS"
-fy board "$DECL" --dataset "$DS"
+echo "== run"
+fy run $C
+fy board $C
 
-# A person reads the board and gates each row: fy gate <id> --advance|--stop --why "...".
-# This template advances every pending row with one recorded reason.
-fy gate "$DECL" --dataset "$DS" --pending --advance --why "screening: every pipeline clears corr 0.15"
+echo "== seat the incumbent"
+fy decide $C ridge_3m --kind promote --why "incumbent: the model in production" >/dev/null
 
-echo "== funnel: quick sim grid, full sim against the baseline"
-fy run "$DECL" --dataset "$DS"
-fy board "$DECL" --dataset "$DS"
+echo "== compare every scored candidate to it"
+fy compare $C
 
 echo "== history"
-fy history "$DECL" --dataset "$DS"
+fy history $C
 
-echo "== seal"
-fy seal "$DECL" --dataset "$DS" || true
+echo
+echo "Next: read the comparisons, then  fy decide $C <pipeline> --kind promote|reject --why '...'"
