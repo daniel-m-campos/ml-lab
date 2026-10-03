@@ -21,9 +21,9 @@ Steps:
 2. `fy dataset freeze --capture <id> --filters filters/std.yaml --target targets/ret-30s-120s.yaml` writes a dataset row; the filtered and labeled bytes land in `blobs/`.
 3. `git commit` the two manifests.
 
-Ledger after: one capture, one dataset, both with recipe and bytes hashes.
+Ledger after: one capture, one dataset, both with pipeline and bytes hashes.
 
-Done when: `fy dataset show <id>` prints the recipe, hashes and row count, and a rerun of step 2 with the same inputs returns the same id and writes nothing.
+Done when: `fy dataset show <id>` prints the pipeline, hashes and row count, and a rerun of step 2 with the same inputs returns the same id and writes nothing.
 
 ## S2. Researcher declares how candidates will be judged so that no comparison is argued after the fact
 
@@ -41,9 +41,9 @@ Done when: changing any input, including the simulator version, yields a differe
 Context: a new order-book imbalance feature set, depthwise bonsai, five seeds, data resident on the GPU box.
 
 Steps:
-1. Edit `recipes/imbalance-v2.yaml`: steps feature-imbalance -> select-topk -> bonsai-depthwise, train window 1y. The recipe implements fit/predict and knows nothing about folds.
-2. `fy run --dataset <id> --recipe recipes/imbalance-v2.yaml --protocol <id> --seeds 5 --executor gpubox`: the harness expands the protocol's schedule, writes one fit row per cutoff (memoized by dataset, recipe, train_range) and one predictions row per eval window and age, all on the resident session.
-3. `fy candidate add --dataset <id> --recipe <id> --exec-config exec/es-taker-a.yaml` names the prediction column to trade; `fy eval --candidate <id> --protocol <id>` runs the simulator harness-side and writes per-fold and aggregate eval rows.
+1. Edit `pipelines/imbalance-v2.yaml`: steps feature-imbalance -> select-topk -> bonsai-depthwise, train window 1y. The pipeline implements fit/predict and knows nothing about folds.
+2. `fy run --dataset <id> --pipeline pipelines/imbalance-v2.yaml --protocol <id> --seeds 5 --executor gpubox`: the harness expands the protocol's schedule, writes one fit row per cutoff (memoized by dataset, pipeline, train_range) and one predictions row per eval window and age, all on the resident session.
+3. `fy candidate add --dataset <id> --pipeline <id> --exec-config exec/es-taker-a.yaml` names the prediction column to trade; `fy eval --candidate <id> --protocol <id>` runs the simulator harness-side and writes per-fold and aggregate eval rows.
 
 Ledger after: N fits, N predictions, one candidate, N+1 evals.
 
@@ -68,9 +68,9 @@ Done when: `fy baseline --family ES --protocol <id>` names the candidate and the
 Context: three months into the campaign, 140 fits.
 
 Steps:
-1. `fy fits --dataset <id> --sort sharpe` lists fits with recipe name, seeds, metric vector, verdict against the baseline at the time.
+1. `fy fits --dataset <id> --sort sharpe` lists fits with pipeline name, seeds, metric vector, verdict against the baseline at the time.
 2. `fy history --baseline ES/<protocol>` prints the chain of promotions with their decisions and rationales.
-3. `fy why <fit>` prints the recipe, step configs and diffs against the baseline's fit.
+3. `fy why <fit>` prints the pipeline, step configs and diffs against the baseline's fit.
 
 Ledger after: unchanged.
 
@@ -86,7 +86,7 @@ Steps:
 
 Ledger after: one decision, one deployment.
 
-Done when: `fy deployments --env prod-es` shows the bundle hash, and the bundle's `bundle.json` names the dataset, recipe, protocol and metrics that justified it.
+Done when: `fy deployments --env prod-es` shows the bundle hash, and the bundle's `bundle.json` names the dataset, pipeline, protocol and metrics that justified it.
 
 ## S7. Researcher refreshes a deployed model so that the incumbent is the bar to clear
 
