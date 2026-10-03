@@ -3,6 +3,8 @@
 # stocks: "all", a count ("20", the default) or a list ("0,1,2,3").
 set -euo pipefail
 cd "$(dirname "$0")/../.."
+[ -x .venv/bin/fy ] && PATH=".venv/bin:$PATH"
+command -v fy >/dev/null || { echo "fy not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
 export PYTHONPATH=examples FORESTRY_ROOT=.forestry-optiver
 DECL=optiver.declarations
 
