@@ -20,14 +20,12 @@ $ fy history $C
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import importlib
 import importlib.util
 import json
 import os
 import pathlib
 import sys
-from collections.abc import Callable
 from typing import Any
 
 from forestry import harness, review
@@ -39,25 +37,40 @@ BOARD_COLUMNS = ("entry", "pipeline", "status", "verdict", "deltas", "metrics", 
 HISTORY_COLUMNS = ("id", "pipeline", "key", "against", "why", "actor")
 
 
-@dataclasses.dataclass(frozen=True)
-class Handler:
-    """One ``fy`` verb: its help line, how it extends the parser, and what it does."""
-
-    help: str
-    arguments: Callable[[argparse.ArgumentParser], None]
-    run: Callable[[argparse.Namespace, Ledger], int]
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="fy")
     parser.add_argument("--root", default=os.environ.get("FORESTRY_ROOT", DEFAULT_ROOT))
     sub = parser.add_subparsers(dest="command", required=True)
-    for name, handler in HANDLERS.items():
-        handler.arguments(sub.add_parser(name, help=handler.help))
+
+    p = sub.add_parser("freeze", help="call module:function(ledger, *args); prints the id")
+    p.add_argument("function", help="module:function(ledger, *args)")
+    p.add_argument("args", nargs="*")
+    p.set_defaults(handler=_freeze)
+
+    p = sub.add_parser("run", help="fit, predict and score every pipeline")
+    _campaign_arguments(p)
+    p.set_defaults(handler=_run)
+
+    p = sub.add_parser("board", help="every pipeline against the baseline; one name for detail")
+    _campaign_arguments(p)
+    p.add_argument("pipeline", nargs="?", help="one pipeline's detail as JSON")
+    p.set_defaults(handler=_board)
+
+    p = sub.add_parser("decide", help="record promote or reject on a pipeline")
+    _campaign_arguments(p)
+    p.add_argument("pipeline")
+    p.add_argument("--kind", required=True, choices=["promote", "reject"])
+    p.add_argument("--why", required=True)
+    p.set_defaults(handler=_decide)
+
+    p = sub.add_parser("history", help="the chain of promotions")
+    _campaign_arguments(p)
+    p.set_defaults(handler=_history)
+
     args = parser.parse_args(argv)
     ledger = Ledger.open(pathlib.Path(args.root))
     try:
-        return HANDLERS[args.command].run(args, ledger)
+        return args.handler(args, ledger)
     except (harness.Refused, KeyError) as refused:
         print(f"fy {args.command}: {refused}", file=sys.stderr)
         return 1
@@ -66,19 +79,14 @@ def main(argv: list[str] | None = None) -> int:
 # Handlers =========================================================================================
 
 
-def _freeze_arguments(p: argparse.ArgumentParser):
-    p.add_argument("function", help="module:function(ledger, *args)")
-    p.add_argument("args", nargs="*")
+def _campaign_arguments(p: argparse.ArgumentParser):
+    p.add_argument("declarations", help="module name or .py path")
+    p.add_argument("--dataset", required=True, help="dataset id from fy freeze")
 
 
 def _freeze(args: argparse.Namespace, ledger: Ledger) -> int:
     print(_load(args.function)(ledger, *args.args))
     return 0
-
-
-def _campaign_arguments(p: argparse.ArgumentParser):
-    p.add_argument("declarations", help="module name or .py path")
-    p.add_argument("--dataset", required=True, help="dataset id from fy freeze")
 
 
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
@@ -91,11 +99,6 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     return 0
 
 
-def _board_arguments(p: argparse.ArgumentParser):
-    _campaign_arguments(p)
-    p.add_argument("pipeline", nargs="?", help="one pipeline's detail as JSON")
-
-
 def _board(args: argparse.Namespace, ledger: Ledger) -> int:
     _, evaluation = _campaign(args)
     if args.pipeline:
@@ -104,13 +107,6 @@ def _board(args: argparse.Namespace, ledger: Ledger) -> int:
     else:
         print(_table(BOARD_COLUMNS, review.board(ledger, evaluation)))
     return 0
-
-
-def _decide_arguments(p: argparse.ArgumentParser):
-    _campaign_arguments(p)
-    p.add_argument("pipeline")
-    p.add_argument("--kind", required=True, choices=["promote", "reject"])
-    p.add_argument("--why", required=True)
 
 
 def _decide(args: argparse.Namespace, ledger: Ledger) -> int:
@@ -124,19 +120,6 @@ def _history(args: argparse.Namespace, ledger: Ledger) -> int:
     _, evaluation = _campaign(args)
     print(_table(HISTORY_COLUMNS, review.history(ledger, evaluation)))
     return 0
-
-
-HANDLERS = {
-    "freeze": Handler(
-        "call module:function(ledger, *args); prints the id", _freeze_arguments, _freeze
-    ),
-    "run": Handler("fit, predict and score every pipeline", _campaign_arguments, _run),
-    "board": Handler(
-        "every pipeline against the baseline; one name for detail", _board_arguments, _board
-    ),
-    "decide": Handler("record promote or reject on a pipeline", _decide_arguments, _decide),
-    "history": Handler("the chain of promotions", _campaign_arguments, _history),
-}
 
 
 # Private Functions ================================================================================
