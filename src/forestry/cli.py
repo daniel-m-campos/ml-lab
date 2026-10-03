@@ -29,6 +29,7 @@ from forestry.declare import Evaluation
 from forestry.ledger import Ledger
 
 DEFAULT_ROOT = ".forestry"
+TYPE_KEY = "__type__"
 BOARD_COLUMNS = ("seq", "id", "pipeline", "head", "exec", "stage", "status", "reason")
 
 
@@ -161,7 +162,9 @@ def _cell(value: Any) -> str:
         return ""
     if isinstance(value, dict):
         return " ".join(
-            f"{k}={v:g}" if isinstance(v, float) else f"{k}={v}" for k, v in value.items()
+            f"{k}={v:g}" if isinstance(v, float) else f"{k}={v}"
+            for k, v in value.items()
+            if k != TYPE_KEY
         )
     if isinstance(value, str) and len(value) == 16:
         return value[:8]
