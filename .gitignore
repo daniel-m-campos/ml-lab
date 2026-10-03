@@ -5,3 +5,5 @@ blobs/
 .forestry-toy/
 .venv/
 *.egg-info/
+data/
+.forestry-optiver/

@@ -16,7 +16,7 @@ An experiment is a triple on three independent, content-addressed axes. Nothing 
 | pipeline | the fit/predict implementation and its config, including how much history to train on | a modeling idea |
 | evaluation | schedule of cutoffs and eval windows, ages, embargo, sealed window, staged scorers and gates, metrics, rule | a validation or scoring idea |
 
-Two memo points keep the cross product from materializing. A fit is keyed by (dataset, pipeline, train_range); the pipeline hash covers its binning and preprocessing steps, so two pipelines that bin differently never share a fit. A prediction set is keyed by (fit, eval_range, head). Scores derive from predictions plus a scorer's config, so a scoring change refits nothing, and schedules that share a cutoff share the fit. Model bytes are optional: predictions and the fit key are kept always; bytes only for baselines, deployments and pins, since a fit is reproducible from its key, code sha and env lock.
+Two memo points keep the cross product from materializing. A fit is keyed by (dataset, pipeline, train_range); the pipeline hash covers its binning and preprocessing steps, so two pipelines that bin differently never share a fit. A prediction set is keyed by (fit, eval_range, head). Scores derive from predictions, the session's columns over the eval range and a scorer's config, so a scoring change refits nothing, and schedules that share a cutoff share the fit. Model bytes are optional: predictions and the fit key are kept always; bytes only for baselines, deployments and pins, since a fit is reproducible from its key, code sha and env lock.
 
 Comparability is "same dataset, same evaluation". The harness refuses anything else.
 

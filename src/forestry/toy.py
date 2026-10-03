@@ -132,8 +132,11 @@ def rmse_loss(pred: np.ndarray, truth: np.ndarray) -> float:
 
 
 @scorer(directions={"corr": "max", "hit_rate": "max", "rmse": "min"})
-def fit_metrics(pred: np.ndarray, truth: np.ndarray, exec: Any, config: Any) -> ScoreResult:
+def fit_metrics(
+    pred: np.ndarray, session: Session, rng: Range, exec: Any, config: Any
+) -> ScoreResult:
     """Prediction quality against the target, no trading."""
+    truth = session.column(TARGET, rng)
     corr = float(np.corrcoef(pred, truth)[0, 1]) if pred.std() > 0 else 0.0
     hit = float(np.mean(np.sign(pred) == np.sign(truth)))
     return ScoreResult({"corr": corr, "hit_rate": hit, "rmse": rmse_loss(pred, truth)})
@@ -152,7 +155,8 @@ class SimConfig:
     fidelity: str
 
 
-def _sim_metrics(series: np.ndarray) -> dict[str, float]:
+def sim_metrics(series: np.ndarray) -> dict[str, float]:
+    """pnl, sharpe, max drawdown and turnover from a (pnl, flips) series."""
     pnl, turnover = series[:, 0], series[:, 1]
     equity = np.cumsum(pnl)
     drawdown = float(np.max(np.maximum.accumulate(equity) - equity)) if equity.size else 0.0
@@ -169,16 +173,19 @@ def _sim_metrics(series: np.ndarray) -> dict[str, float]:
 
 @scorer(
     directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
-    from_series=_sim_metrics,
+    from_series=sim_metrics,
 )
-def sign_sim(pred: np.ndarray, truth: np.ndarray, exec: Exec, config: SimConfig) -> ScoreResult:
+def sign_sim(
+    pred: np.ndarray, session: Session, rng: Range, exec: Exec, config: SimConfig
+) -> ScoreResult:
     """Taker simulation: hold the sign of the prediction above a threshold, pay a cost per flip."""
+    truth = session.column(TARGET, rng)
     scale = pred.std() if pred.std() > 0 else 1.0
     position = np.sign(pred) * (np.abs(pred) > exec.threshold * scale)
     flips = np.abs(np.diff(position, prepend=0.0))
     pnl = position * truth - config.cost * flips
     series = np.column_stack([pnl, flips])
-    return ScoreResult(_sim_metrics(series), series)
+    return ScoreResult(sim_metrics(series), series)
 
 
 # Private Functions ================================================================================

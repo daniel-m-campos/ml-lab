@@ -27,7 +27,7 @@ def step(func: Callable) -> Callable:
 
 
 def scorer(directions: Mapping[str, str], from_series: Callable | None = None) -> Callable:
-    """Register a scorer: ``score(pred, truth, exec, config) -> ScoreResult``.
+    """Register a scorer: ``score(pred, session, range, exec, config) -> ScoreResult``.
 
     Parameters
     ----------

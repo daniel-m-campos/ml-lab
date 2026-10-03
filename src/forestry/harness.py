@@ -222,8 +222,7 @@ def seal(ledger: Ledger, candidate_id: str, evaluation: Evaluation) -> SealVerdi
         ledger, session, pipeline, fit_id, sealed, cand["head"], -1, 0, report
     )
     stage = evaluation.final
-    truth = session.column(_target(ledger, evaluation), sealed)
-    metrics = stage.scorer(pred, truth, _load(cand["exec"]), stage.config).metrics
+    metrics = stage.scorer(pred, session, sealed, _load(cand["exec"]), stage.config).metrics
     bands = _fold_bands(ledger, candidate_id, final_index, evaluation.compare_age)
     passed = all(bands[m][0] <= v <= bands[m][1] for m, v in metrics.items() if m in bands)
     kind = "seal-pass" if passed else "seal-fail"
@@ -455,7 +454,6 @@ def _score_candidate(
         return
     stage = evaluation.stages[index]
     exec = _load(cand["exec"])
-    target = _target(ledger, evaluation)
     pipeline = _load_pipeline(ledger, cand["pipeline"])
     by_age: dict[int, list[Any]] = {}
     for fold in folds:
@@ -466,7 +464,7 @@ def _score_candidate(
             pred = _ensure_predictions(
                 ledger, session, pipeline, fit_id, rng, cand["head"], fold.index, age, RunReport()
             )
-            result = stage.scorer(pred, session.column(target, rng), exec, stage.config)
+            result = stage.scorer(pred, session, rng, exec, stage.config)
             by_age.setdefault(age, []).append(result)
             ledger.put(
                 Kinds.SCORE,
@@ -802,10 +800,6 @@ def _dominance(a: dict[str, float], b: dict[str, float], directions: dict[str, s
 
 def _heads(pipeline: Pipeline) -> tuple[Any, ...]:
     return pipeline.heads if pipeline.heads else (None,)
-
-
-def _target(ledger: Ledger, evaluation: Evaluation) -> str:
-    return ledger.get(Kinds.DATASET, evaluation.dataset)["targets"][0]
 
 
 def _target_name(pipeline: Pipeline, evaluation: Evaluation, session: Session) -> str:
