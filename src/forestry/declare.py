@@ -142,6 +142,26 @@ class gates:
 
 
 @dataclasses.dataclass(frozen=True)
+class Rule:
+    """How two metric vectors are ordered: Pareto, or a priority order with a relative band."""
+
+    kind: str = "pareto"
+    order: tuple[str, ...] = ()
+    band: float = 0.0
+
+
+class rules:
+    """Rule constructors."""
+
+    pareto = Rule("pareto")
+
+    @staticmethod
+    def priority(*order: str, band: float = 0.02) -> Rule:
+        """Decide on the first metric whose relative difference exceeds ``band``."""
+        return Rule("priority", order=tuple(order), band=band)
+
+
+@dataclasses.dataclass(frozen=True)
 class Stage:
     """A scorer, its config, an optional execution grid and the gate out."""
 
@@ -160,6 +180,7 @@ class Evaluation:
     stages: tuple[Stage, ...]
     min_folds: int = 3
     sealed: Sealed = Sealed()
+    rule: Rule = Rule()
     compare_age: int = 1
     contracts: tuple[str, ...] = ("fit_predict",)
 

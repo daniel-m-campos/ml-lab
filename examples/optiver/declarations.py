@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 
-from forestry.declare import Evaluation, Pipeline, Schedule, Sealed, Stage, gates
+from forestry.declare import Evaluation, Pipeline, Schedule, Sealed, Stage, gates, rules
 from optiver import steps
 
 ridge = Pipeline(
@@ -60,5 +60,6 @@ def evaluation(dataset: str) -> Evaluation:
                 gate=gates.vs_baseline,
             ),
         ),
+        rule=rules.priority("pnl", "sharpe", "max_dd", "turnover", band=0.02),
         compare_age=1,
     )

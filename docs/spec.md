@@ -53,7 +53,7 @@ A head is a cheap readout of one trained model: an iteration count for a boosted
 | stages | ordered scorers, each with a cost class and a gate; see below | fit metrics (human gate), quick sim grid (Pareto front, cap 5), full sim |
 | metrics | per stage; the last stage's vector is business-oriented (pnl, sharpe, max drawdown, turnover) | |
 | aggregate | over folds: concatenated series for pnl and sharpe, worst drawdown, equal weights | |
-| rule | pareto on the aggregate; tie policy human | |
+| rule | pareto on the aggregate, or a priority order over metrics with a relative band (the next metric decides only inside the band); tie policy human | priority pnl, sharpe, max_dd, turnover, band 2% |
 | contracts | fit/predict, fit_sequence | fit/predict |
 
 Any field change is a new evaluation id. A scored sealed window becomes a public fold; time supplies the next seal.
@@ -112,6 +112,6 @@ An agent uses the CLI and Python API. The journal is a node per attempt: parent,
 
 ## Open
 
-1. Objective count before the incomparable set swamps the human; a cap or priority order per evaluation.
+1. Resolved 2026-10-03: the Optiver run left 17 of 20 final candidates incomparable under Pareto on four metrics; the evaluation now declares a priority order with a 2% band, Pareto remains available. With no incumbent the best of the first final-stage batch is seated at the end of the run, ranked by pairwise wins under the rule because the band makes dominance intransitive.
 2. Whether bonsai's bench harness becomes the first local executor or stays a consumer.
 3. Minimum slice: dataset, pipeline, evaluation, fit, predictions, candidate, score, comparison, baseline, decision on SQLite with the local executor; remote executors and the journal second.

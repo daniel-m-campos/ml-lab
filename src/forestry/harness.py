@@ -26,7 +26,7 @@ from typing import Any, Final
 import numpy as np
 
 from forestry import data, hashing
-from forestry.declare import Evaluation, Gate, Pipeline, Stage
+from forestry.declare import Evaluation, Gate, Pipeline, Rule, Stage
 from forestry.ledger import Kinds, Ledger
 from forestry.session import Range, Session, add_months, as_date
 
@@ -114,6 +114,7 @@ def run(ledger: Ledger, pipelines: list[Pipeline], evaluation: Evaluation) -> Ru
                     )
         _score_seated(ledger, session, evaluation, pipeline, folds)
         report.candidates += _advance_stages(ledger, session, evaluation, pipeline, folds)
+    _settle_final_stage(ledger, evaluation)
     return report
 
 
@@ -153,7 +154,7 @@ def compare(ledger: Ledger, candidate_id: str, evaluation: Evaluation) -> dict[s
     incumbent = _aggregate(ledger, current["candidate"], final_index, evaluation.compare_age)
     if _fold_count(ledger, candidate_id, final_index) < evaluation.min_folds:
         raise Refused("fewer folds than min_folds")
-    verdict = _dominance(challenger, incumbent, evaluation.directions)
+    verdict = _dominance(challenger, incumbent, evaluation.directions, evaluation.rule)
     row = {
         "challenger": candidate_id,
         "baseline": current["candidate"],
@@ -513,6 +514,8 @@ def _apply_gate(
             ledger.update(Kinds.CANDIDATE, c["id"], status=Status.PENDING)
         return
     if gate.kind == "vs_baseline":
+        if ledger.get(Kinds.BASELINE, evaluation.id) is None:
+            return
         for c in fresh:
             _gate_vs_baseline(ledger, evaluation, c)
         return
@@ -549,32 +552,39 @@ def _select(
         reverse = directions[gate.metric] == "max"
         ranked = sorted(metrics, key=lambda cid: metrics[cid][gate.metric], reverse=reverse)
         return set(ranked[: gate.n])
-    front = [
-        cid
-        for cid in metrics
-        if not any(
-            _dominance(metrics[o], metrics[cid], directions) == Verdict.DOMINATES
-            for o in metrics
-            if o != cid
-        )
+    return set(_ranked(metrics, directions, evaluation.rule)[: gate.n])
+
+
+def _settle_final_stage(ledger: Ledger, evaluation: Evaluation):
+    """Seat the best of the first batch to reach a baseline gate, then gate the rest against it."""
+    final = len(evaluation.stages) - 1
+    if evaluation.stages[final].gate.kind != "vs_baseline":
+        return
+    fresh = [
+        c
+        for c in ledger.where(Kinds.CANDIDATE, evaluation=evaluation.id, stage=final)
+        if c["status"] is None
     ]
-    front.sort(
-        key=lambda cid: (
-            -sum(metrics[cid][m] * (1 if d == "max" else -1) for m, d in directions.items())
-        )
+    if not fresh:
+        return
+    if ledger.get(Kinds.BASELINE, evaluation.id) is None:
+        _seat_best(ledger, evaluation, final, fresh)
+    for c in fresh:
+        _gate_vs_baseline(ledger, evaluation, c)
+
+
+def _seat_best(ledger: Ledger, evaluation: Evaluation, index: int, group: list[dict[str, Any]]):
+    metrics = {c["id"]: _aggregate(ledger, c["id"], index, evaluation.compare_age) for c in group}
+    best = _ranked(metrics, evaluation.directions, evaluation.rule)[0]
+    decision = _decision(
+        ledger, kind="promote", why="best of the first batch at the final stage", candidate=best
     )
-    return set(front[: gate.n])
+    _set_baseline(ledger, evaluation.id, evaluation.dataset, best, decision)
+    ledger.update(Kinds.CANDIDATE, best, status=Status.ADVANCED, reason="first baseline")
 
 
 def _gate_vs_baseline(ledger: Ledger, evaluation: Evaluation, cand: dict[str, Any]):
     current = ledger.get(Kinds.BASELINE, evaluation.id)
-    if current is None:
-        decision = _decision(
-            ledger, kind="promote", why="first candidate at the final stage", candidate=cand["id"]
-        )
-        _set_baseline(ledger, evaluation.id, evaluation.dataset, cand["id"], decision)
-        ledger.update(Kinds.CANDIDATE, cand["id"], status=Status.ADVANCED, reason="first baseline")
-        return
     if current["candidate"] == cand["id"]:
         ledger.update(Kinds.CANDIDATE, cand["id"], status=Status.ADVANCED)
         return
@@ -782,11 +792,43 @@ def _fold_bands(
     }
 
 
-def _dominance(a: dict[str, float], b: dict[str, float], directions: dict[str, str]) -> str:
+def _ranked(
+    metrics: dict[str, dict[str, float]], directions: dict[str, str], rule: Rule
+) -> list[str]:
+    """Candidate ids best first: the priority order, or the Pareto front then the rest."""
+
+    def cmp(x: str, y: str) -> int:
+        verdict = _dominance(metrics[x], metrics[y], directions, rule)
+        return -1 if verdict == Verdict.DOMINATES else 1 if verdict == Verdict.DOMINATED else 0
+
+    def summed(cid: str) -> float:
+        return -sum(metrics[cid][m] * (1 if d == "max" else -1) for m, d in directions.items())
+
+    def wins(cid: str) -> int:
+        return sum(cmp(cid, o) < 0 for o in metrics if o != cid)
+
+    if rule.kind == "priority":
+        return sorted(metrics, key=lambda cid: (-wins(cid), summed(cid)))
+    front = [cid for cid in metrics if not any(cmp(o, cid) < 0 for o in metrics if o != cid)]
+    rest = [cid for cid in metrics if cid not in front]
+    return sorted(front, key=summed) + sorted(rest, key=summed)
+
+
+def _dominance(
+    a: dict[str, float], b: dict[str, float], directions: dict[str, str], rule: Rule
+) -> str:
     def better(m: str) -> float:
         sign = 1.0 if directions[m] == "max" else -1.0
         return sign * (a[m] - b[m])
 
+    if rule.kind == "priority":
+        for m in rule.order:
+            relative = better(m) / max(abs(b[m]), 1e-12)
+            if relative > rule.band:
+                return Verdict.DOMINATES
+            if relative < -rule.band:
+                return Verdict.DOMINATED
+        return Verdict.INCOMPARABLE
     deltas = [better(m) for m in directions]
     if all(d >= 0 for d in deltas) and any(d > 0 for d in deltas):
         return Verdict.DOMINATES

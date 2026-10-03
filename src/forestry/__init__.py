@@ -10,6 +10,7 @@ from forestry.declare import (
     Stage,
     Tune,
     gates,
+    rules,
     scorer,
     step,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "Stage",
     "Tune",
     "gates",
+    "rules",
     "scorer",
     "step",
 ]
