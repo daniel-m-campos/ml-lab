@@ -61,10 +61,12 @@ def main() -> int:
 
     current = review.baseline(ledger, evaluation)
     if current is not None:
-        verdict = harness.seal(ledger, current["candidate"], evaluation)
-        print(
-            "seal", verdict.kind, json.dumps({k: round(v, 3) for k, v in verdict.metrics.items()})
-        )
+        try:
+            verdict = harness.seal(ledger, current["candidate"], evaluation)
+            metrics = {k: round(v, 3) for k, v in verdict.metrics.items()}
+            print("seal", verdict.kind, json.dumps(metrics))
+        except harness.Refused as refused:
+            print("seal:", refused)
     pending = sum(r["status"] == "pending" for r in review.board(ledger, evaluation))
     print(f"\nledger at {args.root}; pending decisions: {pending}")
     return 0
