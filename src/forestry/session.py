@@ -11,6 +11,7 @@ Examples
 
 from __future__ import annotations
 
+import calendar
 import datetime
 
 import numpy as np
@@ -37,18 +38,18 @@ class Session:
 
     @property
     def start(self) -> datetime.date:
-        return self.ts[0].astype("datetime64[D]").astype(datetime.date)
+        return self.date_at(0)
 
     @property
     def end_exclusive(self) -> datetime.date:
-        last = self.ts[-1].astype("datetime64[D]").astype(datetime.date)
-        return last + datetime.timedelta(days=1)
+        return self.date_at(-1) + datetime.timedelta(days=1)
 
     def index_of(
         self, when: str | datetime.date | datetime.datetime, offset_seconds: int = 0
     ) -> int:
         """First row at or after ``when`` shifted by ``offset_seconds``."""
-        moment = np.datetime64(as_datetime(when), "s").astype(np.int64) + offset_seconds
+        midnight = datetime.datetime.combine(as_date(when), datetime.time())
+        moment = np.datetime64(midnight, "s").astype(np.int64) + offset_seconds
         return int(np.searchsorted(self._seconds, moment, side="left"))
 
     def date_at(self, row: int) -> datetime.date:
@@ -74,21 +75,9 @@ def as_date(when: str | datetime.date | datetime.datetime) -> datetime.date:
     return datetime.date.fromisoformat(when[:10])
 
 
-def as_datetime(when: str | datetime.date | datetime.datetime) -> datetime.datetime:
-    if isinstance(when, datetime.datetime):
-        return when
-    date = as_date(when)
-    return datetime.datetime(date.year, date.month, date.day)
-
-
 def add_months(date: datetime.date, months: int) -> datetime.date:
     """Shift a date by whole months, clamping the day to the month's length."""
     month_index = date.month - 1 + months
     year = date.year + month_index // 12
     month = month_index % 12 + 1
-    last_day = [31, 29 if _leap(year) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
-    return datetime.date(year, month, min(date.day, last_day))
-
-
-def _leap(year: int) -> bool:
-    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    return datetime.date(year, month, min(date.day, calendar.monthrange(year, month)[1]))

@@ -37,31 +37,18 @@ HASH_LEN = 16
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
-@dataclasses.dataclass(frozen=True)
-class StepRef:
-    """Where a registered function lives: ``module:qualname``."""
-
-    module: str
-    qualname: str
-
-    @property
-    def path(self) -> str:
-        return f"{self.module}:{self.qualname}"
-
-
 # Declarations =====================================================================================
 
 
-def register(func: Callable, kind: str, **meta: Any) -> Callable:
-    """Mark a function as a hashable step or scorer and return it unchanged."""
-    setattr(func, STEP_ATTR, StepRef(func.__module__, func.__qualname__))
-    func.__forestry_kind__ = kind  # type: ignore[attr-defined]
+def register(func: Callable, **meta: Any) -> Callable:
+    """Mark a function as a hashable step by its ``module:qualname`` and return it unchanged."""
+    setattr(func, STEP_ATTR, f"{func.__module__}:{func.__qualname__}")
     func.__forestry_meta__ = meta  # type: ignore[attr-defined]
     return func
 
 
-def step_ref(func: Callable) -> StepRef:
-    """The registration of a step, or a TypeError for an unregistered callable."""
+def step_ref(func: Callable) -> str:
+    """The ``module:qualname`` of a step, or a TypeError for an unregistered callable."""
     ref = getattr(func, STEP_ATTR, None)
     if ref is None:
         raise TypeError(f"{func!r} is not a registered step; closures and lambdas cannot be hashed")
@@ -77,7 +64,7 @@ def canonical(obj: Any) -> Any:
     if isinstance(obj, (datetime.date, datetime.datetime)):
         return obj.isoformat()
     if callable(obj):
-        return {"__step__": step_ref(obj).path}
+        return {"__step__": step_ref(obj)}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         fields = {
             f.name: canonical(getattr(obj, f.name))

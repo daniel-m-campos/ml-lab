@@ -31,7 +31,7 @@ def step(func: Callable | None = None, *, format: str | None = None) -> Callable
     """
 
     def decorate(f: Callable) -> Callable:
-        return hashing.register(f, kind="step", format=format)
+        return hashing.register(f, format=format)
 
     return decorate(func) if func is not None else decorate
 
@@ -48,7 +48,7 @@ def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
     """
 
     def decorate(func: Callable) -> Callable:
-        return hashing.register(func, kind="scorer", metrics=metrics, directions=dict(directions))
+        return hashing.register(func, metrics=metrics, directions=dict(directions))
 
     return decorate
 

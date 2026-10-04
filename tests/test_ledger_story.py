@@ -6,7 +6,6 @@ Mirrors docs/user-stories.md; every event type in docs/spec.md is written and re
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import io
 import pathlib
 import sqlite3
@@ -24,7 +23,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def ledger(tmp_path) -> Ledger:
-    return Ledger.open(tmp_path / "forestry")
+    return Ledger(tmp_path / "forestry")
 
 
 @pytest.fixture
@@ -170,7 +169,7 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(ledger
 def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledger, tmp_path):
     code = tmp_path / "steps_v.py"
     code.write_text((REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNV"))
-    module = _import(code, "steps_v")
+    module = cli._load(str(code))
     dataset = module.dataset(ledger)
     evaluation = module.evaluation(dataset)
     pipeline = module.ridge(3)
@@ -178,7 +177,7 @@ def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledg
     decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="first")
     first_entry = decisions.baseline(ledger, evaluation)
     code.write_text(code.read_text().replace("0.01 * np.sum", "0.02 * np.sum"))
-    module = _import(code, "steps_v")
+    module = cli._load(str(code))
     report = runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
     assert module.ridge(3).id == pipeline.id
     assert report.fits_computed > 0 and report.entries_scored == 1
@@ -357,18 +356,10 @@ def test_ulids_sort_and_do_not_collide():
 
 def test_blobs_are_written_atomically_under_their_sha(ledger):
     sha = ledger.put_blob(b"hello")
-    assert ledger.has_blob(sha) and ledger.get_blob(sha) == b"hello"
+    assert (ledger.blobs / sha).exists() and ledger.get_blob(sha) == b"hello"
     assert sha == hashing.bytes_hash(b"hello")
     assert not list(ledger.blobs.glob(".tmp-*"))
 
 
 def test_git_blob_sha_matches_git():
     assert hashing.git_blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
-
-
-def _import(path: pathlib.Path, name: str):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module

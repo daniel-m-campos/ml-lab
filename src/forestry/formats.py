@@ -13,7 +13,7 @@ array([0., 1., 2.])
 from __future__ import annotations
 
 import io
-import os
+import pathlib
 import tempfile
 from collections.abc import Callable
 from typing import Any
@@ -106,20 +106,17 @@ def arrays_load(payload: bytes) -> dict[str, np.ndarray]:
 
 def bytes_via_file(write: Callable[[str], Any], suffix: str) -> bytes:
     """Bytes from a library that can only write to a path."""
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, f"model{suffix}")
-        write(path)
-        with open(path, "rb") as handle:
-            return handle.read()
+    with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
+        write(handle.name)
+        return pathlib.Path(handle.name).read_bytes()
 
 
 def load_via_file[T](payload: bytes, read: Callable[[str], T], suffix: str) -> T:
     """An object from a library that can only read from a path."""
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, f"model{suffix}")
-        with open(path, "wb") as handle:
-            handle.write(payload)
-        return read(path)
+    with tempfile.NamedTemporaryFile(suffix=suffix) as handle:
+        handle.write(payload)
+        handle.flush()
+        return read(handle.name)
 
 
 def _parquet_bytes(table: pa.Table) -> bytes:

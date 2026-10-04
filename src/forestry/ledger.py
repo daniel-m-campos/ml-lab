@@ -5,7 +5,7 @@ runs and decisions carry ULIDs, so two ledgers merge by id. Blobs live under the
 
 Examples
 --------
->>> ledger = Ledger.open("/tmp/fy-example")  # doctest: +SKIP
+>>> ledger = Ledger("/tmp/fy-example")  # doctest: +SKIP
 >>> ledger.append("pipeline_declared", "abc", "abc", {"name": "ridge"})  # doctest: +SKIP
 'abc'
 """
@@ -158,10 +158,11 @@ FROM event WHERE type='pipeline_failed';
 class Ledger:
     """One event table plus a content-addressed blob store under a root directory."""
 
-    def __init__(self, root: pathlib.Path):
-        self.root = root
-        self.blobs = root / "blobs" / "sha256"
-        self._db = sqlite3.connect(root / "forestry.sqlite")
+    def __init__(self, root: str | pathlib.Path):
+        self.root = pathlib.Path(root)
+        self.blobs = self.root / "blobs" / "sha256"
+        self.blobs.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(self.root / "forestry.sqlite")
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
@@ -171,13 +172,6 @@ class Ledger:
 
     def __repr__(self) -> str:
         return f"Ledger({self.root})"
-
-    @classmethod
-    def open(cls, root: str | pathlib.Path) -> Ledger:
-        """Create the directory layout if needed and open the database."""
-        root = pathlib.Path(root)
-        (root / "blobs" / "sha256").mkdir(parents=True, exist_ok=True)
-        return cls(root)
 
     # Events ---------------------------------------------------------------------------------------
 
@@ -252,9 +246,6 @@ class Ledger:
 
     def get_blob(self, sha: str) -> bytes:
         return (self.blobs / sha).read_bytes()
-
-    def has_blob(self, sha: str) -> bool:
-        return (self.blobs / sha).exists()
 
 
 def actor() -> str:

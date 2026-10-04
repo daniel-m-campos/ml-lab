@@ -49,7 +49,7 @@ def fy(root: pathlib.Path, *argv: str) -> str:
 
 
 def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
-    ledger = Ledger.open(root)
+    ledger = Ledger(root)
     event = ledger.latest("dataset_recorded", dataset)
     table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
     assert table.num_rows > 100_000 and table.num_rows == event["payload"]["rows"]
@@ -70,7 +70,7 @@ def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
 
 
 def test_a_rerun_writes_nothing_and_keeps_the_baseline(root, dataset):
-    ledger = Ledger.open(root)
+    ledger = Ledger(root)
     before = len(ledger.events())
     out = fy(root, "run", DECL, "--dataset", dataset)
     assert out.startswith("up to date: 5 entries") or out.startswith("up to date: 3 entries")
@@ -82,7 +82,7 @@ def test_a_rerun_writes_nothing_and_keeps_the_baseline(root, dataset):
 def test_a_bonsai_model_blob_opens_with_bonsai_alone(root, dataset, tmp_path):
     import bonsai
 
-    ledger = Ledger.open(root)
+    ledger = Ledger(root)
     fits = [
         f
         for f in ledger.events("fit_computed")

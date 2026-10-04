@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(handler=_history)
 
     args = parser.parse_args(argv)
-    ledger = Ledger.open(pathlib.Path(args.root))
+    ledger = Ledger(pathlib.Path(args.root))
     try:
         return args.handler(args, ledger)
     except (Refused, KeyError) as refused:

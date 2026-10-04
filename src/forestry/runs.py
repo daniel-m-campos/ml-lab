@@ -51,7 +51,6 @@ class RunReport:
     fits_reused: int = 0
     predictions_reused: int = 0
     entries_existing: int = 0
-    pipelines: list[str] = dataclasses.field(default_factory=list)
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
@@ -125,7 +124,6 @@ def run(
 
     for pipeline in pipelines:
         _declare_pipeline(ledger, pipeline)
-        report.pipelines.append(pipeline.id)
         try:
             _run_pipeline(ledger, session, folds, pipeline, evaluation, root, report, start)
         except Exception as error:  # noqa: BLE001
