@@ -1,4 +1,4 @@
-# forestry: design spec (draft 8, 2026-10-03)
+# ml-lab: design spec (draft 8, 2026-10-03)
 
 A local-first record of experimentation on frozen, time-ordered datasets. Git owns the code, a content-addressed blob store owns the bytes, an append-only event log owns what happened. People and agents write through two commands and read with SQL. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
 
@@ -14,7 +14,7 @@ In: frozen datasets, pipeline and evaluation declarations, runs that memoize fit
 |---|---|---|
 | code | git | per run: commit, dirty flag, the dirty diff as a blob; per fit: the git blob sha of every repo module imported while fitting, and the environment lock |
 | bytes | the blob store, `blobs/sha256/` | dataset rows, models, predictions, diffs, each under its sha, in a format that opens without this Python environment |
-| facts | the event log, `forestry.sqlite` | the seven event types below |
+| facts | the event log, `ml_lab.sqlite` | the seven event types below |
 
 The log never stores what a function is, only a dotted path and the blob shas git computed for the files. Reproducing a number is the join: the log says which shas and which commit, git has the content, the blob store has the bytes.
 
@@ -78,7 +78,7 @@ The import closure is every module under the repo root reachable from the step m
 
 Comparability: scores compare only within one evaluation. A scorer or schedule change is a new evaluation.
 
-Faults: every blob is written before the event that names it, and each fit is its own event, so a killed process loses at most the fit in flight and a rerun resumes from the last recorded one with the same ids. A pipeline that raises is recorded as `pipeline_failed` with its traceback, the other pipelines continue, and `fy run` exits 1 naming it. Failures are not memoized: a rerun retries. The `failure` view holds the error until a newer score exists.
+Faults: every blob is written before the event that names it, and each fit is its own event, so a killed process loses at most the fit in flight and a rerun resumes from the last recorded one with the same ids. A pipeline that raises is recorded as `pipeline_failed` with its traceback, the other pipelines continue, and `lab run` exits 1 naming it. Failures are not memoized: a rerun retries. The `failure` view holds the error until a newer score exists.
 
 Splits: a fit's train segments never overlap its fold's windows, and the embargo the split declares separates them. The folds are in the evaluation payload, written once; `session.ts` is optional and only `CalendarWalkForward` needs it.
 
@@ -100,28 +100,28 @@ A blob's name is the sha256 of its bytes as stored, so identical content is writ
 
 ## Analytics
 
-SQLite is the record; DuckDB is the analyst. `ATTACH 'forestry.sqlite' (TYPE sqlite)` queries the same views with columnar speed and hands frames to polars or pandas. Per-fold and aggregate metrics come from the views; per-row work (paired tests on pnl) loads prediction blobs by sha. Nothing in the log is redesigned for analytics.
+SQLite is the record; DuckDB is the analyst. `ATTACH 'ml_lab.sqlite' (TYPE sqlite)` queries the same views with columnar speed and hands frames to polars or pandas. Per-fold and aggregate metrics come from the views; per-row work (paired tests on pnl) loads prediction blobs by sha. Nothing in the log is redesigned for analytics.
 
 ## From inception to experimentation
 
-1. A project is a git repo exposing three module attributes, in one file or several: `dataset(ledger, *args)`, `pipelines` and `evaluation` (a value or a function of the dataset id). `fy` reads them by name, so a file holding only new pipelines runs beside the project's declarations.
-2. `fy ingest` appends `dataset_recorded` and stores the rows under their sha. Same recipe, same id, no write.
-3. The first `fy run` appends `evaluation_declared` with the schedule expanded once.
-4. A `fy run` with work appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `score_recorded` per pipeline whose predictions are new. A rerun of an unchanged tree writes nothing and prints what it reused; adding one pipeline costs only that pipeline's fits, predictions and score.
-5. Read with SQL: the latest score per pipeline, its aggregate and per-fold scores, the failures. Add a `Pipeline`, `fy run`, query again.
+1. A project is a git repo exposing three module attributes, in one file or several: `dataset(ledger, *args)`, `pipelines` and `evaluation` (a value or a function of the dataset id). `lab` reads them by name, so a file holding only new pipelines runs beside the project's declarations.
+2. `lab ingest` appends `dataset_recorded` and stores the rows under their sha. Same recipe, same id, no write.
+3. The first `lab run` appends `evaluation_declared` with the schedule expanded once.
+4. A `lab run` with work appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `score_recorded` per pipeline whose predictions are new. A rerun of an unchanged tree writes nothing and prints what it reused; adding one pipeline costs only that pipeline's fits, predictions and score.
+5. Read with SQL: the latest score per pipeline, its aggregate and per-fold scores, the failures. Add a `Pipeline`, `lab run`, query again.
 6. Code evolves: changed import shas refit, new scores appear, old scores stand with their commit and shas.
 7. Reproduce: the score names its run and predictions, the run its commit and resolution file, the fit its shas, lock and blob. Check out, sync, load, rerun, compare shas.
 
 ## Command line
 
 ```
-fy ingest project/dataset.py <args>              # prints the dataset id
-fy run project/experiment.py                   # newest dataset; --dataset <id prefix> to pick
-fy run project/experiment.py ideas/agent7.py   # pipelines from both, the evaluation from one
-sqlite3 -box .forestry/forestry.sqlite "..."
+lab ingest project/dataset.py <args>              # prints the dataset id
+lab run project/experiment.py                   # newest dataset; --dataset <id prefix> to pick
+lab run project/experiment.py ideas/agent7.py   # pipelines from both, the evaluation from one
+sqlite3 -box .ml-lab/ml_lab.sqlite "..."
 ```
 
-Two verbs. A module is a dotted name importable from the current directory or a `.py` path, resolved by its package so its own imports work. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
+Two verbs. A module is a dotted name importable from the current directory or a `.py` path, resolved by its package so its own imports work. The ledger root is `ML_LAB_ROOT` or `--root`. Every write carries the actor.
 
 Reads are SQL over the views. Three to start from:
 

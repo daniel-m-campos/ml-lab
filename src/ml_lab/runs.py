@@ -1,7 +1,7 @@
 """Runs: split a session, memoize fits and predictions, record a score per pipeline.
 
 A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``,
-``save`` and ``load``. Reading is SQL over the views in ``forestry.ledger``.
+``save`` and ``load``. Reading is SQL over the views in ``ml_lab.ledger``.
 
 Examples
 --------
@@ -25,11 +25,11 @@ from typing import Any
 
 import numpy as np
 
-from forestry import dataset, formats, identity
-from forestry.experiment import Evaluation, Pipeline
-from forestry.ledger import Event, Ledger, Refused
-from forestry.session import Range, Session
-from forestry.splits import Fold
+from ml_lab import dataset, formats, identity
+from ml_lab.experiment import Evaluation, Pipeline
+from ml_lab.ledger import Event, Ledger, Refused
+from ml_lab.session import Range, Session
+from ml_lab.splits import Fold
 
 
 @dataclasses.dataclass

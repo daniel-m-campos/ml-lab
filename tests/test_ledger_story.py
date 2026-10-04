@@ -16,10 +16,10 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from forestry import cli, identity, runs, splits
-from forestry.dataset import load
-from forestry.ledger import Event, Ledger, Refused
-from forestry.session import Session
+from ml_lab import cli, identity, runs, splits
+from ml_lab.dataset import load
+from ml_lab.ledger import Event, Ledger, Refused
+from ml_lab.session import Session
 from tests import synthetic
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -27,7 +27,7 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def ledger(tmp_path) -> Ledger:
-    return Ledger(tmp_path / "forestry")
+    return Ledger(tmp_path / "ml-lab")
 
 
 @pytest.fixture
@@ -247,7 +247,7 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
         for line in ledger.get_blob(payload["env_lock"]["sha"]).decode().split()
     )
     assert {"python", "numpy", "pyarrow"} <= set(lock) and "pytest" not in lock
-    assert lock["forestry"].count("+") == 1
+    assert lock["ml-lab"].count("+") == 1
     run = ledger.latest(Event.RUN, payload["run"])
     assert "commit" in run["payload"]["git"]
     model = pipeline.load(ledger.get_blob(payload["model"]["sha"]))
@@ -351,7 +351,7 @@ def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
 
 def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
     assert cli.main(["--root", str(tmp_path / "empty"), "run", "tests.synthetic"]) == 1
-    assert "fy ingest first" in capsys.readouterr().err
+    assert "lab ingest first" in capsys.readouterr().err
 
 
 # Read back ============================================================================
@@ -360,7 +360,7 @@ def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
 def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path):
     folds = evaluation.split.folds(load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
-    db = sqlite3.connect(tmp_path / "forestry" / "forestry.sqlite")
+    db = sqlite3.connect(tmp_path / "ml-lab" / "ml_lab.sqlite")
     metrics = len(evaluation.directions)
     assert db.execute("SELECT COUNT(*) FROM fold_score").fetchone()[0] == (
         2 * len(folds) * len(evaluation.split.horizons) * metrics

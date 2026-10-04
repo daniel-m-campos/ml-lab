@@ -1,4 +1,4 @@
-"""The Optiver template on four stocks, driven through ``fy`` exactly as launch.sh
+"""The Optiver template on four stocks, driven through ``lab`` exactly as launch.sh
 drives it.
 
 Skipped when the Kaggle data is absent.
@@ -19,7 +19,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "examples"))
 
-from forestry.ledger import Ledger  # noqa: E402
+from ml_lab.ledger import Ledger  # noqa: E402
 from optiver import dataset as optiver_dataset  # noqa: E402
 from optiver import experiment  # noqa: E402
 
@@ -31,22 +31,22 @@ DECL = "optiver.experiment"
 
 @pytest.fixture(scope="module")
 def root(tmp_path_factory) -> pathlib.Path:
-    return tmp_path_factory.mktemp("optiver") / "forestry"
+    return tmp_path_factory.mktemp("optiver") / "ml-lab"
 
 
 @pytest.fixture(scope="module")
 def dataset(root: pathlib.Path) -> str:
-    return fy(root, "ingest", "optiver.dataset", "0,1,2,3").strip()
+    return lab(root, "ingest", "optiver.dataset", "0,1,2,3").strip()
 
 
-def fy(root: pathlib.Path, *argv: str) -> str:
+def lab(root: pathlib.Path, *argv: str) -> str:
     env = {
         **os.environ,
         "PYTHONPATH": str(REPO / "examples"),
-        "FORESTRY_ROOT": str(root),
+        "ML_LAB_ROOT": str(root),
     }
     done = subprocess.run(
-        [sys.executable, "-m", "forestry.cli", *argv],
+        [sys.executable, "-m", "ml_lab.cli", *argv],
         cwd=REPO,
         env=env,
         text=True,
@@ -71,7 +71,7 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
 
 
 def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
-    fy(root, "run", DECL)
+    lab(root, "run", DECL)
     rows = Ledger(root).sql(
         "SELECT p.name, s.metric, s.value FROM latest_score l "
         "JOIN aggregate_score s ON s.score = l.score "
@@ -87,7 +87,7 @@ def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
 def test_a_rerun_writes_nothing(root, dataset):
     ledger = Ledger(root)
     before = len(ledger.events())
-    out = fy(root, "run", DECL, "--dataset", dataset)
+    out = lab(root, "run", DECL, "--dataset", dataset)
     assert out.startswith("up to date:")
     assert ledger.events()[before:] == []
 

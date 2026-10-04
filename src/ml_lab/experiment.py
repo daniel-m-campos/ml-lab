@@ -1,6 +1,6 @@
 """What an experiment is made of: steps, scorers, pipelines and the evaluation.
 
-An experiment module exposes ``pipelines`` and ``evaluation``; ``fy run`` reads both by
+An experiment module exposes ``pipelines`` and ``evaluation``; ``lab run`` reads both by
 name. Declarations are frozen dataclasses hashed by canonical serialization; see
 docs/spec.md. A pipeline's name is a label and does not enter its hash. Identity is
 declaration only: code changes are caught by the fit memo, not by hashing files.
@@ -19,7 +19,7 @@ import dataclasses
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from forestry import identity
+from ml_lab import identity
 
 
 def step(func: Callable | None = None, *, format: str | None = None) -> Callable:
@@ -77,7 +77,7 @@ class Pipeline:
 
     @property
     def format(self) -> str | None:
-        return self.save.__forestry_meta__.get("format")
+        return self.save.__ml_lab_meta__.get("format")
 
     @property
     def steps(self) -> tuple[Callable, ...]:
@@ -96,7 +96,7 @@ class Pipeline:
 @dataclasses.dataclass(frozen=True)
 class Evaluation:
     """How every pipeline on a dataset is scored: a split into folds, a scorer and its
-    config. Splits live in ``forestry.splits``; any frozen dataclass with
+    config. Splits live in ``ml_lab.splits``; any frozen dataclass with
     ``folds(session) -> list[Fold]`` works.
     """
 
@@ -111,8 +111,8 @@ class Evaluation:
 
     @property
     def directions(self) -> dict[str, str]:
-        return self.scorer.__forestry_meta__["directions"]
+        return self.scorer.__ml_lab_meta__["directions"]
 
     @property
     def metrics(self) -> Callable:
-        return self.scorer.__forestry_meta__["metrics"]
+        return self.scorer.__ml_lab_meta__["metrics"]

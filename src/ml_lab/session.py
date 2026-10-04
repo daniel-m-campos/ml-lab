@@ -15,7 +15,7 @@ import datetime
 
 import numpy as np
 
-from forestry.dates import as_date
+from ml_lab.dates import as_date
 
 Range = tuple[int, int]
 Rows = Range | tuple[Range, ...]

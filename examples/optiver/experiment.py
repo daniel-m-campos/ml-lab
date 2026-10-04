@@ -1,9 +1,9 @@
-"""Pipelines and the evaluation for the Optiver example; ``fy`` loads this module."""
+"""Pipelines and the evaluation for the Optiver example; ``lab`` loads this module."""
 
 from __future__ import annotations
 
-from forestry.experiment import Evaluation, Pipeline
-from forestry.splits import CalendarWalkForward
+from ml_lab.experiment import Evaluation, Pipeline
+from ml_lab.splits import CalendarWalkForward
 from optiver import steps
 
 ridge = Pipeline(

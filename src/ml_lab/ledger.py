@@ -23,10 +23,10 @@ import sqlite3
 import time
 from typing import Any, Final
 
-from forestry import identity
+from ml_lab import identity
 
 SCHEMA_VERSION = 12
-ACTOR_ENV = "FORESTRY_ACTOR"
+ACTOR_ENV = "ML_LAB_ACTOR"
 
 
 class Refused(Exception):
@@ -142,7 +142,7 @@ class Ledger:
         self.root = pathlib.Path(root)
         self.blobs = self.root / "blobs" / "sha256"
         self.blobs.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.root / "forestry.sqlite")
+        self._db = sqlite3.connect(self.root / "ml_lab.sqlite")
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
@@ -233,7 +233,7 @@ class Ledger:
 
 
 def actor() -> str:
-    """Who is writing: ``FORESTRY_ACTOR`` or the login name."""
+    """Who is writing: ``ML_LAB_ACTOR`` or the login name."""
     return os.environ.get(ACTOR_ENV) or getpass.getuser()
 
 

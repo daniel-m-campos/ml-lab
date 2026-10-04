@@ -3,24 +3,24 @@
 # Usage: examples/optiver/launch.sh [stocks]   ("all", a count such as "20", or "0,1,2,3")
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-[ -x .venv/bin/fy ] && PATH=".venv/bin:$PATH"
-command -v fy >/dev/null || { echo "fy not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
-export FORESTRY_ROOT=.forestry-optiver
-export FORESTRY_ACTOR="${FORESTRY_ACTOR:-$USER}"
+[ -x .venv/bin/lab ] && PATH=".venv/bin:$PATH"
+command -v lab >/dev/null || { echo "lab not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
+export ML_LAB_ROOT=.ml-lab-optiver
+export ML_LAB_ACTOR="${ML_LAB_ACTOR:-$USER}"
 D=examples/optiver/experiment.py
 
 echo "== ingest"
-fy ingest examples/optiver/dataset.py "${1:-20}"
+lab ingest examples/optiver/dataset.py "${1:-20}"
 
 echo "== run"
-fy run $D
+lab run $D
 
 echo "== latest aggregate scores, horizon 1"
-sqlite3 -box $FORESTRY_ROOT/forestry.sqlite "
+sqlite3 -box $ML_LAB_ROOT/ml_lab.sqlite "
 SELECT p.name, s.metric, round(s.value, 2) AS value FROM latest_score l
 JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline
 WHERE s.window = '1' ORDER BY s.metric, s.value DESC"
 
 echo
-echo "Next: export FORESTRY_ROOT=$FORESTRY_ROOT, add a Pipeline to $D (or a file of pipelines), fy run $D <file>,"
-echo "      then sqlite3 -box \$FORESTRY_ROOT/forestry.sqlite over fold_score, aggregate_score, fit, failure."
+echo "Next: export ML_LAB_ROOT=$ML_LAB_ROOT, add a Pipeline to $D (or a file of pipelines), lab run $D <file>,"
+echo "      then sqlite3 -box \$ML_LAB_ROOT/ml_lab.sqlite over fold_score, aggregate_score, fit, failure."

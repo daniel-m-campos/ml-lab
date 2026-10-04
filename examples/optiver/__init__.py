@@ -1,4 +1,4 @@
-"""Optiver "Trading at the Close" (Kaggle, 2023) as a forestry example.
+"""Optiver "Trading at the Close" (Kaggle, 2023) as a ml-lab example.
 
 Real order-book columns, 200 stocks, 481 trading days, target is the 60 s ahead move of
 the stock's weighted average price in basis points. The competition hides calendar

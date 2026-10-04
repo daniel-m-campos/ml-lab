@@ -1,21 +1,21 @@
-"""``fy``: the command line over the log, two verbs; reading is SQL over the views.
+"""``lab``: the command line over the log, two verbs; reading is SQL over the views.
 
 Declarations are plain module attributes, so a project may organize them freely: one
 script, or ``dataset.py`` + ``steps.py`` + ``experiment.py``, or one file per idea. ``fy
-ingest`` reads ``dataset(ledger, *args)`` from a module. ``fy run`` takes one or more
+ingest`` reads ``dataset(ledger, *args)`` from a module. ``lab run`` takes one or more
 modules, reads ``pipelines`` (a list of ``Pipeline``) from each and ``evaluation`` (an
 ``Evaluation`` or a function of the dataset id) from exactly one of them, so a file an
 agent wrote holding only new pipelines runs beside the project's declarations. A module
 is a dotted name importable from the current directory or a ``.py`` path. The dataset
 defaults to the newest one recorded. The ledger root comes from ``--root`` or
-``FORESTRY_ROOT`` (default ``.forestry``); the actor from ``FORESTRY_ACTOR``.
+``ML_LAB_ROOT`` (default ``.ml-lab``); the actor from ``ML_LAB_ACTOR``.
 
 Examples
 --------
-$ fy ingest examples/optiver/dataset.py 20
-$ fy run examples/optiver/experiment.py
-$ fy run examples/optiver/experiment.py ideas/agent7.py
-$ sqlite3 -box .forestry/forestry.sqlite "SELECT * FROM latest_score"
+$ lab ingest examples/optiver/dataset.py 20
+$ lab run examples/optiver/experiment.py
+$ lab run examples/optiver/experiment.py ideas/agent7.py
+$ sqlite3 -box .ml-lab/ml_lab.sqlite "SELECT * FROM latest_score"
 """
 
 from __future__ import annotations
@@ -27,16 +27,16 @@ import pathlib
 import sys
 from typing import Any
 
-from forestry import runs
-from forestry.experiment import Evaluation, Pipeline
-from forestry.ledger import Event, Ledger, Refused
+from ml_lab import runs
+from ml_lab.experiment import Evaluation, Pipeline
+from ml_lab.ledger import Event, Ledger, Refused
 
-DEFAULT_ROOT = ".forestry"
+DEFAULT_ROOT = ".ml-lab"
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="fy")
-    parser.add_argument("--root", default=os.environ.get("FORESTRY_ROOT", DEFAULT_ROOT))
+    parser = argparse.ArgumentParser(prog="lab")
+    parser.add_argument("--root", default=os.environ.get("ML_LAB_ROOT", DEFAULT_ROOT))
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser(
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.handler(args, ledger)
     except (Refused, KeyError, ImportError) as refused:
-        print(f"fy {args.command}: {refused}", file=sys.stderr)
+        print(f"lab {args.command}: {refused}", file=sys.stderr)
         return 1
 
 
@@ -86,7 +86,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
         f"{report.predictions_computed}, scores {report.scores_recorded}"
     )
     for name, error in report.failed.items():
-        print(f"fy run: {name} failed: {error}", file=sys.stderr)
+        print(f"lab run: {name} failed: {error}", file=sys.stderr)
     return 1 if report.failed else 0
 
 
@@ -120,7 +120,7 @@ def _dataset(ledger: Ledger, prefix: str | None) -> str:
     matches = [i for i in ids if i.startswith(prefix)] if prefix else ids[-1:]
     if len(matches) != 1:
         raise Refused(
-            f"dataset {prefix or '(newest)'}: {len(matches)} matches; fy ingest first"
+            f"dataset {prefix or '(newest)'}: {len(matches)} matches; lab ingest first"
         )
     return matches[-1]
 

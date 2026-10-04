@@ -7,13 +7,13 @@ from typing import Any
 
 import numpy as np
 
-from forestry import formats
-from forestry.dataset import record
-from forestry.dates import add_months, as_date
-from forestry.experiment import Evaluation, Pipeline, scorer, step
-from forestry.ledger import Ledger
-from forestry.session import Range, Session
-from forestry.splits import CalendarWalkForward, Segments
+from ml_lab import formats
+from ml_lab.dataset import record
+from ml_lab.dates import add_months, as_date
+from ml_lab.experiment import Evaluation, Pipeline, scorer, step
+from ml_lab.ledger import Ledger
+from ml_lab.session import Range, Session
+from ml_lab.splits import CalendarWalkForward, Segments
 
 FEATURES = ("f0", "f1", "f2")
 TARGET = "ret_1"

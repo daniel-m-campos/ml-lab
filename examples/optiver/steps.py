@@ -6,11 +6,11 @@ import dataclasses
 
 import numpy as np
 
-from forestry import formats
-from forestry.dates import add_months
-from forestry.experiment import scorer, step
-from forestry.session import Range, Session
-from forestry.splits import Segments
+from ml_lab import formats
+from ml_lab.dates import add_months
+from ml_lab.experiment import scorer, step
+from ml_lab.session import Range, Session
+from ml_lab.splits import Segments
 
 try:
     import bonsai

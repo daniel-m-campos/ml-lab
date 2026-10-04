@@ -23,7 +23,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from forestry.session import Session
+from ml_lab.session import Session
 
 TS = "ts"
 PREDICTION = "prediction"

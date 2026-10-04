@@ -4,6 +4,6 @@ blobs/
 .venv/
 *.egg-info/
 data/
-.forestry-optiver/
-.forestry/
+.ml-lab-optiver/
+.ml-lab/
 .scratch/

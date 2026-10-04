@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import dataclasses
 
-from forestry import dates
-from forestry.ledger import Refused
-from forestry.session import Range, Session
+from ml_lab import dates
+from ml_lab.ledger import Refused
+from ml_lab.session import Range, Session
 
 Segments = tuple[Range, ...]
 

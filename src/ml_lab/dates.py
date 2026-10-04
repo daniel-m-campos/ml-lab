@@ -13,7 +13,7 @@ import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from forestry.session import Session
+    from ml_lab.session import Session
 
 
 def as_date(when: str | datetime.date | datetime.datetime) -> datetime.date:

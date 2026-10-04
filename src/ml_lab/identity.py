@@ -34,7 +34,7 @@ from typing import Any
 
 import numpy as np
 
-STEP_ATTR = "__forestry_step__"
+STEP_ATTR = "__ml_lab_step__"
 HASH_LEN = 16
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -47,7 +47,7 @@ def register(func: Callable, **meta: Any) -> Callable:
     unchanged.
     """
     setattr(func, STEP_ATTR, f"{func.__module__}:{func.__qualname__}")
-    func.__forestry_meta__ = meta  # type: ignore[attr-defined]
+    func.__ml_lab_meta__ = meta  # type: ignore[attr-defined]
     return func
 
 

@@ -15,9 +15,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from forestry import dates, formats, identity
-from forestry.ledger import Event, Ledger
-from forestry.session import Session
+from ml_lab import dates, formats, identity
+from ml_lab.ledger import Event, Ledger
+from ml_lab.session import Session
 
 
 def record(
