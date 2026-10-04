@@ -50,12 +50,27 @@ class Session:
         self._clock()
         return self.ts[row].astype("datetime64[D]").astype(datetime.date)
 
+    def upto(self, row: int) -> Session:
+        """The first ``row`` rows as a view: positions are unchanged, so ranges into
+        the full session stay valid, and nothing after ``row`` can be read.
+        """
+        view = Session.__new__(Session)
+        view.columns = {k: v[:row] for k, v in self.columns.items()}
+        view.ts = None if self.ts is None else self.ts[:row]
+        view._seconds = None if self._seconds is None else self._seconds[:row]
+        return view
+
     def matrix(self, rows: Rows, cols: tuple[str, ...]) -> np.ndarray:
         """Column-stacked features over a range or segments, shape (rows, len(cols))."""
         return np.column_stack([self.column(c, rows) for c in cols])
 
     def column(self, name: str, rows: Rows) -> np.ndarray:
         values = self.columns[name]
+        end = max(hi for _, hi in segments(rows))
+        if end > self.rows:
+            raise ValueError(
+                f"rows up to {end} asked, {self.rows} visible before the cutoff"
+            )
         return np.concatenate([values[lo:hi] for lo, hi in segments(rows)])
 
     def _clock(self) -> np.ndarray:

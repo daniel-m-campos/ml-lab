@@ -19,6 +19,7 @@ import pytest
 from ml_lab import cli, identity, runs, splits
 from ml_lab.dataset import load, record
 from ml_lab.ledger import Event, Ledger, Refused
+from ml_lab.panel import Panel
 from ml_lab.runs import _load_predictions
 from ml_lab.session import Session
 from tests import synthetic
@@ -226,6 +227,18 @@ def test_adding_a_pipeline_costs_only_its_own_fits(ledger, dataset, evaluation):
     assert report.fits_computed == len(folds) and report.scores_recorded == 1
     assert report.fits_reused == len(folds) and report.scores_reused == 1
     assert len(ledger.events(Event.RUN)) == 2
+
+
+def test_steps_see_only_the_rows_before_their_cutoff(ledger, dataset, evaluation):
+    folds = evaluation.split.folds(load(ledger, dataset))
+    synthetic.SEEN_ROWS.clear()
+    peeking = dataclasses.replace(synthetic.ridge(1), fit=synthetic.peeking_fit)
+    _run(ledger, evaluation, peeking)
+    assert synthetic.SEEN_ROWS == [fold.train[-1][1] for fold in folds]
+    first = load(ledger, dataset).upto(10)
+    assert first.rows == 10 and first.column("f0", (8, 10)).shape == (2,)
+    with pytest.raises(ValueError, match="before"):
+        first.matrix((8, 12), ("f0",))
 
 
 def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
@@ -485,3 +498,23 @@ def test_git_blob_sha_matches_git():
     assert (
         identity.git_blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
     )
+
+
+# Panel ================================================================================
+
+
+def test_a_panel_grids_a_session_by_time_and_key_and_back():
+    ts = np.array(["2025-01-01"] * 2 + ["2025-01-02"], dtype="datetime64[s]")
+    session = Session(
+        {"stock": np.array([1, 2, 1]), "px": np.array([10.0, 20.0, 11.0])}, ts
+    )
+    panel = Panel(session, "stock")
+    grid = panel.grid("px")
+    assert panel.shape == (2, 2) and np.isnan(grid[1, 1])
+    assert np.array_equal(grid[:, 0], [10.0, 11.0])
+    assert np.array_equal(panel.rows(grid), session.columns["px"])
+    demeaned = grid - np.nanmean(grid, axis=1, keepdims=True)
+    assert np.allclose(panel.rows(demeaned), [-5.0, 5.0, 0.0])
+    assert Panel(session.upto(2), "stock").shape == (1, 2)
+    with pytest.raises(ValueError, match="timestamps"):
+        Panel(Session({"stock": np.array([1])}), "stock")

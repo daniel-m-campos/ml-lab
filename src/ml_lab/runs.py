@@ -68,7 +68,10 @@ def run(
     write, so a rerun of an unchanged tree writes nothing and adding one pipeline costs
     only its own fits, predictions and score. A pipeline that raises is recorded as
     ``pipeline_failed`` and the others continue; what it had written stays and a rerun
-    resumes from there. Two names on one declaration are refused, since the ledger
+    resumes from there. Every step sees a prefix of the session: fit up to the end of
+    its last train segment, predict, postprocess and the scorer up to the end of the
+    window, so nothing after the cutoff can be read. Two names on one declaration are
+    refused, since the ledger
     keeps one name per id and would score the second as a duplicate. ``log`` receives
     one line per fit, prediction set and score as it is written.
     """
@@ -189,7 +192,8 @@ def _run_pipeline(
             return fit_id
         run_id = start()
         started = time.perf_counter()
-        model = pipeline.fit(session, fold.train, pipeline.config)
+        visible = session.upto(max(hi for _, hi in fold.train))
+        model = pipeline.fit(visible, fold.train, pipeline.config)
         duration = time.perf_counter() - started
         models[fit_id] = model
         ledger.append(
@@ -261,13 +265,15 @@ def _run_pipeline(
                     ledger.get_blob(fit["payload"]["model"]["sha"])
                 )
             raw = write_predictions(
-                raw_id, pipeline.predict(models[fit_id], session, rng), where
+                raw_id,
+                pipeline.predict(models[fit_id], session.upto(rng[1]), rng),
+                where,
             )
             log(f"predictions {name} {window} rows {rng[0]}:{rng[1]}")
         if pipeline.postprocess is not None:
             write_predictions(
                 pred_id,
-                pipeline.postprocess(raw, session, rng),
+                pipeline.postprocess(raw, session.upto(rng[1]), rng),
                 {
                     **where,
                     "raw": raw_id,
@@ -302,7 +308,9 @@ def _run_pipeline(
     for index, fold in enumerate(folds):
         for window, rng in fold.windows.items():
             pred = _load_predictions(ledger, predictions[f"{index}:{window}"])
-            rows = np.asarray(evaluation.scorer(pred, session, rng, evaluation.config))
+            rows = np.asarray(
+                evaluation.scorer(pred, session.upto(rng[1]), rng, evaluation.config)
+            )
             series.setdefault(window, []).append(rows)
             per_fold.append(
                 {

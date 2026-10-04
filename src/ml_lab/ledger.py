@@ -178,8 +178,8 @@ class Ledger:
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, SCHEMA_VERSION):
             raise Refused(
-                f"ledger schema {version}, this build is {SCHEMA_VERSION}; the log is a "
-                "cache of code plus data, delete the root and rerun"
+                f"ledger schema {version}, this build is {SCHEMA_VERSION}; the log is "
+                "a cache of code plus data, delete the root and rerun"
             )
         self._db.executescript(DDL + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};")
 

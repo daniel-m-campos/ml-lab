@@ -107,6 +107,14 @@ def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray
 
 
 FLAKY_CALLS: list[int] = []
+SEEN_ROWS: list[int] = []
+
+
+@step
+def peeking_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
+    """Records how many rows it could see; the guard test reads it."""
+    SEEN_ROWS.append(session.rows)
+    return ridge_fit(session, train, config)
 
 
 @step
