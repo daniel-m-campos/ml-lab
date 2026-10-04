@@ -29,7 +29,7 @@ from typing import Any
 
 from ml_lab import runs
 from ml_lab.experiment import Evaluation, Pipeline
-from ml_lab.ledger import Event, Ledger, Refused
+from ml_lab.ledger import Ledger, Refused
 
 DEFAULT_ROOT = ".ml-lab"
 
@@ -51,7 +51,9 @@ def main(argv: list[str] | None = None) -> int:
         "experiments", nargs="+", help="modules or .py paths exposing pipelines"
     )
     p.add_argument(
-        "--dataset", help="dataset id or prefix; default: the newest recorded"
+        "--dataset",
+        help="dataset id prefix or source name; default: the newest, when the ledger "
+        "holds one source",
     )
     p.set_defaults(handler=_run)
 
@@ -114,15 +116,27 @@ def _experiments(
     return pipelines, evaluation
 
 
-def _dataset(ledger: Ledger, prefix: str | None) -> str:
-    """The newest recorded dataset, or the one whose id starts with ``prefix``."""
-    ids = [e["id"] for e in ledger.events(Event.DATASET)]
-    matches = [i for i in ids if i.startswith(prefix)] if prefix else ids[-1:]
-    if len(matches) != 1:
-        raise Refused(
-            f"dataset {prefix or '(newest)'}: {len(matches)} matches; lab ingest first"
-        )
-    return matches[-1]
+def _dataset(ledger: Ledger, selector: str | None) -> str:
+    """The dataset named by an id prefix or a source; with no selector, the newest,
+    provided every dataset in the ledger shares one source.
+    """
+    rows = ledger.sql("SELECT id, source FROM dataset ORDER BY seq")
+    by_source: dict[str, str] = {r["source"]: r["id"] for r in rows}
+    if selector in by_source:
+        return by_source[selector]
+    if selector:
+        matches = [r["id"] for r in rows if r["id"].startswith(selector)]
+        if len(matches) != 1:
+            raise Refused(
+                f"dataset {selector}: {len(matches)} matches; lab ingest first"
+            )
+        return matches[0]
+    if len(by_source) > 1:
+        choices = ", ".join(f"{s} ({i[:8]})" for s, i in by_source.items())
+        raise Refused(f"ledger holds several sources, pass --dataset: {choices}")
+    if not rows:
+        raise Refused("dataset (newest): 0 matches; lab ingest first")
+    return rows[-1]["id"]
 
 
 def _load(spec: str) -> Any:

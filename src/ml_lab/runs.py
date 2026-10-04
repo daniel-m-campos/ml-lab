@@ -65,12 +65,20 @@ def run(
     write, so a rerun of an unchanged tree writes nothing and adding one pipeline costs
     only its own fits, predictions and score. A pipeline that raises is recorded as
     ``pipeline_failed`` and the others continue; what it had written stays and a rerun
-    resumes from there. ``log`` receives one line per fit, prediction set and score
-    as it is written.
+    resumes from there. Two names on one declaration are refused, since the ledger
+    keeps one name per id and would score the second as a duplicate. ``log`` receives
+    one line per fit, prediction set and score as it is written.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
+    names: dict[str, str] = {}
     for pipeline in pipelines:
+        name = pipeline.name or pipeline.id
+        if names.setdefault(pipeline.id, name) != name:
+            raise Refused(
+                f"pipelines {names[pipeline.id]} and {name} declare the same steps and "
+                f"config, one id {pipeline.id}; rename or change one"
+            )
         if pipeline.format is None:
             raise Refused(
                 f"pipeline {pipeline.name or pipeline.id}: save step declares no format"

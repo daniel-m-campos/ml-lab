@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from ml_lab import cli, identity, runs, splits
-from ml_lab.dataset import load
+from ml_lab.dataset import load, record
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.session import Session
 from tests import synthetic
@@ -348,6 +348,32 @@ def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
     assert "No module named 'nope'" in capsys.readouterr().err
     assert cli.main([*root, "run", "tests.synthetic", "--dataset", "zzz"]) == 1
     assert "0 matches" in capsys.readouterr().err
+
+
+def test_fy_run_refuses_a_shared_ledger_without_dataset_and_takes_a_source(
+    ledger, dataset, evaluation, capsys
+):
+    record(
+        ledger,
+        synthetic.generate(
+            start="2025-01-01", months=2, rows_per_day=5, seed=1, drift_at="2025-02-01"
+        ),
+        source="other",
+        params={},
+        filters=(synthetic.keep_all,),
+        targets=(synthetic.TARGET,),
+    )
+    root = ["--root", str(ledger.root)]
+    assert cli.main([*root, "run", "tests.synthetic"]) == 1
+    assert "several sources" in capsys.readouterr().err
+    assert cli.main([*root, "run", "tests.synthetic", "--dataset", "synthetic"]) == 0
+    assert set(_latest(ledger, evaluation)) == {"ridge_1m", "ridge_3m", "ridge_6m"}
+
+
+def test_two_names_on_one_declaration_are_refused(ledger, evaluation):
+    with pytest.raises(Refused, match="ridge_1m and twin"):
+        _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(1).named("twin"))
+    assert Event.PIPELINE not in _types(ledger)
 
 
 def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
