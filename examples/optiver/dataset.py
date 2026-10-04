@@ -6,11 +6,8 @@ import datetime
 import pathlib
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
-import pyarrow.csv
+import polars as pl
 
-from ml_lab import formats
 from ml_lab.dataset import record
 from ml_lab.experiment import step
 from ml_lab.ledger import Ledger
@@ -31,26 +28,18 @@ def available() -> bool:
 
 def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Session:
     """Read the competition CSV onto a synthetic calendar axis."""
-    table = pyarrow.csv.read_csv(path)
+    frame = pl.read_csv(path)
     if stocks is not None:
-        table = table.filter(pc.is_in(table["stock_id"], pa.array(stocks)))
+        frame = frame.filter(pl.col("stock_id").is_in(list(stocks)))
     seconds = (
-        table["date_id"].to_numpy() * 86_400
+        frame["date_id"].to_numpy() * 86_400
         + CLOSE_AUCTION_START_S
-        + table["seconds_in_bucket"].to_numpy()
+        + frame["seconds_in_bucket"].to_numpy()
     )
-    order = pa.array(np.lexsort((table["stock_id"].to_numpy(), seconds)))
+    order = np.lexsort((frame["stock_id"].to_numpy(), seconds))
     ts = np.datetime64(BASE_DATE, "s") + seconds.astype("timedelta64[s]")
-    kept = table.drop_columns(list(DROPPED)).append_column(
-        "ts", pa.array(ts, pa.timestamp("s"))
-    )
-    floats = pa.table(
-        {
-            name: pc.cast(kept[name], pa.float64()) if name != "ts" else kept[name]
-            for name in kept.column_names
-        }
-    )
-    return formats.session_from_table(floats.take(order))
+    floats = frame.drop(DROPPED).cast(pl.Float64)
+    return Session({c: floats[c].to_numpy()[order] for c in floats.columns}, ts[order])
 
 
 @step

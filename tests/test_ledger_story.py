@@ -13,7 +13,7 @@ import sqlite3
 import sys
 
 import numpy as np
-import pyarrow.parquet as pq
+import polars as pl
 import pytest
 
 from ml_lab import cli, formats, identity, runs, splits
@@ -87,13 +87,14 @@ def test_the_dataset_id_is_the_data_not_the_recipe(ledger, dataset):
     assert _types(ledger) == {Event.DATASET: 2}
 
 
-def test_the_dataset_blob_opens_with_pyarrow_alone(ledger, dataset):
+def test_the_dataset_blob_opens_with_polars_alone(ledger, dataset):
     event = ledger.latest(Event.DATASET, dataset)
     assert event["payload"]["blob"]["format"] == "parquet"
-    table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
+    table = pl.read_parquet(
+        io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"]))
+    )
     assert (
-        synthetic.TARGET in table.column_names
-        and table.num_rows == event["payload"]["rows"]
+        synthetic.TARGET in table.columns and table.height == event["payload"]["rows"]
     )
     assert ledger.sql("SELECT source FROM dataset")[0] == {"source": "synthetic"}
 
@@ -333,7 +334,7 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
         line.split("==", 1)
         for line in ledger.get_blob(payload["env_lock"]["sha"]).decode().split()
     )
-    assert {"python", "numpy", "pyarrow"} <= set(lock) and "pytest" not in lock
+    assert {"python", "numpy", "polars"} <= set(lock) and "pytest" not in lock
     assert lock["ml-lab"].count("+") == 1
     run = ledger.latest(Event.RUN, payload["run"])
     assert "commit" in run["payload"]["git"]

@@ -12,8 +12,7 @@ import pathlib
 import subprocess
 import sys
 
-import pyarrow.compute as pc
-import pyarrow.parquet as pq
+import polars as pl
 import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -59,9 +58,11 @@ def lab(root: pathlib.Path, *argv: str) -> str:
 def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
     ledger = Ledger(root)
     event = ledger.latest("dataset_recorded", dataset)
-    table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
-    assert table.num_rows > 100_000 and table.num_rows == event["payload"]["rows"]
-    assert not pc.any(pc.is_nan(table[optiver_dataset.TARGET])).as_py()
+    table = pl.read_parquet(
+        io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"]))
+    )
+    assert table.height > 100_000 and table.height == event["payload"]["rows"]
+    assert not table[optiver_dataset.TARGET].is_nan().any()
     assert (
         ledger.sql("SELECT source FROM dataset")[0]["source"] == optiver_dataset.SOURCE
     )
