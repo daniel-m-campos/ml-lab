@@ -63,7 +63,8 @@ Shipped as SQL in the same file so `sqlite3` shows them as tables. Every view ta
 |---|---|
 | dataset, pipeline, evaluation, run, fit, prediction, score | one event type each, payload fields as columns |
 | fold_score, aggregate_score | `score_recorded` unpacked one row per (fold, window, metric) and per (window, metric) |
-| latest_score | per (evaluation, pipeline), the newest score |
+| latest_score | per (evaluation, pipeline), the newest score, with the pipeline name and the dataset's id and source joined on |
+| score_fit | one row per (score, fit): the fits a score stands on, with their labels and seconds |
 | failure | `pipeline_failed` with run and error |
 
 The payload is JSON so a shape change is a new payload version and an edited view, not a migration. Materialize a view only when a read is measured past a second.
@@ -123,21 +124,25 @@ sqlite3 -box .ml-lab/ml_lab.sqlite "..."
 
 Two verbs. A module is a dotted name importable from the current directory or a `.py` path, resolved by its package so its own imports work. The ledger root is `ML_LAB_ROOT` or `--root`. Every write carries the actor.
 
-Reads are SQL over the views. Three to start from:
+Reads are SQL over the views. Four to start from:
 
 ```sql
 -- latest aggregate scores per pipeline at the first age
-SELECT p.name, s.metric, s.value FROM latest_score l
-JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline
+SELECT l.name, s.metric, s.value FROM latest_score l
+JOIN aggregate_score s ON s.score = l.score
 WHERE s.window = '1' ORDER BY s.metric, s.value DESC;
 
 -- one pipeline fold by fold
 SELECT f.fold, f.label, f.window, f.metric, f.value FROM latest_score l
-JOIN fold_score f ON f.score = l.score JOIN pipeline p ON p.id = l.pipeline
-WHERE p.name = 'ridge_3m' ORDER BY f.fold, f.window, f.metric;
+JOIN fold_score f ON f.score = l.score
+WHERE l.name = 'ridge_3m' ORDER BY f.fold, f.window, f.metric;
 
 -- what failed, and in which run
 SELECT p.name, x.error, x.run, x.at FROM failure x JOIN pipeline p ON p.id = x.pipeline;
+
+-- what each scored pipeline cost to fit
+SELECT l.name, COUNT(*) AS fits, SUM(sf.duration_s) AS seconds FROM latest_score l
+JOIN score_fit sf ON sf.score = l.score GROUP BY l.score ORDER BY seconds DESC;
 ```
 
 ## Later

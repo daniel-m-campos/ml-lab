@@ -323,7 +323,8 @@ def test_fy_run_merges_pipelines_from_several_modules_and_defaults_the_dataset(
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     by_path = str(REPO / "tests" / "synthetic.py")
     assert cli.main(["--root", str(ledger.root), "run", by_path, str(extra)]) == 0
-    assert "scores 4" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "scores 4" in out and "fit ridge_12m " in out and "score ridge_12m " in out
     assert set(_latest(ledger, evaluation)) == {
         "ridge_1m",
         "ridge_3m",
@@ -370,6 +371,15 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     )
     assert db.execute("SELECT COUNT(*) FROM latest_score").fetchone()[0] == 2
     assert db.execute("SELECT COUNT(*) FROM fit").fetchone()[0] == 2 * len(folds)
+    assert db.execute("SELECT COUNT(*) FROM score_fit").fetchone()[0] == 2 * len(folds)
+    assert (
+        db.execute("SELECT SUM(duration_s) FROM score_fit").fetchone()
+        == db.execute("SELECT SUM(duration_s) FROM fit").fetchone()
+    )
+    assert db.execute("SELECT DISTINCT source FROM latest_score").fetchall() == [
+        ("synthetic",)
+    ]
+    assert db.execute("SELECT resolution, pipelines FROM run").fetchone()[1]
 
 
 def test_the_log_reads_as_it_stood(ledger, evaluation):

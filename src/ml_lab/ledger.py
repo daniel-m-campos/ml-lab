@@ -57,7 +57,8 @@ CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
 """
 
 VIEWS = """
-CREATE VIEW IF NOT EXISTS dataset AS SELECT seq, id, at, actor,
+DROP VIEW IF EXISTS dataset;
+CREATE VIEW dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.source') AS source,
   json_extract(payload,'$.window[0]') AS window_start,
   json_extract(payload,'$.window[1]') AS window_end,
@@ -65,26 +66,32 @@ CREATE VIEW IF NOT EXISTS dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.blob.format') AS format
 FROM event WHERE type='dataset_recorded';
 
-CREATE VIEW IF NOT EXISTS pipeline AS SELECT seq, id, at, actor,
+DROP VIEW IF EXISTS pipeline;
+CREATE VIEW pipeline AS SELECT seq, id, at, actor,
   json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,
   json_extract(payload,'$.declaration') AS declaration
 FROM event WHERE type='pipeline_declared';
 
-CREATE VIEW IF NOT EXISTS evaluation AS SELECT seq, id, at, actor,
+DROP VIEW IF EXISTS evaluation;
+CREATE VIEW evaluation AS SELECT seq, id, at, actor,
   json_extract(payload,'$.dataset') AS dataset,
   json_extract(payload,'$.metrics') AS metrics,
   json_extract(payload,'$.declaration') AS declaration,
   json_extract(payload,'$.folds') AS folds
 FROM event WHERE type='evaluation_declared';
 
-CREATE VIEW IF NOT EXISTS run AS SELECT seq, id, at, actor, host, stream AS evaluation,
+DROP VIEW IF EXISTS run;
+CREATE VIEW run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.git.commit') AS "commit",
   json_extract(payload,'$.git.dirty') AS dirty,
   json_extract(payload,'$.git.diff.sha') AS diff,
-  json_extract(payload,'$.env_lock') AS env_lock
+  json_extract(payload,'$.resolution.path') AS resolution,
+  json_extract(payload,'$.resolution.sha') AS resolution_sha,
+  json_extract(payload,'$.pipelines') AS pipelines
 FROM event WHERE type='run_started';
 
-CREATE VIEW IF NOT EXISTS fit AS SELECT seq, id, at, actor, host, stream AS dataset,
+DROP VIEW IF EXISTS fit;
+CREATE VIEW fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.train') AS train, json_extract(payload,'$.label') AS label,
   json_extract(payload,'$.env_lock') AS env_lock,
@@ -94,7 +101,8 @@ CREATE VIEW IF NOT EXISTS fit AS SELECT seq, id, at, actor, host, stream AS data
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='fit_computed';
 
-CREATE VIEW IF NOT EXISTS prediction AS SELECT seq, id, at, stream AS dataset,
+DROP VIEW IF EXISTS prediction;
+CREATE VIEW prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.fit') AS fit,
   json_extract(payload,'$.range[0]') AS range_start,
   json_extract(payload,'$.range[1]') AS range_end,
@@ -102,11 +110,13 @@ CREATE VIEW IF NOT EXISTS prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.window') AS window, json_extract(payload,'$.blob.sha') AS blob
 FROM event WHERE type='predictions_computed';
 
-CREATE VIEW IF NOT EXISTS score AS SELECT seq, id, at, actor, stream AS evaluation,
+DROP VIEW IF EXISTS score;
+CREATE VIEW score AS SELECT seq, id, at, actor, stream AS evaluation,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run
 FROM event WHERE type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS score, e.stream AS evaluation,
+DROP VIEW IF EXISTS fold_score;
+CREATE VIEW fold_score AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline,
   json_extract(f.value,'$.fold') AS fold,
   json_extract(f.value,'$.label') AS label, json_extract(f.value,'$.window') AS window,
@@ -114,20 +124,37 @@ CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS score, e.stream AS evalua
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
 WHERE e.type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS score,
+DROP VIEW IF EXISTS aggregate_score;
+CREATE VIEW aggregate_score AS SELECT e.id AS score,
   e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, a.key AS window,
   m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
 WHERE e.type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS latest_score AS SELECT evaluation, pipeline, id AS score,
-  run, seq
-FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY evaluation,
-  pipeline ORDER BY seq DESC) AS rn
-      FROM score) WHERE rn = 1;
+DROP VIEW IF EXISTS latest_score;
+CREATE VIEW latest_score AS SELECT l.evaluation, l.pipeline, p.name,
+  e.dataset, d.source, l.score, l.run, l.seq
+FROM (SELECT evaluation, pipeline, id AS score, run, seq,
+        ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
+      FROM score) l
+JOIN pipeline p ON p.id = l.pipeline
+JOIN evaluation e ON e.id = l.evaluation
+JOIN dataset d ON d.id = e.dataset
+WHERE l.rn = 1;
 
-CREATE VIEW IF NOT EXISTS failure AS SELECT seq, id, at, actor, host,
+DROP VIEW IF EXISTS score_fit;
+CREATE VIEW score_fit AS SELECT DISTINCT s.id AS score,
+  s.stream AS evaluation, json_extract(s.payload,'$.pipeline') AS pipeline,
+  f.id AS fit, json_extract(f.payload,'$.label') AS label,
+  json_extract(f.payload,'$.duration_s') AS duration_s
+FROM event s, json_each(s.payload,'$.predictions') p
+JOIN event pr ON pr.type='predictions_computed' AND pr.id = p.value
+JOIN event f ON f.type='fit_computed' AND f.id = json_extract(pr.payload,'$.fit')
+WHERE s.type='score_recorded';
+
+DROP VIEW IF EXISTS failure;
+CREATE VIEW failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.error') AS error

@@ -73,10 +73,8 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
 def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
     lab(root, "run", DECL)
     rows = Ledger(root).sql(
-        "SELECT p.name, s.metric, s.value FROM latest_score l "
-        "JOIN aggregate_score s ON s.score = l.score "
-        "JOIN pipeline p ON p.id = l.pipeline "
-        "WHERE s.window = '1'"
+        "SELECT l.name, s.metric, s.value FROM latest_score l "
+        "JOIN aggregate_score s ON s.score = l.score WHERE s.window = '1'"
     )
     names = {r["name"] for r in rows}
     assert {"ridge_1m", "ridge_3m", "ridge_6m"} <= names

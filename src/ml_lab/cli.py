@@ -74,7 +74,7 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
 
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     pipelines, evaluation = _experiments(args, ledger)
-    report = runs.run(ledger, pipelines, evaluation)
+    report = runs.run(ledger, pipelines, evaluation, log=print)
     if not report.run:
         print(
             f"up to date: {report.scores_reused} scores; {report.fits_reused} fits and "
@@ -86,7 +86,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
         f"{report.predictions_computed}, scores {report.scores_recorded}"
     )
     for name, error in report.failed.items():
-        print(f"lab run: {name} failed: {error}", file=sys.stderr)
+        print(f"lab run: {name} failed: {error}")
     return 1 if report.failed else 0
 
 

@@ -57,6 +57,7 @@ def run(
     evaluation: Evaluation,
     *,
     code_root: pathlib.Path | None = None,
+    log: Callable[[str], None] = lambda line: None,
 ) -> RunReport:
     """Fit, predict and score each pipeline, reusing what the memo rule allows.
 
@@ -64,7 +65,8 @@ def run(
     write, so a rerun of an unchanged tree writes nothing and adding one pipeline costs
     only its own fits, predictions and score. A pipeline that raises is recorded as
     ``pipeline_failed`` and the others continue; what it had written stays and a rerun
-    resumes from there.
+    resumes from there. ``log`` receives one line per fit, prediction set and score
+    as it is written.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -102,7 +104,15 @@ def run(
         _declare_pipeline(ledger, pipeline)
         try:
             _run_pipeline(
-                ledger, session, schedule, pipeline, evaluation, root, report, start
+                ledger,
+                session,
+                schedule,
+                pipeline,
+                evaluation,
+                root,
+                report,
+                start,
+                log,
             )
         except Exception as error:  # noqa: BLE001
             name = pipeline.name or pipeline.id
@@ -133,7 +143,9 @@ def _run_pipeline(
     root: pathlib.Path,
     report: RunReport,
     start: Callable[[], str],
+    log: Callable[[str], None],
 ):
+    name = pipeline.name or pipeline.id
     shas = identity.import_shas(pipeline.steps, root)
     dists = identity.imported_dists(pipeline.steps, root)
     env_lock = _text_blob(ledger, _lock_text(dists))
@@ -180,6 +192,7 @@ def _run_pipeline(
             id=fit_id,
         )
         report.fits_computed += 1
+        log(f"fit {name} {fold.label} {duration:.1f}s")
         return fit_id
 
     def ensure_predictions(fit_id: str, index: int, window: str, rng: Range) -> str:
@@ -213,6 +226,7 @@ def _run_pipeline(
             id=pred_id,
         )
         report.predictions_computed += 1
+        log(f"predictions {name} {window} rows {rng[0]}:{rng[1]}")
         return pred_id
 
     for index, fold in enumerate(folds):
@@ -236,6 +250,7 @@ def _run_pipeline(
         report.scores_reused += 1
         return
     per_fold, series = [], {}
+    aggregate: dict[str, dict[str, float]] = {}
     for index, fold in enumerate(folds):
         for window, rng in fold.windows.items():
             pred = _load_predictions(ledger, predictions[f"{index}:{window}"])
@@ -249,6 +264,8 @@ def _run_pipeline(
                     "metrics": evaluation.metrics(rows),
                 }
             )
+    for window, parts in series.items():
+        aggregate[window] = evaluation.metrics(np.concatenate(parts))
     ledger.append(
         Event.SCORE,
         evaluation.id,
@@ -258,14 +275,16 @@ def _run_pipeline(
             "run": start(),
             "predictions": predictions,
             "folds": per_fold,
-            "aggregate": {
-                window: evaluation.metrics(np.concatenate(parts))
-                for window, parts in series.items()
-            },
+            "aggregate": aggregate,
         },
         id=score_id,
     )
     report.scores_recorded += 1
+    for window, metrics in aggregate.items():
+        log(
+            f"score {name} {window} "
+            + " ".join(f"{k}={v:.4g}" for k, v in metrics.items())
+        )
 
 
 def _load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
