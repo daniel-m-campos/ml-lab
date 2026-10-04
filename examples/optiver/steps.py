@@ -7,8 +7,9 @@ import dataclasses
 import numpy as np
 
 from forestry import formats
+from forestry.dates import add_months
 from forestry.experiment import scorer, step
-from forestry.session import Range, Session, add_months
+from forestry.session import Range, Session
 from forestry.splits import Segments
 
 try:

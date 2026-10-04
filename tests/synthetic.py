@@ -9,10 +9,11 @@ import numpy as np
 
 from forestry import formats
 from forestry.dataset import record
+from forestry.dates import add_months, as_date
 from forestry.experiment import Evaluation, Pipeline, scorer, step
 from forestry.ledger import Ledger
-from forestry.session import Range, Session, add_months, as_date
-from forestry.splits import Segments, WalkForward
+from forestry.session import Range, Session
+from forestry.splits import CalendarWalkForward, Segments
 
 FEATURES = ("f0", "f1", "f2")
 TARGET = "ret_1"
@@ -164,7 +165,7 @@ def evaluation(dataset: str, cost: float = 0.001, split: Any = None) -> Evaluati
     return Evaluation(
         dataset=dataset,
         split=split
-        or WalkForward(
+        or CalendarWalkForward(
             first_cutoff="2025-05-01", horizons=(1, 2), embargo_seconds=60, min_folds=3
         ),
         scorer=sign_sim,

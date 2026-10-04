@@ -145,10 +145,28 @@ def test_a_clockless_session_fits_on_segments_and_refuses_walk_forward(ledger):
     )
     assert bare.matrix(((0, 10), (90, 100)), ("f0", "f1")).shape == (20, 2)
     with pytest.raises(ValueError, match="no timestamps"):
-        splits.WalkForward(first_cutoff="2025-01-01").folds(bare)
+        splits.CalendarWalkForward(first_cutoff="2025-01-01").folds(bare)
     assert synthetic.ridge_fit(
         bare, ((0, 50), (60, 100)), synthetic.RidgeConfig(0, 1.0)
     ).weights.shape == (3,)
+
+
+def test_row_walk_forward_steps_by_rows_and_names_windows_only_when_asked(
+    ledger, dataset
+):
+    session = load(ledger, dataset)
+    plain = splits.WalkForward(
+        first_cutoff_rows=1000, step_rows=500, window_rows=500, embargo_rows=10
+    )
+    folds = plain.folds(session)
+    assert len(folds) == (session.rows - 1000) // 500
+    assert folds[0].train == ((0, 990),) and folds[0].windows == {"test": (1000, 1500)}
+    assert folds[1].label == "row 1500"
+    named = dataclasses.replace(plain, horizons=(1, 2)).folds(session)
+    assert named[0].windows == {"1": (1000, 1500), "2": (1500, 2000)}
+    evaluation = synthetic.evaluation(dataset, split=plain)
+    report = _run(ledger, evaluation, synthetic.ridge(0))
+    assert report.fits_computed == len(folds) and report.scores_recorded == 1
 
 
 def test_a_blocked_kfold_evaluation_scores_one_test_window_per_fold(ledger, dataset):

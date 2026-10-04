@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from forestry import formats, identity
+from forestry import dates, formats, identity
 from forestry.ledger import Event, Ledger
 from forestry.session import Session
 
@@ -32,7 +32,7 @@ def record(
 ) -> str:
     """Apply the filters, check the targets, store the rows; returns the dataset id."""
     has_clock = session.ts is not None
-    window = [str(session.start), str(session.end_exclusive)] if has_clock else None
+    window = [str(d) for d in dates.span(session)] if has_clock else None
     recipe = {
         "process": process,
         "params": params,

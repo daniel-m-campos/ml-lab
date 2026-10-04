@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from forestry.experiment import Evaluation, Pipeline
-from forestry.splits import WalkForward
+from forestry.splits import CalendarWalkForward
 from optiver import steps
 
 ridge = Pipeline(
@@ -45,7 +45,7 @@ def evaluation(dataset: str) -> Evaluation:
     """Monthly walk-forward with three horizons, scored by the taker simulation."""
     return Evaluation(
         dataset=dataset,
-        split=WalkForward(
+        split=CalendarWalkForward(
             first_cutoff="2021-05-04",
             every_months=1,
             eval_months=1,

@@ -1,4 +1,4 @@
-"""A time-ordered table held resident; pipelines read row ranges, never the whole.
+"""A table held resident, read by row ranges, with a clock lookup when ``ts`` is given.
 
 Examples
 --------
@@ -11,10 +11,11 @@ Examples
 
 from __future__ import annotations
 
-import calendar
 import datetime
 
 import numpy as np
+
+from forestry.dates import as_date
 
 Range = tuple[int, int]
 Rows = Range | tuple[Range, ...]
@@ -31,24 +32,11 @@ class Session:
             raise ValueError("timestamps must be sorted")
 
     def __repr__(self) -> str:
-        span = (
-            f", start={self.start}, end={self.end_exclusive}"
-            if self.ts is not None
-            else ""
-        )
-        return f"Session(rows={self.rows}{span})"
+        return f"Session(rows={self.rows}, clock={self.ts is not None})"
 
     @property
     def rows(self) -> int:
         return int(next(iter(self.columns.values())).shape[0])
-
-    @property
-    def start(self) -> datetime.date:
-        return self.date_at(0)
-
-    @property
-    def end_exclusive(self) -> datetime.date:
-        return self.date_at(-1) + datetime.timedelta(days=1)
 
     def index_of(
         self, when: str | datetime.date | datetime.datetime, offset_seconds: int = 0
@@ -79,25 +67,3 @@ class Session:
 def segments(rows: Rows) -> tuple[Range, ...]:
     """A range or a tuple of ranges as a tuple of ranges."""
     return (rows,) if isinstance(rows[0], int) else rows
-
-
-# Date helpers =========================================================================
-
-
-def as_date(when: str | datetime.date | datetime.datetime) -> datetime.date:
-    """Coerce a date-like value to a date."""
-    if isinstance(when, datetime.datetime):
-        return when.date()
-    if isinstance(when, datetime.date):
-        return when
-    return datetime.date.fromisoformat(when[:10])
-
-
-def add_months(date: datetime.date, months: int) -> datetime.date:
-    """Shift a date by whole months, clamping the day to the month's length."""
-    month_index = date.month - 1 + months
-    year = date.year + month_index // 12
-    month = month_index % 12 + 1
-    return datetime.date(
-        year, month, min(date.day, calendar.monthrange(year, month)[1])
-    )
