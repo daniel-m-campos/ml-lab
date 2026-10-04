@@ -6,7 +6,7 @@ Each story: a context, the steps, what the log holds afterwards, and when it is 
 
 Context: a new month of order-book captures for one instrument and sampling process.
 
-1. `fy ingest project/capture.py <args>` calls the module's `dataset` function, which loads the rows, applies the declared filter steps, checks the targets, stores the bytes under their sha and appends one `dataset_recorded` event with the recipe.
+1. `fy ingest project/dataset.py <args>` calls the module's `dataset` function, which loads the rows, applies the declared filter steps, checks the targets, stores the bytes under their sha and appends one `dataset_recorded` event with the recipe.
 2. The same call with the same inputs returns the same id and writes nothing.
 
 Log after: one event, one blob.
@@ -19,7 +19,7 @@ Context: `project/experiment.py` lists the pipelines and declares the evaluation
 
 1. `fy run $D` appends `evaluation_declared` with the metric directions and the schedule expanded into folds and windows; then `run_started` with the commit, dirty flag, resolution file and host; then, per pipeline, `fit_computed` per cutoff carrying the import shas and environment lock, `predictions_computed` per eval window, and one `score_recorded` keyed by the prediction ids.
 2. `fy run $D` again writes nothing: every fit and prediction is reused and every score already exists, and the report says so. Adding a pipeline to the module fits only the new one; the other pipelines cost nothing.
-3. `sql "SELECT p.name, s.metric, s.value FROM latest_score l JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline WHERE s.age = 1"` is the board.
+3. `sql "SELECT p.name, s.metric, s.value FROM latest_score l JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline WHERE s.window = '1'"` is the board.
 
 Log after: one evaluation, N pipelines, one run, N scores, fits, predictions.
 

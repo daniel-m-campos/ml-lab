@@ -1,7 +1,7 @@
 """``fy``: the command line over the log, two verbs; reading is SQL over the views.
 
 Declarations are plain module attributes, so a project may organize them freely: one
-script, or ``capture.py`` + ``steps.py`` + ``experiment.py``, or one file per idea. ``fy
+script, or ``dataset.py`` + ``steps.py`` + ``experiment.py``, or one file per idea. ``fy
 ingest`` reads ``dataset(ledger, *args)`` from a module. ``fy run`` takes one or more
 modules, reads ``pipelines`` (a list of ``Pipeline``) from each and ``evaluation`` (an
 ``Evaluation`` or a function of the dataset id) from exactly one of them, so a file an
@@ -12,7 +12,7 @@ defaults to the newest one recorded. The ledger root comes from ``--root`` or
 
 Examples
 --------
-$ fy ingest examples/optiver/capture.py 20
+$ fy ingest examples/optiver/dataset.py 20
 $ fy run examples/optiver/experiment.py
 $ fy run examples/optiver/experiment.py ideas/agent7.py
 $ sqlite3 -box .forestry/forestry.sqlite "SELECT * FROM latest_score"

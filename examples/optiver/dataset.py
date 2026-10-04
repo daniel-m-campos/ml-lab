@@ -56,7 +56,7 @@ def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Sess
 @step
 def drop_null_target(session: Session) -> Session:
     keep = ~np.isnan(session.columns[TARGET])
-    return Session(session.ts[keep], {k: v[keep] for k, v in session.columns.items()})
+    return Session({k: v[keep] for k, v in session.columns.items()}, session.ts[keep])
 
 
 def dataset(ledger: Ledger, stocks: str = "all") -> str:

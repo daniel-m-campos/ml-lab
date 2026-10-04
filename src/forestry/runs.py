@@ -1,4 +1,4 @@
-"""Runs: expand a schedule, memoize fits and predictions, record a score per pipeline.
+"""Runs: split a session, memoize fits and predictions, record a score per pipeline.
 
 A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``,
 ``save`` and ``load``. Reading is SQL over the views in ``forestry.ledger``.
@@ -13,7 +13,6 @@ Examples
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import os
 import pathlib
 import platform
@@ -29,15 +28,8 @@ import numpy as np
 from forestry import dataset, formats, identity
 from forestry.experiment import Evaluation, Pipeline
 from forestry.ledger import Event, Ledger, Refused
-from forestry.session import Range, Session, add_months, as_date
-
-
-@dataclasses.dataclass
-class Fold:
-    index: int
-    cutoff: datetime.date
-    train: Range
-    evals: dict[int, Range]
+from forestry.session import Range, Session
+from forestry.splits import Fold
 
 
 @dataclasses.dataclass
@@ -57,33 +49,6 @@ class RunReport:
 
 
 # Public Functions =====================================================================
-
-
-def folds(evaluation: Evaluation, session: Session) -> list[Fold]:
-    """Folds from the schedule: every cutoff whose oldest eval window still fits the
-    data.
-    """
-    span = max(evaluation.ages) * evaluation.eval_months
-    folds: list[Fold] = []
-    cutoff = as_date(evaluation.first_cutoff)
-    while add_months(cutoff, span) <= session.end_exclusive:
-        train = (0, session.index_of(cutoff, -evaluation.embargo_seconds))
-        evals = {
-            age: (
-                session.index_of(
-                    add_months(cutoff, (age - 1) * evaluation.eval_months)
-                ),
-                session.index_of(add_months(cutoff, age * evaluation.eval_months)),
-            )
-            for age in evaluation.ages
-        }
-        folds.append(Fold(len(folds), cutoff, train, evals))
-        cutoff = add_months(cutoff, evaluation.every_months)
-    if len(folds) < evaluation.min_folds:
-        raise Refused(
-            f"schedule yields {len(folds)} folds, min_folds is {evaluation.min_folds}"
-        )
-    return folds
 
 
 def run(
@@ -109,7 +74,7 @@ def run(
                 f"pipeline {pipeline.name or pipeline.id}: save step declares no format"
             )
     session = dataset.load(ledger, evaluation.dataset)
-    schedule = folds(evaluation, session)
+    schedule = evaluation.split.folds(session)
     _declare_evaluation(ledger, evaluation, schedule)
     root = code_root or identity.repo_root(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
@@ -191,9 +156,18 @@ def _run_pipeline(
         if report.fits_computed > computed_before and loaded is not None:
             _refuse_lazy_imports(pipeline, root, shas, dists, loaded)
             loaded = None
-        for age, rng in fold.evals.items():
-            predictions[f"{fold.index}:{age}"] = _ensure_predictions(
-                ledger, session, pipeline, fit_id, rng, fold, age, models, report, start
+        for window, rng in fold.windows.items():
+            predictions[f"{fold.index}:{window}"] = _ensure_predictions(
+                ledger,
+                session,
+                pipeline,
+                fit_id,
+                rng,
+                fold,
+                window,
+                models,
+                report,
+                start,
             )
     score_id = identity.content_hash(
         {
@@ -207,15 +181,15 @@ def _run_pipeline(
         return
     per_fold, series = [], {}
     for fold in folds:
-        for age, rng in fold.evals.items():
-            pred = _load_predictions(ledger, predictions[f"{fold.index}:{age}"])
+        for window, rng in fold.windows.items():
+            pred = _load_predictions(ledger, predictions[f"{fold.index}:{window}"])
             rows = np.asarray(evaluation.scorer(pred, session, rng, evaluation.config))
-            series.setdefault(age, []).append(rows)
+            series.setdefault(window, []).append(rows)
             per_fold.append(
                 {
                     "fold": fold.index,
-                    "cutoff": str(fold.cutoff),
-                    "age": age,
+                    "label": fold.label,
+                    "window": window,
                     "metrics": evaluation.metrics(rows),
                 }
             )
@@ -229,8 +203,8 @@ def _run_pipeline(
             "predictions": predictions,
             "folds": per_fold,
             "aggregate": {
-                str(age): evaluation.metrics(np.concatenate(parts))
-                for age, parts in series.items()
+                window: evaluation.metrics(np.concatenate(parts))
+                for window, parts in series.items()
             },
         },
         id=score_id,
@@ -254,7 +228,7 @@ def _ensure_fit(
         {
             "dataset": evaluation.dataset,
             "pipeline": pipeline.id,
-            "train": list(fold.train),
+            "train": [list(seg) for seg in fold.train],
             "import_shas": shas,
             "env_lock": env_lock["sha"],
         }
@@ -274,8 +248,8 @@ def _ensure_fit(
         {
             "pipeline": pipeline.id,
             "run": run_id,
-            "train": list(fold.train),
-            "cutoff": str(fold.cutoff),
+            "train": [list(seg) for seg in fold.train],
+            "label": fold.label,
             "import_shas": shas,
             "env_lock": env_lock,
             "duration_s": duration,
@@ -297,7 +271,7 @@ def _ensure_predictions(
     fit_id: str,
     rng: Range,
     fold: Fold,
-    age: int,
+    window: str,
     models: dict[str, Any],
     report: RunReport,
     start: Callable[[], str],
@@ -319,7 +293,7 @@ def _ensure_predictions(
             "fit": fit_id,
             "range": list(rng),
             "fold": fold.index,
-            "age": age,
+            "window": window,
             "blob": {
                 "sha": ledger.put_blob(formats.series_save(pred)),
                 "format": formats.Format.PARQUET,
@@ -365,9 +339,9 @@ def _declare_evaluation(ledger: Ledger, evaluation: Evaluation, folds: list[Fold
             "folds": [
                 {
                     "index": f.index,
-                    "cutoff": str(f.cutoff),
-                    "train": list(f.train),
-                    "windows": f.evals,
+                    "label": f.label,
+                    "train": [list(seg) for seg in f.train],
+                    "windows": f.windows,
                 }
                 for f in folds
             ],

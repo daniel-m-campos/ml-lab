@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import numpy as np
 
@@ -11,6 +12,7 @@ from forestry.dataset import record
 from forestry.experiment import Evaluation, Pipeline, scorer, step
 from forestry.ledger import Ledger
 from forestry.session import Range, Session, add_months, as_date
+from forestry.splits import Segments, WalkForward
 
 FEATURES = ("f0", "f1", "f2")
 TARGET = "ret_1"
@@ -40,7 +42,7 @@ def generate(
     )
     columns = {name: features[:, i] for i, name in enumerate(FEATURES)}
     columns[TARGET] = target
-    return Session(ts, columns)
+    return Session(columns, ts)
 
 
 @step
@@ -80,13 +82,16 @@ class RidgeModel:
 
 
 @step
-def ridge_fit(session: Session, train: Range, config: RidgeConfig) -> RidgeModel:
-    end_date = session.date_at(train[1] - 1)
-    start = max(
-        train[0], session.index_of(add_months(end_date, -config.train_window_months))
-    )
-    X = session.matrix((start, train[1]), FEATURES)
-    y = session.column(TARGET, (start, train[1]))
+def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
+    rows = train
+    if session.ts is not None and config.train_window_months:
+        start, end = train[0][0], train[-1][1]
+        since = session.index_of(
+            add_months(session.date_at(end - 1), -config.train_window_months)
+        )
+        rows = ((max(start, since), end),)
+    X = session.matrix(rows, FEATURES)
+    y = session.column(TARGET, rows)
     x_mean, y_mean = X.mean(axis=0), y.mean()
     Xc = X - x_mean
     weights = np.linalg.solve(
@@ -104,9 +109,9 @@ FLAKY_CALLS: list[int] = []
 
 
 @step
-def flaky_fit(session: Session, train: Range, config: RidgeConfig) -> RidgeModel:
+def flaky_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Raises on its third call ever; the test clears ``FLAKY_CALLS`` to arm it."""
-    FLAKY_CALLS.append(train[1])
+    FLAKY_CALLS.append(train[-1][1])
     if len(FLAKY_CALLS) == 3:
         raise RuntimeError("boom at the third fit")
     return ridge_fit(session, train, config)
@@ -155,15 +160,15 @@ def ridge(window_months: int, alpha: float = 1.0) -> Pipeline:
     )
 
 
-def evaluation(dataset: str, cost: float = 0.001) -> Evaluation:
+def evaluation(dataset: str, cost: float = 0.001, split: Any = None) -> Evaluation:
     return Evaluation(
         dataset=dataset,
+        split=split
+        or WalkForward(
+            first_cutoff="2025-05-01", horizons=(1, 2), embargo_seconds=60, min_folds=3
+        ),
         scorer=sign_sim,
         config=SimConfig(cost=cost),
-        first_cutoff="2025-05-01",
-        ages=(1, 2),
-        embargo_seconds=60,
-        min_folds=3,
     )
 
 

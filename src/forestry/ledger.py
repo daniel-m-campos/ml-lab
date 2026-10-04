@@ -25,7 +25,7 @@ from typing import Any, Final
 
 from forestry import identity
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 ACTOR_ENV = "FORESTRY_ACTOR"
 
 
@@ -87,9 +87,7 @@ FROM event WHERE type='run_started';
 
 CREATE VIEW IF NOT EXISTS fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
-  json_extract(payload,'$.train[0]') AS train_start,
-  json_extract(payload,'$.train[1]') AS train_end,
-  json_extract(payload,'$.cutoff') AS cutoff,
+  json_extract(payload,'$.train') AS train, json_extract(payload,'$.label') AS label,
   json_extract(payload,'$.env_lock') AS env_lock,
   json_extract(payload,'$.import_shas') AS import_shas,
   json_extract(payload,'$.model.sha') AS model,
@@ -102,7 +100,7 @@ CREATE VIEW IF NOT EXISTS prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.range[0]') AS range_start,
   json_extract(payload,'$.range[1]') AS range_end,
   json_extract(payload,'$.fold') AS fold,
-  json_extract(payload,'$.age') AS age, json_extract(payload,'$.blob.sha') AS blob
+  json_extract(payload,'$.window') AS window, json_extract(payload,'$.blob.sha') AS blob
 FROM event WHERE type='predictions_computed';
 
 CREATE VIEW IF NOT EXISTS score AS SELECT seq, id, at, actor, stream AS evaluation,
@@ -112,13 +110,14 @@ FROM event WHERE type='score_recorded';
 CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline,
   json_extract(f.value,'$.fold') AS fold,
-  json_extract(f.value,'$.age') AS age, m.key AS metric, m.value AS value
+  json_extract(f.value,'$.label') AS label, json_extract(f.value,'$.window') AS window,
+  m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
 WHERE e.type='score_recorded';
 
 CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS score,
   e.stream AS evaluation,
-  json_extract(e.payload,'$.pipeline') AS pipeline, CAST(a.key AS INTEGER) AS age,
+  json_extract(e.payload,'$.pipeline') AS pipeline, a.key AS window,
   m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
 WHERE e.type='score_recorded';

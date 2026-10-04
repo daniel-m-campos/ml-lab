@@ -20,7 +20,7 @@ The log never stores what a function is, only a dotted path and the blob shas gi
 
 ## Declarations
 
-A pipeline is `fit(session, train_range, config) -> model`, `predict(model, session, range) -> predictions`, and `save(model) -> bytes` with `load(bytes) -> model` naming a format that opens without Python. A scorer is `score(predictions, session, range, config) -> series`, one row per prediction, with `metrics(series) -> {name: value}` and a direction per metric declared once on the scorer; the same `metrics` runs per fold and over the concatenated folds.
+An evaluation is a dataset, a split, a scorer and its config. The split is a frozen dataclass with `folds(session)`: `WalkForward` (monthly cutoffs, named horizons, an embargo) for a clocked session, `BlockedKFold` and `Holdout` by row count for any session; a project may declare its own. A fold trains on contiguous segments and scores named windows. A pipeline is `fit(session, train_segments, config) -> model`, `predict(model, session, range) -> predictions`, and `save(model) -> bytes` with `load(bytes) -> model` naming a format that opens without Python. A scorer is `score(predictions, session, range, config) -> series`, one row per prediction, with `metrics(series) -> {name: value}` and a direction per metric declared once on the scorer; the same `metrics` runs per fold and over the concatenated folds.
 
 `session` is the frozen dataset's columns, resident in memory, read by row range. Anything that learns from data lives inside `fit` over `train_range`. Declarations are frozen dataclasses referencing functions by dotted path, hashed by canonical serialization: a value change changes the id, a pipeline's name is a label outside the hash. No YAML, no closures. Identity is declaration only; code changes are caught by the memo rule, not by hashing files into identities.
 
@@ -46,7 +46,7 @@ CREATE TABLE event (
 |---|---|---|---|
 | dataset_recorded | dataset | dataset id = hash(recipe) | process, instrument, window, recipe (params, filter paths, targets), rows, blob sha |
 | pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
-| evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, scorer path, config, metric directions, cadence, the expanded folds and eval windows |
+| evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, split, scorer path, config, metric directions, the expanded folds (label, train segments, named windows) |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, resolution file sha (`uv.lock` or `requirements*.txt` if present), host facts |
 | fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock sha) | run id, cutoff, model sha and format, import shas, env lock sha, duration |
 | predictions_computed | dataset | hash(fit id, range) | blob sha and format |
@@ -62,7 +62,7 @@ Shipped as SQL in the same file so `sqlite3` shows them as tables. Every view ta
 | view | definition |
 |---|---|
 | dataset, pipeline, evaluation, run, fit, prediction, score | one event type each, payload fields as columns |
-| fold_score, aggregate_score | `score_recorded` unpacked one row per (fold, age, metric) and per (age, metric) |
+| fold_score, aggregate_score | `score_recorded` unpacked one row per (fold, window, metric) and per (window, metric) |
 | latest_score | per (evaluation, pipeline), the newest score |
 | failure | `pipeline_failed` with run and error |
 
@@ -80,7 +80,7 @@ Comparability: scores compare only within one evaluation. A scorer or schedule c
 
 Faults: every blob is written before the event that names it, and each fit is its own event, so a killed process loses at most the fit in flight and a rerun resumes from the last recorded one with the same ids. A pipeline that raises is recorded as `pipeline_failed` with its traceback, the other pipelines continue, and `fy run` exits 1 naming it. Failures are not memoized: a rerun retries. The `failure` view holds the error until a newer score exists.
 
-Embargo: no fit's train range ends after its fold's eval start minus the embargo. The folds are in the evaluation payload, written once.
+Splits: a fit's train segments never overlap its fold's windows, and the embargo the split declares separates them. The folds are in the evaluation payload, written once; `session.ts` is optional and only `WalkForward` needs it.
 
 Day one, because rows written wrong cannot be repaired: ids that merge across hosts (content hashes and ULIDs, no serial counters); the blob store writes to a temp file, fsyncs and renames; every fit carries its import shas and env lock. Two logs from two hosts merge by `INSERT OR IGNORE` on id. The schema version is `PRAGMA user_version`; a log at another version is refused with the instruction to delete and rerun, since the log is a cache of the code plus the data.
 
@@ -115,7 +115,7 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'forestry.sqlite' (TYPE sql
 ## Command line
 
 ```
-fy ingest project/capture.py <args>              # prints the dataset id
+fy ingest project/dataset.py <args>              # prints the dataset id
 fy run project/experiment.py                   # newest dataset; --dataset <id prefix> to pick
 fy run project/experiment.py ideas/agent7.py   # pipelines from both, the evaluation from one
 sqlite3 -box .forestry/forestry.sqlite "..."
@@ -129,12 +129,12 @@ Reads are SQL over the views. Three to start from:
 -- latest aggregate scores per pipeline at the first age
 SELECT p.name, s.metric, s.value FROM latest_score l
 JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline
-WHERE s.age = 1 ORDER BY s.metric, s.value DESC;
+WHERE s.window = '1' ORDER BY s.metric, s.value DESC;
 
 -- one pipeline fold by fold
-SELECT f.fold, f.cutoff, f.age, f.metric, f.value FROM latest_score l
+SELECT f.fold, f.label, f.window, f.metric, f.value FROM latest_score l
 JOIN fold_score f ON f.score = l.score JOIN pipeline p ON p.id = l.pipeline
-WHERE p.name = 'ridge_3m' ORDER BY f.fold, f.age, f.metric;
+WHERE p.name = 'ridge_3m' ORDER BY f.fold, f.window, f.metric;
 
 -- what failed, and in which run
 SELECT p.name, x.error, x.run, x.at FROM failure x JOIN pipeline p ON p.id = x.pipeline;

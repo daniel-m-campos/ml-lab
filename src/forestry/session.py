@@ -4,7 +4,7 @@ Examples
 --------
 >>> import numpy as np
 >>> ts = np.array(["2025-01-01T00:00", "2025-01-02T00:00"], dtype="datetime64[s]")
->>> s = Session(ts, {"x": np.array([1.0, 2.0])})
+>>> s = Session({"x": np.array([1.0, 2.0])}, ts)
 >>> s.index_of("2025-01-02")
 1
 """
@@ -17,26 +17,30 @@ import datetime
 import numpy as np
 
 Range = tuple[int, int]
+Rows = Range | tuple[Range, ...]
 
 
 class Session:
-    """Columns over a sorted timestamp axis, with range lookups by date."""
+    """Columns over rows in a fixed order, with date lookups when ``ts`` is given."""
 
-    def __init__(self, ts: np.ndarray, columns: dict[str, np.ndarray]):
-        self.ts = ts.astype("datetime64[s]")
+    def __init__(self, columns: dict[str, np.ndarray], ts: np.ndarray | None = None):
         self.columns = columns
-        self._seconds = self.ts.astype(np.int64)
-        if np.any(np.diff(self._seconds) < 0):
+        self.ts = None if ts is None else ts.astype("datetime64[s]")
+        self._seconds = None if self.ts is None else self.ts.astype(np.int64)
+        if self._seconds is not None and np.any(np.diff(self._seconds) < 0):
             raise ValueError("timestamps must be sorted")
 
     def __repr__(self) -> str:
-        return (
-            f"Session(rows={self.rows}, start={self.start}, end={self.end_exclusive})"
+        span = (
+            f", start={self.start}, end={self.end_exclusive}"
+            if self.ts is not None
+            else ""
         )
+        return f"Session(rows={self.rows}{span})"
 
     @property
     def rows(self) -> int:
-        return int(self.ts.shape[0])
+        return int(next(iter(self.columns.values())).shape[0])
 
     @property
     def start(self) -> datetime.date:
@@ -52,17 +56,29 @@ class Session:
         """First row at or after ``when`` shifted by ``offset_seconds``."""
         midnight = datetime.datetime.combine(as_date(when), datetime.time())
         moment = np.datetime64(midnight, "s").astype(np.int64) + offset_seconds
-        return int(np.searchsorted(self._seconds, moment, side="left"))
+        return int(np.searchsorted(self._clock(), moment, side="left"))
 
     def date_at(self, row: int) -> datetime.date:
+        self._clock()
         return self.ts[row].astype("datetime64[D]").astype(datetime.date)
 
-    def matrix(self, rng: Range, cols: tuple[str, ...]) -> np.ndarray:
-        """Column-stacked features over a range, shape (rows, len(cols))."""
-        return np.column_stack([self.columns[c][rng[0] : rng[1]] for c in cols])
+    def matrix(self, rows: Rows, cols: tuple[str, ...]) -> np.ndarray:
+        """Column-stacked features over a range or segments, shape (rows, len(cols))."""
+        return np.column_stack([self.column(c, rows) for c in cols])
 
-    def column(self, name: str, rng: Range) -> np.ndarray:
-        return self.columns[name][rng[0] : rng[1]]
+    def column(self, name: str, rows: Rows) -> np.ndarray:
+        values = self.columns[name]
+        return np.concatenate([values[lo:hi] for lo, hi in segments(rows)])
+
+    def _clock(self) -> np.ndarray:
+        if self._seconds is None:
+            raise ValueError("session has no timestamps; use a row-based split")
+        return self._seconds
+
+
+def segments(rows: Rows) -> tuple[Range, ...]:
+    """A range or a tuple of ranges as a tuple of ranges."""
+    return (rows,) if isinstance(rows[0], int) else rows
 
 
 # Date helpers =========================================================================

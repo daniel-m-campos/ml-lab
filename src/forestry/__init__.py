@@ -1,11 +1,19 @@
-"""forestry: a local-first ledger for the lifecycle of experimentation on frozen
-datasets.
-"""
+"""forestry: a local-first ledger of experimentation on frozen datasets."""
 
 from __future__ import annotations
 
 from forestry.experiment import Evaluation, Pipeline, scorer, step
 from forestry.ledger import Ledger
+from forestry.splits import BlockedKFold, Holdout, WalkForward
 
 __version__ = "0.0.1"
-__all__ = ["Evaluation", "Ledger", "Pipeline", "scorer", "step"]
+__all__ = [
+    "BlockedKFold",
+    "Evaluation",
+    "Holdout",
+    "Ledger",
+    "Pipeline",
+    "WalkForward",
+    "scorer",
+    "step",
+]

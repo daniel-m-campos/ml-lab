@@ -7,16 +7,19 @@ from __future__ import annotations
 
 import dataclasses
 import io
+import json
 import pathlib
 import sqlite3
 import sys
 
+import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from forestry import cli, identity, runs
+from forestry import cli, identity, runs, splits
 from forestry.dataset import load
 from forestry.ledger import Event, Ledger, Refused
+from forestry.session import Session
 from tests import synthetic
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -91,19 +94,21 @@ def test_a_pipeline_name_is_a_label_and_a_config_change_is_a_new_id():
 
 def test_any_evaluation_field_change_is_a_new_evaluation_id(dataset, evaluation):
     cost = synthetic.evaluation(dataset, cost=0.01)
-    ages = dataclasses.replace(evaluation, ages=(1,))
-    assert len({evaluation.id, cost.id, ages.id}) == 3
+    one = dataclasses.replace(
+        evaluation, split=dataclasses.replace(evaluation.split, horizons=(1,))
+    )
+    assert len({evaluation.id, cost.id, one.id}) == 3
 
 
 def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     ledger, dataset, evaluation
 ):
     session = load(ledger, dataset)
-    folds = runs.folds(evaluation, session)
-    assert len(folds) >= evaluation.min_folds
+    folds = evaluation.split.folds(session)
+    assert len(folds) >= evaluation.split.min_folds
     for fold in folds:
-        gap = session.ts[fold.evals[1][0]] - session.ts[fold.train[1] - 1]
-        assert gap.astype(int) >= evaluation.embargo_seconds
+        gap = session.ts[fold.windows["1"][0]] - session.ts[fold.train[-1][1] - 1]
+        assert gap.astype(int) >= evaluation.split.embargo_seconds
     _run(ledger, evaluation, synthetic.ridge(3))
     stored = ledger.latest(Event.EVALUATION, evaluation.id)["payload"]
     assert (
@@ -112,16 +117,64 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     )
 
 
+def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
+    session = load(ledger, dataset)
+    n = session.rows
+    folds = splits.BlockedKFold(k=4, embargo_rows=10).folds(session)
+    assert [f.label for f in folds] == [f"block {i}" for i in range(4)]
+    assert folds[0].train == ((folds[0].windows["test"][1] + 10, n),)
+    middle = folds[1]
+    lo, hi = middle.windows["test"]
+    assert middle.train == ((0, lo - 10), (hi + 10, n))
+    assert sum(hi - lo for f in folds for lo, hi in f.windows.values()) == n
+    (hold,) = splits.Holdout(train_fraction=0.8, embargo_rows=5).folds(session)
+    assert (
+        hold.train == ((0, round(0.8 * n)),)
+        and hold.windows["test"][0] == round(0.8 * n) + 5
+    )
+
+
+def test_a_clockless_session_fits_on_segments_and_refuses_walk_forward(ledger):
+    bare = Session(
+        {
+            "f0": np.arange(100.0),
+            "f1": np.ones(100),
+            "f2": np.zeros(100),
+            "ret_1": np.arange(100.0),
+        }
+    )
+    assert bare.matrix(((0, 10), (90, 100)), ("f0", "f1")).shape == (20, 2)
+    with pytest.raises(ValueError, match="no timestamps"):
+        splits.WalkForward(first_cutoff="2025-01-01").folds(bare)
+    assert synthetic.ridge_fit(
+        bare, ((0, 50), (60, 100)), synthetic.RidgeConfig(0, 1.0)
+    ).weights.shape == (3,)
+
+
+def test_a_blocked_kfold_evaluation_scores_one_test_window_per_fold(ledger, dataset):
+    evaluation = synthetic.evaluation(
+        dataset, split=splits.BlockedKFold(k=3, embargo_rows=20)
+    )
+    report = _run(ledger, evaluation, synthetic.ridge(0))
+    assert report.fits_computed == 3 and report.scores_recorded == 1
+    rows = ledger.sql(
+        "SELECT DISTINCT window FROM fold_score WHERE evaluation = ?", (evaluation.id,)
+    )
+    assert [r["window"] for r in rows] == ["test"]
+    fit = ledger.sql("SELECT train, label FROM fit ORDER BY seq LIMIT 2")[1]
+    assert fit["label"] == "block 1" and len(json.loads(fit["train"])) == 2
+
+
 # Run ==================================================================================
 
 
 def test_a_run_posts_fits_predictions_and_one_score_and_a_rerun_writes_nothing(
     ledger, dataset, evaluation
 ):
-    folds = runs.folds(evaluation, load(ledger, dataset))
+    folds = evaluation.split.folds(load(ledger, dataset))
     first = _run(ledger, evaluation, synthetic.ridge(3))
     assert first.fits_computed == len(folds)
-    assert first.predictions_computed == len(folds) * len(evaluation.ages)
+    assert first.predictions_computed == len(folds) * len(evaluation.split.horizons)
     assert first.scores_recorded == 1
     before = len(ledger.events())
     second = _run(ledger, evaluation, synthetic.ridge(3))
@@ -132,14 +185,14 @@ def test_a_run_posts_fits_predictions_and_one_score_and_a_rerun_writes_nothing(
     ) == (0, 0, 0)
     assert (second.fits_reused, second.predictions_reused, second.scores_reused) == (
         len(folds),
-        len(folds) * len(evaluation.ages),
+        len(folds) * len(evaluation.split.horizons),
         1,
     )
     assert second.run == "" and ledger.events()[before:] == []
 
 
 def test_adding_a_pipeline_costs_only_its_own_fits(ledger, dataset, evaluation):
-    folds = runs.folds(evaluation, load(ledger, dataset))
+    folds = evaluation.split.folds(load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(3))
     report = _run(ledger, evaluation, synthetic.ridge(3), synthetic.ridge(6))
     assert report.fits_computed == len(folds) and report.scores_recorded == 1
@@ -211,7 +264,7 @@ def test_a_changed_source_file_is_a_new_fit_and_score_but_the_same_pipeline(
 def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resumes(
     ledger, dataset, evaluation
 ):
-    folds = runs.folds(evaluation, load(ledger, dataset))
+    folds = evaluation.split.folds(load(ledger, dataset))
     synthetic.FLAKY_CALLS.clear()
     flaky = synthetic.flaky()
     report = _run(ledger, evaluation, flaky, synthetic.ridge(1))
@@ -290,15 +343,15 @@ def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
 
 
 def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path):
-    folds = runs.folds(evaluation, load(ledger, dataset))
+    folds = evaluation.split.folds(load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     db = sqlite3.connect(tmp_path / "forestry" / "forestry.sqlite")
     metrics = len(evaluation.directions)
     assert db.execute("SELECT COUNT(*) FROM fold_score").fetchone()[0] == (
-        2 * len(folds) * len(evaluation.ages) * metrics
+        2 * len(folds) * len(evaluation.split.horizons) * metrics
     )
     assert db.execute("SELECT COUNT(*) FROM aggregate_score").fetchone()[0] == (
-        2 * len(evaluation.ages) * metrics
+        2 * len(evaluation.split.horizons) * metrics
     )
     assert db.execute("SELECT COUNT(*) FROM latest_score").fetchone()[0] == 2
     assert db.execute("SELECT COUNT(*) FROM fit").fetchone()[0] == 2 * len(folds)

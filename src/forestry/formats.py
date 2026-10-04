@@ -41,10 +41,8 @@ class Format:
 
 def session_save(session: Session) -> bytes:
     """A session as one Parquet file: ``ts`` timestamp[s] plus one column per array."""
-    table = pa.table(
-        {TS: pa.array(session.ts, type=pa.timestamp("s")), **session.columns}
-    )
-    return _parquet_bytes(table)
+    stamps = {} if session.ts is None else {TS: pa.array(session.ts, pa.timestamp("s"))}
+    return _parquet_bytes(pa.table({**stamps, **session.columns}))
 
 
 def session_load(payload: bytes) -> Session:
@@ -52,14 +50,15 @@ def session_load(payload: bytes) -> Session:
 
 
 def session_from_table(table: pa.Table, ts: str = TS) -> Session:
-    """A session from an Arrow table whose ``ts`` column is a timestamp."""
-    stamps = table[ts].to_numpy().astype("datetime64[s]")
+    """A session from an Arrow table; a ``ts`` timestamp column is optional."""
+    has_ts = ts in table.column_names
+    stamps = table[ts].to_numpy().astype("datetime64[s]") if has_ts else None
     columns = {
         name: table[name].to_numpy(zero_copy_only=False)
         for name in table.column_names
         if name != ts
     }
-    return Session(stamps, columns)
+    return Session(columns, stamps)
 
 
 # Series ===============================================================================

@@ -31,7 +31,8 @@ def record(
     targets: Sequence[str],
 ) -> str:
     """Apply the filters, check the targets, store the rows; returns the dataset id."""
-    window = [str(session.start), str(session.end_exclusive)]
+    has_clock = session.ts is not None
+    window = [str(session.start), str(session.end_exclusive)] if has_clock else None
     recipe = {
         "process": process,
         "params": params,

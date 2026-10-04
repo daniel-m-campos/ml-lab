@@ -95,19 +95,15 @@ class Pipeline:
 
 @dataclasses.dataclass(frozen=True)
 class Evaluation:
-    """How every pipeline on a dataset is scored: the walk-forward schedule and the
-    scorer.
+    """How every pipeline on a dataset is scored: a split into folds, a scorer and its
+    config. Splits live in ``forestry.splits``; any frozen dataclass with
+    ``folds(session) -> list[Fold]`` works.
     """
 
     dataset: str
+    split: Any
     scorer: Callable
-    first_cutoff: str
     config: Any = None
-    every_months: int = 1
-    eval_months: int = 1
-    ages: tuple[int, ...] = (1, 2, 3)
-    embargo_seconds: int = 0
-    min_folds: int = 3
 
     @property
     def id(self) -> str:

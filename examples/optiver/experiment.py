@@ -1,8 +1,9 @@
-"""Pipelines and the evaluation for the Optiver campaign; ``fy`` loads this module."""
+"""Pipelines and the evaluation for the Optiver example; ``fy`` loads this module."""
 
 from __future__ import annotations
 
 from forestry.experiment import Evaluation, Pipeline
+from forestry.splits import WalkForward
 from optiver import steps
 
 ridge = Pipeline(
@@ -41,15 +42,17 @@ pipelines = ridge_windows + (
 
 
 def evaluation(dataset: str) -> Evaluation:
-    """Monthly walk-forward with three ages, scored by the taker simulation."""
+    """Monthly walk-forward with three horizons, scored by the taker simulation."""
     return Evaluation(
         dataset=dataset,
+        split=WalkForward(
+            first_cutoff="2021-05-04",
+            every_months=1,
+            eval_months=1,
+            horizons=(1, 2, 3),
+            embargo_seconds=60,
+            min_folds=3,
+        ),
         scorer=steps.taker_sim,
         config=steps.SimConfig(cost_bps=0.5, threshold_bps=0.0),
-        first_cutoff="2021-05-04",
-        every_months=1,
-        eval_months=1,
-        ages=(1, 2, 3),
-        embargo_seconds=60,
-        min_folds=3,
     )

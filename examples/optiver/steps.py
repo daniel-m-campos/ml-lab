@@ -9,6 +9,7 @@ import numpy as np
 from forestry import formats
 from forestry.experiment import scorer, step
 from forestry.session import Range, Session, add_months
+from forestry.splits import Segments
 
 try:
     import bonsai
@@ -57,9 +58,13 @@ def features(session: Session, rng: Range) -> np.ndarray:
     return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def window(session: Session, train: Range, months: int) -> Range:
-    end_date = session.date_at(train[1] - 1)
-    return (max(train[0], session.index_of(add_months(end_date, -months))), train[1])
+def window(session: Session, train: Segments, months: int) -> Range:
+    """The last ``months`` of the train segments as one range."""
+    start, end = train[0][0], train[-1][1]
+    return (
+        max(start, session.index_of(add_months(session.date_at(end - 1), -months))),
+        end,
+    )
 
 
 # Ridge ================================================================================
@@ -78,7 +83,7 @@ class RidgeModel:
 
 
 @step
-def ridge_fit(session: Session, train: Range, config: RidgeConfig) -> RidgeModel:
+def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
     rng = window(session, train, config.train_window_months)
     X = features(session, rng)
     y = session.column(TARGET, rng)
@@ -123,7 +128,7 @@ class BonsaiConfig:
 
 
 @step
-def bonsai_fit(session: Session, train: Range, config: BonsaiConfig):
+def bonsai_fit(session: Session, train: Segments, config: BonsaiConfig):
     rng = window(session, train, config.train_window_months)
     model = bonsai.BonsaiRegressor(
         n_iters=config.n_iters,

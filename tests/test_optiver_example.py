@@ -1,4 +1,4 @@
-"""The Optiver template on four stocks, driven through ``fy`` exactly as campaign.sh
+"""The Optiver template on four stocks, driven through ``fy`` exactly as launch.sh
 drives it.
 
 Skipped when the Kaggle data is absent.
@@ -20,10 +20,11 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "examples"))
 
 from forestry.ledger import Ledger  # noqa: E402
-from optiver import capture, experiment  # noqa: E402
+from optiver import dataset as optiver_dataset  # noqa: E402
+from optiver import experiment  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
-    not capture.available(), reason="Optiver train.csv not downloaded"
+    not optiver_dataset.available(), reason="Optiver train.csv not downloaded"
 )
 DECL = "optiver.experiment"
 
@@ -35,7 +36,7 @@ def root(tmp_path_factory) -> pathlib.Path:
 
 @pytest.fixture(scope="module")
 def dataset(root: pathlib.Path) -> str:
-    return fy(root, "ingest", "optiver.capture", "0,1,2,3").strip()
+    return fy(root, "ingest", "optiver.dataset", "0,1,2,3").strip()
 
 
 def fy(root: pathlib.Path, *argv: str) -> str:
@@ -60,9 +61,12 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
     event = ledger.latest("dataset_recorded", dataset)
     table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
     assert table.num_rows > 100_000 and table.num_rows == event["payload"]["rows"]
-    assert not pc.any(pc.is_nan(table[capture.TARGET])).as_py()
+    assert not pc.any(pc.is_nan(table[optiver_dataset.TARGET])).as_py()
     row = ledger.sql("SELECT process, instrument FROM dataset")[0]
-    assert (row["process"], row["instrument"]) == (capture.PROCESS, capture.INSTRUMENT)
+    assert (row["process"], row["instrument"]) == (
+        optiver_dataset.PROCESS,
+        optiver_dataset.INSTRUMENT,
+    )
 
 
 def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
@@ -71,7 +75,7 @@ def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
         "SELECT p.name, s.metric, s.value FROM latest_score l "
         "JOIN aggregate_score s ON s.score = l.score "
         "JOIN pipeline p ON p.id = l.pipeline "
-        "WHERE s.age = 1"
+        "WHERE s.window = '1'"
     )
     names = {r["name"] for r in rows}
     assert {"ridge_1m", "ridge_3m", "ridge_6m"} <= names
