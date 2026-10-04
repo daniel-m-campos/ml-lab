@@ -744,9 +744,34 @@ def test_two_names_on_one_declaration_are_refused(ledger, evaluation):
     assert Event.PIPELINE not in _types(ledger)
 
 
-def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
-    assert cli.main(["--root", str(tmp_path / "empty"), "run", "tests.synthetic"]) == 1
-    assert "lab ingest first" in capsys.readouterr().err
+def test_fy_run_refuses_a_root_without_a_ledger_and_creates_none(tmp_path, capsys):
+    empty = tmp_path / "empty"
+    assert cli.main(["--root", str(empty), "run", "tests.synthetic"]) == 1
+    assert f"no ledger at {empty.resolve()}" in capsys.readouterr().err
+    assert not empty.exists()
+    assert cli.main(["--root", str(empty), "ingest", "tests.synthetic"]) == 0
+    run = ["--root", str(empty), "run", "tests.synthetic", "--dataset", "zzz"]
+    assert cli.main(run) == 1
+    assert f"0 matches in {empty.resolve()}" in capsys.readouterr().err
+
+
+def test_lab_run_flushes_each_progress_line(ledger, dataset, monkeypatch):
+    class Recording(io.StringIO):
+        flushed = ""
+
+        def flush(self):
+            self.flushed = self.getvalue()
+
+    out = Recording()
+    monkeypatch.setattr(sys, "stdout", out)
+
+    def fake(ledger, pipelines, evaluation, *, log, **kwargs):
+        log("fit ridge_1m 2025-05-01 0.1s")
+        assert out.flushed == "fit ridge_1m 2025-05-01 0.1s\n"
+        return runs.RunReport()
+
+    monkeypatch.setattr(runs, "run", fake)
+    assert cli.main(["--root", str(ledger.root), "run", "tests.synthetic"]) == 0
 
 
 # Read back ============================================================================
@@ -781,6 +806,34 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     assert stored["sha"] == sha
     assert len(_load_series(ledger, sha)) == sum(stored["fold_rows"])
     assert db.execute("SELECT resolution, pipelines FROM run").fetchone()[1]
+
+
+def test_paired_score_is_the_fold_by_fold_difference_and_the_series_is_named(
+    ledger, evaluation
+):
+    _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
+    scores = _latest(ledger, evaluation)
+    values = {}
+    for name, score in scores.items():
+        rows = ledger.sql(
+            "SELECT value FROM fold_score WHERE score = ? AND window = '1' "
+            "AND metric = 'pnl' ORDER BY fold",
+            (score,),
+        )
+        values[name] = np.array([r["value"] for r in rows])
+    d = values["ridge_1m"] - values["ridge_6m"]
+    row = ledger.sql(
+        "SELECT * FROM paired_score WHERE name = 'ridge_1m' AND reference_name = "
+        "'ridge_6m' AND window = '1' AND metric = 'pnl'"
+    )[0]
+    assert row["folds"] == len(d) and row["wins"] == int((d > 0).sum())
+    assert np.isclose(row["mean_delta"], d.mean())
+    assert np.isclose(row["delta_std"], d.std(ddof=1))
+    sha = ledger.sql("SELECT series FROM aggregate_score WHERE window = '1' LIMIT 1")
+    assert list(formats.arrays_load(ledger.get_blob(sha[0]["series"]))) == [
+        "pnl",
+        "flips",
+    ]
 
 
 def test_the_log_reads_as_it_stood(ledger, evaluation):

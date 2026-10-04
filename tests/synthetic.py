@@ -276,7 +276,11 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
     return {"pnl": float(series[:, 0].sum()), "turnover": float(series[:, 1].sum())}
 
 
-@scorer(metrics=sim_metrics, directions={"pnl": "max", "turnover": "min"})
+@scorer(
+    metrics=sim_metrics,
+    directions={"pnl": "max", "turnover": "min"},
+    columns=("pnl", "flips"),
+)
 def sign_sim(
     pred: np.ndarray, session: Session, rng: Range, config: SimConfig
 ) -> np.ndarray:

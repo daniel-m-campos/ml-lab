@@ -39,8 +39,14 @@ def step(func: Callable | None = None, *, format: str | None = None) -> Callable
     return decorate(func) if func is not None else decorate
 
 
-def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
+def scorer(
+    metrics: Callable, directions: Mapping[str, str], columns: tuple[str, ...] = ()
+) -> Callable:
     """Register ``score(pred, session, range, config) -> series``.
+
+    The series is a 1-D or 2-D array with one row per scoring unit: a prediction, or a
+    day for a cross-sectional metric. ``metrics`` defines the unit and must make sense
+    over the folds' rows concatenated.
 
     Parameters
     ----------
@@ -48,10 +54,15 @@ def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
         ``metrics(series) -> dict``; applied per fold and over the concatenated folds.
     directions : Mapping[str, str]
         Metric name to ``"max"`` or ``"min"``; comparisons read it.
+    columns : tuple[str, ...], optional
+        Names for the series' columns, stored with the blob so it reads without the
+        scorer's code; ``"0"``, ``"1"``, ... when absent. A count mismatch is refused.
     """
 
     def decorate(func: Callable) -> Callable:
-        return identity.register(func, metrics=metrics, directions=dict(directions))
+        return identity.register(
+            func, metrics=metrics, directions=dict(directions), columns=tuple(columns)
+        )
 
     return decorate
 

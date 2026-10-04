@@ -619,9 +619,17 @@ def _score(
         whole = np.concatenate(parts)
         aggregate[window] = evaluation.metrics(whole)
         columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
+        names = evaluation.scorer.__ml_lab_meta__.get("columns") or [
+            str(i) for i in range(columns.shape[1])
+        ]
+        if len(names) != columns.shape[1]:
+            raise Refused(
+                f"scorer declares columns {list(names)}; its series has "
+                f"{columns.shape[1]}"
+            )
         stored[window] = {
             "sha": ledger.put_blob(
-                formats.arrays_save({str(i): c for i, c in enumerate(columns.T)})
+                formats.arrays_save(dict(zip(names, columns.T, strict=True)))
             ),
             "format": formats.Format.ARROW_ARRAYS,
             "fold_rows": [len(part) for part in parts],

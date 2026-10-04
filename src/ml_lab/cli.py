@@ -9,7 +9,8 @@ of them, so a file an agent wrote holding only new pipelines runs beside the pro
 declarations; every pipeline is scored under every evaluation. A module
 is a dotted name importable from the current directory or a ``.py`` path. The dataset
 defaults to the newest one recorded. The ledger root comes from ``--root`` or
-``ML_LAB_ROOT`` (default ``.ml-lab``); the actor from ``ML_LAB_ACTOR``.
+``ML_LAB_ROOT`` (default ``.ml-lab``); only ``lab ingest`` creates one, ``lab run``
+refuses a root without a ledger. The actor comes from ``ML_LAB_ACTOR``.
 
 Examples
 --------
@@ -64,8 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(handler=_run)
 
     args = parser.parse_args(argv)
+    root = pathlib.Path(args.root)
     try:
-        return args.handler(args, Ledger(pathlib.Path(args.root)))
+        if args.command == "run" and not (root / "ml_lab.sqlite").exists():
+            raise Refused(
+                f"no ledger at {root.resolve()}; set ML_LAB_ROOT or --root, or lab "
+                "ingest to create one"
+            )
+        return args.handler(args, Ledger(root))
     except (Refused, KeyError, ImportError) as refused:
         print(f"lab {args.command}: {refused}", file=sys.stderr)
         return 1
@@ -85,7 +92,13 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     for evaluation in evaluations:
         if len(evaluations) > 1:
             print(f"evaluation {evaluation.name or evaluation.id}")
-        report = runs.run(ledger, pipelines, evaluation, log=print, dry=args.dry_run)
+        report = runs.run(
+            ledger,
+            pipelines,
+            evaluation,
+            log=lambda line: print(line, flush=True),
+            dry=args.dry_run,
+        )
         if args.dry_run:
             print(
                 f"dry run: would compute fits {report.fits_computed}, predictions "
@@ -152,14 +165,17 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
         matches = [r["id"] for r in rows if r["id"].startswith(selector)]
         if len(matches) != 1:
             raise Refused(
-                f"dataset {selector}: {len(matches)} matches; lab ingest first"
+                f"dataset {selector}: {len(matches)} matches in "
+                f"{ledger.root.resolve()}; lab ingest first"
             )
         return matches[0]
     if len(by_source) > 1:
         choices = ", ".join(f"{s} ({i[:8]})" for s, i in by_source.items())
         raise Refused(f"ledger holds several sources, pass --dataset: {choices}")
     if not rows:
-        raise Refused("dataset (newest): 0 matches; lab ingest first")
+        raise Refused(
+            f"dataset (newest): 0 matches in {ledger.root.resolve()}; lab ingest first"
+        )
     return rows[-1]["id"]
 
 

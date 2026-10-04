@@ -193,6 +193,7 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
 @scorer(
     metrics=sim_metrics,
     directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
+    columns=("pnl", "flips"),
 )
 def taker_sim(
     pred: np.ndarray, session: Session, rng: Range, config: SimConfig

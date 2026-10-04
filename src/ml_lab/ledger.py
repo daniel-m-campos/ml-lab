@@ -187,6 +187,26 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
   json_extract(f.payload,'$.duration_s') AS duration_s
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
+DROP VIEW IF EXISTS paired_score;
+CREATE VIEW paired_score AS SELECT la.evaluation, a.window, a.metric,
+  la.pipeline, la.name, la.score,
+  lb.pipeline AS reference, lb.name AS reference_name, lb.score AS reference_score,
+  COUNT(*) AS folds, AVG(a.value - b.value) AS mean_delta,
+  CASE WHEN COUNT(*) > 1
+       THEN sqrt(max(AVG((a.value - b.value) * (a.value - b.value))
+                     - AVG(a.value - b.value) * AVG(a.value - b.value), 0)
+                 * COUNT(*) / (COUNT(*) - 1))
+  END AS delta_std,
+  SUM(CASE json_extract(v.metrics, '$.' || a.metric)
+      WHEN 'max' THEN a.value > b.value WHEN 'min' THEN a.value < b.value END) AS wins
+FROM latest_score la
+JOIN latest_score lb ON lb.evaluation = la.evaluation AND lb.pipeline <> la.pipeline
+JOIN fold_score a ON a.score = la.score
+JOIN fold_score b ON b.score = lb.score AND b.fold = a.fold
+  AND b.window = a.window AND b.metric = a.metric
+JOIN evaluation v ON v.id = la.evaluation
+GROUP BY la.score, lb.score, a.window, a.metric;
+
 DROP VIEW IF EXISTS failure;
 CREATE VIEW failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
