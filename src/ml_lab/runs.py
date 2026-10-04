@@ -320,8 +320,18 @@ def _run_pipeline(
                     "metrics": evaluation.metrics(rows),
                 }
             )
+    stored: dict[str, dict[str, Any]] = {}
     for window, parts in series.items():
-        aggregate[window] = evaluation.metrics(np.concatenate(parts))
+        whole = np.concatenate(parts)
+        aggregate[window] = evaluation.metrics(whole)
+        columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
+        stored[window] = {
+            "sha": ledger.put_blob(
+                formats.arrays_save({str(i): c for i, c in enumerate(columns.T)})
+            ),
+            "format": formats.Format.ARROW_ARRAYS,
+            "fold_rows": [len(part) for part in parts],
+        }
     ledger.append(
         Event.SCORE,
         evaluation.id,
@@ -332,6 +342,7 @@ def _run_pipeline(
             "predictions": predictions,
             "folds": per_fold,
             "aggregate": aggregate,
+            "series": stored,
         },
         id=score_id,
     )

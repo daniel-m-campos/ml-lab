@@ -131,8 +131,16 @@ DROP VIEW IF EXISTS aggregate_score;
 CREATE VIEW aggregate_score AS SELECT e.id AS score,
   e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, a.key AS window,
-  m.key AS metric, m.value AS value
+  m.key AS metric, m.value AS value, f.folds, f.fold_mean,
+  CASE WHEN f.folds > 1
+       THEN sqrt(max(f.sq - f.fold_mean * f.fold_mean, 0) * f.folds / (f.folds - 1))
+  END AS fold_std,
+  json_extract(e.payload,'$.series.' || a.key || '.sha') AS series
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
+JOIN (SELECT score, window, metric, COUNT(*) AS folds, AVG(value) AS fold_mean,
+             AVG(value * value) AS sq
+      FROM fold_score GROUP BY score, window, metric) f
+  ON f.score = e.id AND f.window = a.key AND f.metric = m.key
 WHERE e.type='score_recorded';
 
 DROP VIEW IF EXISTS latest_score;

@@ -16,7 +16,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from ml_lab import cli, identity, runs, splits
+from ml_lab import cli, formats, identity, runs, splits
 from ml_lab.dataset import load, record
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.panel import Panel
@@ -51,6 +51,10 @@ def _types(ledger) -> dict[str, int]:
     for e in ledger.events():
         out[e["type"]] = out.get(e["type"], 0) + 1
     return out
+
+
+def _load_series(ledger, sha: str) -> np.ndarray:
+    return np.column_stack(list(formats.arrays_load(ledger.get_blob(sha)).values()))
 
 
 def _latest(ledger, evaluation) -> dict[str, str]:
@@ -466,6 +470,16 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     assert db.execute("SELECT DISTINCT source FROM latest_score").fetchall() == [
         ("synthetic",)
     ]
+    folds_, std, sha = db.execute(
+        "SELECT folds, fold_std, series FROM aggregate_score WHERE window = '1'"
+    ).fetchone()
+    assert folds_ == len(folds) and std > 0
+    score = ledger.latest(
+        Event.SCORE, db.execute("SELECT score FROM latest_score").fetchone()[0]
+    )
+    stored = score["payload"]["series"]["1"]
+    assert stored["sha"] == sha
+    assert len(_load_series(ledger, sha)) == sum(stored["fold_rows"])
     assert db.execute("SELECT resolution, pipelines FROM run").fetchone()[1]
 
 
