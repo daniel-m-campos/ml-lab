@@ -71,6 +71,7 @@ def dataset(ledger: Ledger, stocks: str = "all") -> str:
         params={
             "stocks": list(selected) if selected else "all",
             "base_date": str(BASE_DATE),
+            "instrument": INSTRUMENT,
         },
         filters=(drop_null_target,),
         targets=(TARGET,),
