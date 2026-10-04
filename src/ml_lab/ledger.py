@@ -67,18 +67,21 @@ CREATE VIEW dataset AS SELECT seq, id, at, actor,
 FROM event WHERE type='dataset_recorded';
 
 DROP VIEW IF EXISTS pipeline;
-CREATE VIEW pipeline AS SELECT seq, id, at, actor,
+CREATE VIEW pipeline AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,
   json_extract(payload,'$.declaration') AS declaration
-FROM event WHERE type='pipeline_declared';
+FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
+      FROM event WHERE type='pipeline_declared') WHERE rn = 1;
 
 DROP VIEW IF EXISTS evaluation;
-CREATE VIEW evaluation AS SELECT seq, id, at, actor,
+CREATE VIEW evaluation AS SELECT seq, key AS id, at, actor,
+  json_extract(payload,'$.name') AS name,
   json_extract(payload,'$.dataset') AS dataset,
   json_extract(payload,'$.metrics') AS metrics,
   json_extract(payload,'$.declaration') AS declaration,
   json_extract(payload,'$.folds') AS folds
-FROM event WHERE type='evaluation_declared';
+FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
+      FROM event WHERE type='evaluation_declared') WHERE rn = 1;
 
 DROP VIEW IF EXISTS run;
 CREATE VIEW run AS SELECT seq, id, at, actor, host, stream AS evaluation,
@@ -144,8 +147,8 @@ JOIN (SELECT score, window, metric, COUNT(*) AS folds, AVG(value) AS fold_mean,
 WHERE e.type='score_recorded';
 
 DROP VIEW IF EXISTS latest_score;
-CREATE VIEW latest_score AS SELECT l.evaluation, l.pipeline, p.name,
-  e.dataset, d.source, l.score, l.run, l.seq
+CREATE VIEW latest_score AS SELECT l.evaluation, e.name AS evaluation_name,
+  l.pipeline, p.name, e.dataset, d.source, l.score, l.run, l.seq
 FROM (SELECT evaluation, pipeline, id AS score, run, seq,
         ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM score) l

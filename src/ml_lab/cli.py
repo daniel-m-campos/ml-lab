@@ -3,9 +3,10 @@
 Declarations are plain module attributes, so a project may organize them freely: one
 script, or ``dataset.py`` + ``steps.py`` + ``experiment.py``, or one file per idea. ``fy
 ingest`` reads ``dataset(ledger, *args)`` from a module. ``lab run`` takes one or more
-modules, reads ``pipelines`` (a list of ``Pipeline``) from each and ``evaluation`` (an
-``Evaluation`` or a function of the dataset id) from exactly one of them, so a file an
-agent wrote holding only new pipelines runs beside the project's declarations. A module
+modules, reads ``pipelines`` (a list of ``Pipeline``) from each and ``evaluations`` (a
+list of ``Evaluation``, or a function of the dataset id returning one) from exactly one
+of them, so a file an agent wrote holding only new pipelines runs beside the project's
+declarations; every pipeline is scored under every evaluation. A module
 is a dotted name importable from the current directory or a ``.py`` path. The dataset
 defaults to the newest one recorded. The ledger root comes from ``--root`` or
 ``ML_LAB_ROOT`` (default ``.ml-lab``); the actor from ``ML_LAB_ACTOR``.
@@ -74,21 +75,26 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
-    pipelines, evaluation = _experiments(args, ledger)
-    report = runs.run(ledger, pipelines, evaluation, log=print)
-    if not report.run:
+    pipelines, evaluations = _experiments(args, ledger)
+    failed = False
+    for evaluation in evaluations:
+        if len(evaluations) > 1:
+            print(f"evaluation {evaluation.name or evaluation.id}")
+        report = runs.run(ledger, pipelines, evaluation, log=print)
+        if not report.run:
+            print(
+                f"up to date: {report.scores_reused} scores; {report.fits_reused} fits "
+                f"and {report.predictions_reused} predictions reused, nothing written"
+            )
+            continue
         print(
-            f"up to date: {report.scores_reused} scores; {report.fits_reused} fits and "
-            f"{report.predictions_reused} predictions reused, nothing written"
+            f"run {report.run}: fits {report.fits_computed}, predictions "
+            f"{report.predictions_computed}, scores {report.scores_recorded}"
         )
-        return 0
-    print(
-        f"run {report.run}: fits {report.fits_computed}, predictions "
-        f"{report.predictions_computed}, scores {report.scores_recorded}"
-    )
-    for name, error in report.failed.items():
-        print(f"lab run: {name} failed: {error}")
-    return 1 if report.failed else 0
+        for name, error in report.failed.items():
+            print(f"lab run: {name} failed: {error}")
+        failed = failed or bool(report.failed)
+    return 1 if failed else 0
 
 
 # Private Functions ====================================================================
@@ -96,23 +102,29 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
 
 def _experiments(
     args: argparse.Namespace, ledger: Ledger
-) -> tuple[list[Pipeline], Evaluation]:
-    """Pipelines from every module named; the evaluation from the one module that
-    declares it.
+) -> tuple[list[Pipeline], list[Evaluation]]:
+    """Pipelines from every module named; the evaluations from the one module that
+    declares them. Two names on one evaluation, or one name on two, are refused.
     """
     modules = [_load(spec) for spec in args.experiments]
     pipelines = [p for m in modules for p in getattr(m, "pipelines", [])]
-    found = {
-        id(m.evaluation): m.evaluation for m in modules if hasattr(m, "evaluation")
-    }
+    found = [m.evaluations for m in modules if hasattr(m, "evaluations")]
     if len(found) != 1:
         raise Refused(
-            f"{len(found)} evaluations declared across {args.experiments}; need one"
+            f"{len(found)} modules declare evaluations across {args.experiments}; "
+            "need one"
         )
-    evaluation = next(iter(found.values()))
-    if callable(evaluation):
-        evaluation = evaluation(_dataset(ledger, args.dataset))
-    return pipelines, evaluation
+    evaluations = found[0]
+    if callable(evaluations):
+        evaluations = evaluations(_dataset(ledger, args.dataset))
+    evaluations = list(evaluations)
+    names, ids = {e.name or e.id for e in evaluations}, {e.id for e in evaluations}
+    if not evaluations or len(names) < len(evaluations) or len(ids) < len(evaluations):
+        raise Refused(
+            f"{len(evaluations)} evaluations, {len(names)} names, {len(ids)} ids; one "
+            "name per evaluation and one evaluation per name"
+        )
+    return pipelines, evaluations
 
 
 def _dataset(ledger: Ledger, selector: str | None) -> str:

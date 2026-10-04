@@ -41,16 +41,19 @@ pipelines = ridge_windows + (
 )
 
 
-def evaluation(dataset: str) -> Evaluation:
+def evaluations(dataset: str) -> list[Evaluation]:
     """Monthly walk-forward with three horizons, scored by the taker simulation."""
-    return Evaluation(
-        dataset=dataset,
-        split=CalendarWalkForward(
-            first_cutoff="2021-05-04",
-            horizons=(1, 2, 3),
-            embargo_timestamps=0,
-            min_folds=3,
-        ),
-        scorer=steps.taker_sim,
-        config=steps.SimConfig(cost_bps=0.5, threshold_bps=0.0),
-    )
+    return [
+        Evaluation(
+            name="taker",
+            dataset=dataset,
+            split=CalendarWalkForward(
+                first_cutoff="2021-05-04",
+                horizons=(1, 2, 3),
+                embargo_timestamps=0,
+                min_folds=3,
+            ),
+            scorer=steps.taker_sim,
+            config=steps.SimConfig(cost_bps=0.5, threshold_bps=0.0),
+        )
+    ]

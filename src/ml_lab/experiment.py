@@ -1,9 +1,10 @@
 """What an experiment is made of: steps, scorers, pipelines and the evaluation.
 
-An experiment module exposes ``pipelines`` and ``evaluation``; ``lab run`` reads both by
-name. Declarations are frozen dataclasses hashed by canonical serialization; see
-docs/spec.md. A pipeline's name is a label and does not enter its hash. Identity is
-declaration only: code changes are caught by the fit memo, not by hashing files.
+An experiment module exposes ``pipelines`` and ``evaluations``; ``lab run`` reads both
+by name. Declarations are frozen dataclasses hashed by canonical serialization; see
+docs/spec.md. A name is a label and does not enter its hash; a field at its default is
+left out, so adding a defaulted field keeps every id. Identity is declaration only: code
+changes are caught by the fit memo, not by hashing files.
 
 Examples
 --------
@@ -65,9 +66,17 @@ class Pipeline:
     cheap stage after ``predict``: neutralise, clip, rank. Its knobs are bound with
     ``step.configured(**kwargs)`` so they enter the prediction's identity and not the
     fit's. A pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a
-    fourth argument, the members' predictions as a list of arrays (over the train
-    segments for ``fit``, over the window for ``predict``), and the members' fits and
-    predictions are memoized on their own.
+    fourth argument, the members' predictions as a list of arrays: over the window for
+    ``predict``, and over the train segments for ``fit`` only when ``fit`` declares a
+    fourth positional parameter. Those are in-sample, so a weight learned on them
+    overfits; a three-argument ``fit`` sets fixed weights and computes no train-range
+    predictions. The members' fits and predictions are memoized on their own.
+
+    Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip.configured(
+    at=3.0), name="gbt_clip")`` shares every fit and raw prediction with ``p``, since
+    the fit id reads ``fit_declaration`` and the raw prediction id excludes
+    ``postprocess``. The config class must live in a module the fit step imports, so
+    an edited default is caught by the memo.
     """
 
     fit: Callable
@@ -117,13 +126,16 @@ class Pipeline:
 class Evaluation:
     """How every pipeline on a dataset is scored: a split into folds, a scorer and its
     config. Splits live in ``ml_lab.splits``; any frozen dataclass with
-    ``folds(session) -> list[Fold]`` works.
+    ``folds(session) -> list[Fold]`` works. ``name`` is a label. A sweep is a list of
+    ``dataclasses.replace(base, config=SimConfig(t), name=f"cost{t}")``; the scorer's
+    config class must live in a module the scorer imports.
     """
 
     dataset: str
     split: Any
     scorer: Callable
     config: Any = None
+    name: str = dataclasses.field(default="", metadata={"label": True})
 
     @property
     def id(self) -> str:

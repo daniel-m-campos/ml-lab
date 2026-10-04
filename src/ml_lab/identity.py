@@ -90,7 +90,7 @@ def canonical(obj: Any) -> Any:
         fields = {
             f.name: canonical(getattr(obj, f.name))
             for f in dataclasses.fields(obj)
-            if not f.metadata.get("label")
+            if not f.metadata.get("label") and not _at_default(f, getattr(obj, f.name))
         }
         return {"__type__": type(obj).__qualname__, **fields}
     if isinstance(obj, dict):
@@ -101,6 +101,17 @@ def canonical(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [canonical(v) for v in obj]
     raise TypeError(f"cannot serialize {type(obj).__name__} into a declaration")
+
+
+def _at_default(field: dataclasses.Field, value: Any) -> bool:
+    """A field holding its default is left out, so adding a defaulted field to a
+    declaration keeps every existing id.
+    """
+    if field.default is not dataclasses.MISSING:
+        return canonical(value) == canonical(field.default)
+    if field.default_factory is not dataclasses.MISSING:
+        return canonical(value) == canonical(field.default_factory())
+    return False
 
 
 def content_hash(obj: Any) -> str:

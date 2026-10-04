@@ -13,6 +13,8 @@ Examples
 from __future__ import annotations
 
 import dataclasses
+import inspect
+import json
 import os
 import pathlib
 import platform
@@ -228,6 +230,8 @@ class _Stage:
             stage: identity.import_shas(steps, root)
             for stage, steps in self.steps.items()
         }
+        self.takes_members = bool(pipeline.members) and _positional(pipeline.fit) > 3
+        _refuse_unseen_class(pipeline.config, self.stage_shas["fit"], root, "fit")
         self.dists = identity.imported_dists(pipeline.steps, root)
         self.env_lock = _text_blob(ledger, _lock_text(self.dists))
         self.models: dict[str, Any] = {}
@@ -260,7 +264,7 @@ class _Stage:
         if self.ledger.latest(Event.FIT, fit_id) is not None:
             self.report.fits_reused += 1
             return fit_id
-        inputs = self._member_inputs(member_fits, fold, fold.train)
+        inputs = self._member_inputs(member_fits, fold) if self.takes_members else []
         run_id = self.start()
         started = time.perf_counter()
         visible = self.session.upto(max(hi for _, hi in fold.train))
@@ -372,11 +376,11 @@ class _Stage:
         return pred_id
 
     def _member_inputs(
-        self, member_fits: list[str], fold: Fold, segments: tuple[Range, ...]
+        self, member_fits: list[str], fold: Fold
     ) -> list[list[np.ndarray]]:
-        """Each member's predictions over the train segments, as one array each."""
-        if not self.members:
-            return []
+        """Each member's in-sample predictions over the train segments, one array
+        each.
+        """
         arrays = []
         for member, fit_id in zip(self.members, member_fits, strict=True):
             parts = [
@@ -384,7 +388,7 @@ class _Stage:
                     self.ledger,
                     member.predictions(fit_id, fold, -1, f"train:{k}", seg),
                 )
-                for k, seg in enumerate(segments)
+                for k, seg in enumerate(fold.train)
             ]
             arrays.append(np.concatenate(parts))
         return [arrays]
@@ -462,6 +466,7 @@ def _score(
 ):
     name = pipeline.name or pipeline.id
     scorer_shas = identity.import_shas((evaluation.scorer,), root)
+    _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
@@ -534,6 +539,7 @@ def _load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
 
 
 def _declare_pipeline(ledger: Ledger, pipeline: Pipeline):
+    """One event per (id, name), so a rename reaches the views."""
     ledger.append(
         Event.PIPELINE,
         pipeline.id,
@@ -543,31 +549,73 @@ def _declare_pipeline(ledger: Ledger, pipeline: Pipeline):
             "declaration": identity.canonical(pipeline),
             "config": identity.canonical(pipeline.config),
         },
-        id=pipeline.id,
+        id=identity.content_hash({"id": pipeline.id, "name": pipeline.name}),
     )
 
 
 def _declare_evaluation(ledger: Ledger, evaluation: Evaluation, folds: list[Fold]):
+    """One event per (id, name); a split whose folds moved under an unchanged
+    declaration is refused, since scores under one id must share one schedule.
+    """
+    live = [
+        {
+            "index": i,
+            "label": f.label,
+            "train": [list(seg) for seg in f.train],
+            "windows": f.windows,
+        }
+        for i, f in enumerate(folds)
+    ]
+    before = ledger.latest(Event.EVALUATION, evaluation.id)
+    if before is not None and before["payload"]["folds"] != json.loads(
+        json.dumps(live)
+    ):
+        raise Refused(
+            f"the split yields other folds than evaluation {evaluation.id} recorded; "
+            "the split's code changed without its declaration, so rename it or delete "
+            "the ledger"
+        )
     ledger.append(
         Event.EVALUATION,
         evaluation.id,
         evaluation.id,
         {
+            "name": evaluation.name,
             "dataset": evaluation.dataset,
             "declaration": identity.canonical(evaluation),
             "metrics": evaluation.directions,
-            "folds": [
-                {
-                    "index": i,
-                    "label": f.label,
-                    "train": [list(seg) for seg in f.train],
-                    "windows": f.windows,
-                }
-                for i, f in enumerate(folds)
-            ],
+            "folds": live,
         },
-        id=evaluation.id,
+        id=identity.content_hash({"id": evaluation.id, "name": evaluation.name}),
     )
+
+
+def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by: str):
+    """A dataclass config defined in a repo module its consumer does not import would
+    let an edited default reuse a stale fit; refuse and say where to define it.
+    """
+    if not dataclasses.is_dataclass(obj) or isinstance(obj, type):
+        return
+    module = sys.modules.get(type(obj).__module__)
+    file = getattr(module, "__file__", None)
+    if not file or root.resolve() not in pathlib.Path(file).resolve().parents:
+        return
+    rel = pathlib.Path(file).resolve().relative_to(root.resolve()).as_posix()
+    if rel not in shas:
+        raise Refused(
+            f"{type(obj).__name__} is defined in {rel}, which the {by} step does not "
+            "import, so a default edited there would not refit; define it beside the "
+            f"{by} step"
+        )
+
+
+def _positional(func: Callable) -> int:
+    """Positional parameters of a step; kwargs bound by ``configured`` do not count."""
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    params = inspect.signature(func).parameters.values()
+    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params):
+        return 4
+    return sum(p.kind in kinds for p in params)
 
 
 def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:

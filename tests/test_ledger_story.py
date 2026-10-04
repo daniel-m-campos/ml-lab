@@ -109,6 +109,84 @@ def test_a_pipeline_name_is_a_label_and_a_config_change_is_a_new_id():
     assert a.with_config(alpha=2.0).id != a.id
 
 
+def test_adding_a_defaulted_field_keeps_the_id_and_a_rename_reaches_the_views(
+    ledger, evaluation
+):
+    old = dataclasses.make_dataclass("Config", [("alpha", float)], frozen=True)
+    new = dataclasses.make_dataclass(
+        "Config",
+        [("alpha", float), ("include", tuple, dataclasses.field(default=()))],
+        frozen=True,
+    )
+    assert identity.content_hash(old(1.0)) == identity.content_hash(new(1.0))
+    assert identity.content_hash(new(1.0, ("x",))) != identity.content_hash(old(1.0))
+    _run(ledger, evaluation, synthetic.ridge(1))
+    _run(ledger, evaluation, synthetic.ridge(1).named("renamed"))
+    assert set(_latest(ledger, evaluation)) == {"renamed"}
+    rows = ledger.sql("SELECT COUNT(*) AS n FROM pipeline")
+    assert rows[0]["n"] == 1 and len(ledger.events(Event.PIPELINE)) == 2
+
+
+def test_a_config_class_the_step_does_not_import_is_refused(ledger, evaluation):
+    @dataclasses.dataclass(frozen=True)
+    class Far:
+        train_window_months: int = 3
+        alpha: float = 1.0
+
+    far = dataclasses.replace(synthetic.ridge(3), config=Far())
+    report = _run(ledger, evaluation, far)
+    assert "define it beside the fit step" in report.failed["ridge_3m"]
+    assert Event.FIT not in _types(ledger)
+
+
+def test_a_split_whose_folds_moved_under_one_declaration_is_refused(
+    ledger, dataset, evaluation, monkeypatch
+):
+    _run(ledger, evaluation, synthetic.ridge(1))
+    folds = evaluation.split.folds(load(ledger, dataset))
+    monkeypatch.setattr(type(evaluation.split), "folds", lambda self, s: folds[1:])
+    with pytest.raises(Refused, match="yields other folds"):
+        _run(ledger, evaluation, synthetic.ridge(3))
+
+
+def test_a_blend_whose_fit_takes_three_arguments_predicts_no_train_range(
+    ledger, evaluation
+):
+    fixed = dataclasses.replace(
+        synthetic.blend(synthetic.ridge(1), synthetic.ridge(3)),
+        fit=synthetic.equal_fit,
+        name="equal",
+    )
+    _run(ledger, evaluation, fixed)
+    rows = ledger.sql(
+        "SELECT COUNT(*) AS n FROM prediction WHERE window LIKE 'train:%'"
+    )
+    assert rows[0]["n"] == 0 and "equal" in _latest(ledger, evaluation)
+
+
+def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
+    ledger, dataset, tmp_path, capsys
+):
+    sweep = tmp_path / "sweep.py"
+    sweep.write_text(
+        "import dataclasses\nfrom tests import synthetic\n"
+        "pipelines = synthetic.pipelines[:2]\n"
+        "def evaluations(d):\n"
+        "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
+        " for c in (0.001, 0.01)]\n"
+    )
+    assert cli.main(["--root", str(ledger.root), "run", str(sweep)]) == 0
+    out = capsys.readouterr().out
+    assert "evaluation c0.001" in out and "evaluation c0.01" in out
+    rows = ledger.sql(
+        "SELECT evaluation_name AS e, COUNT(*) AS n FROM latest_score GROUP BY 1"
+    )
+    assert {r["e"]: r["n"] for r in rows} == {"c0.001": 2, "c0.01": 2}
+    assert ledger.sql("SELECT COUNT(*) AS n FROM fit")[0]["n"] == 2 * len(
+        synthetic.evaluation(dataset).split.folds(load(ledger, dataset))
+    )
+
+
 def test_any_evaluation_field_change_is_a_new_evaluation_id(dataset, evaluation):
     cost = synthetic.evaluation(dataset, cost=0.01)
     one = dataclasses.replace(
@@ -577,7 +655,7 @@ def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     root = ["--root", str(ledger.root)]
     assert cli.main([*root, "run", str(extra)]) == 1
-    assert "0 evaluations" in capsys.readouterr().err
+    assert "0 modules declare evaluations" in capsys.readouterr().err
     assert cli.main([*root, "run", "nope.decl"]) == 1
     assert "No module named 'nope'" in capsys.readouterr().err
     assert cli.main([*root, "run", "tests.synthetic", "--dataset", "zzz"]) == 1

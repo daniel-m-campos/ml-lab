@@ -194,6 +194,12 @@ def blend_load(payload: bytes) -> BlendModel:
     return BlendModel(formats.arrays_load(payload)["weights"])
 
 
+@step
+def equal_fit(session: Session, train: Segments, config: BlendConfig) -> BlendModel:
+    """Fixed equal weights: three arguments, so no in-sample member predictions."""
+    return BlendModel(np.full(2, 0.5))
+
+
 def blend(*members: Pipeline, shrink: float = 1.0) -> Pipeline:
     return Pipeline(
         name="blend_" + "_".join(m.name for m in members),
@@ -281,3 +287,7 @@ def flaky(window_months: int = 3) -> Pipeline:
 
 
 pipelines = [ridge(1), ridge(3), ridge(6)]
+
+
+def evaluations(dataset: str) -> list[Evaluation]:
+    return [evaluation(dataset)]
