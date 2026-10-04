@@ -135,7 +135,7 @@ fy run project.declarations ideas/agent7.py --dataset $DS
 fy history $C
 ```
 
-Five verbs. The four after `ingest` take one or more modules: pipelines are concatenated, the evaluation comes from the one module that declares it. The board shows the pipelines currently declared plus the baseline; `--all` adds the ones no longer declared. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
+Five verbs. A module is a dotted name importable from the current directory or a `.py` path, resolved by its package so its own imports work. The four after `ingest` take one or more modules: pipelines are concatenated, the evaluation comes from the one module that declares it. The board shows the pipelines currently declared plus the baseline; `--all` adds the ones no longer declared. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
 
 ## Later
 

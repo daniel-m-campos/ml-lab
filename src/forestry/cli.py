@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import importlib.util
 import json
 import os
 import pathlib
@@ -75,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     ledger = Ledger(pathlib.Path(args.root))
     try:
         return args.handler(args, ledger)
-    except (Refused, KeyError) as refused:
+    except (Refused, KeyError, ImportError) as refused:
         print(f"fy {args.command}: {refused}", file=sys.stderr)
         return 1
 
@@ -166,13 +165,18 @@ def _declarations(args: argparse.Namespace) -> tuple[list[Pipeline], Evaluation]
 
 
 def _load(spec: str) -> Any:
-    if not spec.endswith(".py"):
-        return importlib.import_module(spec)
-    module_spec = importlib.util.spec_from_file_location(pathlib.Path(spec).stem, spec)
-    module = importlib.util.module_from_spec(module_spec)
-    sys.modules[module_spec.name] = module
-    module_spec.loader.exec_module(module)
-    return module
+    """Import a dotted name from the current directory, or a .py path by its package name."""
+    if spec.endswith(".py"):
+        path = pathlib.Path(spec).resolve()
+        parts = [path.stem]
+        while (path.parent / "__init__.py").exists():
+            path = path.parent
+            parts.insert(0, path.name)
+        sys.path.insert(0, str(path.parent))
+        spec = ".".join(parts)
+    else:
+        sys.path.insert(0, os.getcwd())
+    return importlib.import_module(spec)
 
 
 def _table(columns: tuple[str, ...], rows: list[dict[str, Any]]) -> str:

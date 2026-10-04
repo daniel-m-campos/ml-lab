@@ -332,7 +332,8 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
 def test_fy_run_merges_pipelines_from_several_modules(ledger, dataset, tmp_path, capsys):
     extra = tmp_path / "agent7.py"
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
-    argv = ["--root", str(ledger.root), "run", "tests.synthetic", str(extra), "--dataset", dataset]
+    by_path = str(REPO / "tests" / "synthetic.py")
+    argv = ["--root", str(ledger.root), "run", by_path, str(extra), "--dataset", dataset]
     assert cli.main(argv) == 0
     assert "entries 4" in capsys.readouterr().out
     names = {r["pipeline"] for r in review.board(ledger, synthetic.evaluation(dataset))}
@@ -344,6 +345,8 @@ def test_fy_run_refuses_modules_without_exactly_one_evaluation(ledger, dataset, 
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     assert cli.main(["--root", str(ledger.root), "run", str(extra), "--dataset", dataset]) == 1
     assert "0 evaluations" in capsys.readouterr().err
+    assert cli.main(["--root", str(ledger.root), "run", "nope.decl", "--dataset", dataset]) == 1
+    assert "No module named 'nope'" in capsys.readouterr().err
 
 
 # Storage ==========================================================================================

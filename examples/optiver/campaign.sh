@@ -24,5 +24,7 @@ echo "== history"
 fy history $C
 
 echo
-echo "Next: fy board $C <pipeline> for one in detail, then"
-echo "      fy decide $C <pipeline> --kind promote|reject --why '...'"
+echo "Next, from the repo root with the ledger named:"
+echo "  export FORESTRY_ROOT=$FORESTRY_ROOT"
+echo "  fy board examples/optiver/declarations.py --dataset $DS <pipeline>"
+echo "  fy decide examples/optiver/declarations.py --dataset $DS <pipeline> --kind promote|reject --why '...'"
