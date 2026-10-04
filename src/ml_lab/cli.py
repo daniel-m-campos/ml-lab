@@ -145,7 +145,7 @@ def _experiments(
         evaluations = evaluations(_dataset(ledger, args.dataset))
     evaluations = list(evaluations)
     names, ids = {e.name or e.id for e in evaluations}, {e.id for e in evaluations}
-    if not evaluations or len(names) < len(evaluations) or len(ids) < len(evaluations):
+    if not (evaluations and len(names) == len(ids) == len(evaluations)):
         raise Refused(
             f"{len(evaluations)} evaluations, {len(names)} names, {len(ids)} ids; one "
             "name per evaluation and one evaluation per name"

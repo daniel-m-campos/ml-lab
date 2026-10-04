@@ -203,18 +203,8 @@ class _Stage:
     """
 
     def __init__(self, context: _Run, pipeline: Pipeline):
-        self.context, self.pipeline = context, pipeline
-        self.ledger, self.session, self.root = (
-            context.ledger,
-            context.session,
-            context.root,
-        )
-        self.targets, self.evaluation, self.report = (
-            context.targets,
-            context.evaluation,
-            context.report,
-        )
-        self.start, self.log, self.dry = context.start, context.log, context.dry
+        vars(self).update(vars(context))
+        self.pipeline = pipeline
         self.name = pipeline.name or pipeline.id
         self.shas = identity.import_shas(pipeline.steps, self.root)
         self.steps = {
@@ -449,7 +439,7 @@ class _Stage:
         columns = self._feature_columns(bare)
         duration = time.perf_counter() - started
         self._unchanged("features")
-        at = self.context.probe_at
+        at = self.probe_at
         again = self._feature_columns(bare.frozen(at))
         for name, values in columns.items():
             if not np.array_equal(values[:at], again[name][:at], equal_nan=True):
@@ -572,16 +562,10 @@ class _Stage:
 def _score(
     context: _Run, folds: list[Fold], pipeline: Pipeline, predictions: dict[str, str]
 ):
-    ledger, session, evaluation, root = (
-        context.ledger,
-        context.session,
-        context.evaluation,
-        context.root,
-    )
-    report, start, log = context.report, context.start, context.log
+    ledger, evaluation, report = context.ledger, context.evaluation, context.report
     name = pipeline.name or pipeline.id
-    scorer_shas = identity.import_shas((evaluation.scorer,), root)
-    _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
+    scorer_shas = identity.import_shas((evaluation.scorer,), context.root)
+    _refuse_unseen_class(evaluation.config, scorer_shas, context.root, "scorer")
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
@@ -595,16 +579,15 @@ def _score(
         return
     if context.dry:
         report.scores_recorded += 1
-        log(f"would score {name}")
+        context.log(f"would score {name}")
         return
     per_fold, series = [], {}
     aggregate: dict[str, dict[str, float]] = {}
     for index, fold in enumerate(folds):
         for window, rng in fold.windows.items():
             pred = _load_predictions(ledger, predictions[f"{index}:{window}"])
-            rows = np.asarray(
-                evaluation.scorer(pred, session.upto(rng[1]), rng, evaluation.config)
-            )
+            visible = context.session.upto(rng[1])
+            rows = np.asarray(evaluation.scorer(pred, visible, rng, evaluation.config))
             series.setdefault(window, []).append(rows)
             per_fold.append(
                 {
@@ -640,7 +623,7 @@ def _score(
         score_id,
         {
             "pipeline": pipeline.id,
-            "run": start(),
+            "run": context.start(),
             "predictions": predictions,
             "folds": per_fold,
             "aggregate": aggregate,
@@ -651,7 +634,7 @@ def _score(
     )
     report.scores_recorded += 1
     for window, metrics in aggregate.items():
-        log(
+        context.log(
             f"score {name} {window} "
             + " ".join(f"{k}={v:.4g}" for k, v in metrics.items())
         )
@@ -725,10 +708,11 @@ def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by:
         return
     module = sys.modules.get(type(obj).__module__)
     file = getattr(module, "__file__", None)
-    if not file or root.resolve() not in pathlib.Path(file).resolve().parents:
+    if not file:
         return
-    rel = pathlib.Path(file).resolve().relative_to(root.resolve()).as_posix()
-    if rel not in shas:
+    file, root = pathlib.Path(file).resolve(), root.resolve()
+    rel = file.relative_to(root).as_posix() if root in file.parents else None
+    if rel is not None and rel not in shas:
         raise Refused(
             f"{type(obj).__name__} is defined in {rel}, which the {by} step does not "
             "import, so a default edited there would not refit; define it beside the "
@@ -739,10 +723,7 @@ def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by:
 def _positional(func: Callable) -> int:
     """Positional parameters of a step; kwargs bound by ``configured`` do not count."""
     kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    params = inspect.signature(func).parameters.values()
-    if any(p.kind is inspect.Parameter.VAR_POSITIONAL for p in params):
-        return 4
-    return sum(p.kind in kinds for p in params)
+    return sum(p.kind in kinds for p in inspect.signature(func).parameters.values())
 
 
 def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
