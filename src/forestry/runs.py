@@ -1,7 +1,7 @@
 """Runs: expand a schedule, memoize fits and predictions, score each pipeline into an entry.
 
 A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``, ``save``
-and ``load``. Nothing here moves a baseline; that is a decision, see ``forestry.decisions``.
+and ``load``. Reading is SQL over the views in ``forestry.ledger``.
 
 Examples
 --------

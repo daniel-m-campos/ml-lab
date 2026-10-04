@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
-# One Optiver campaign: ingest, run, seat the incumbent, read the board.
+# One Optiver campaign: ingest, run, read the scores.
 # Usage: examples/optiver/campaign.sh [stocks]   ("all", a count such as "20", or "0,1,2,3")
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 [ -x .venv/bin/fy ] && PATH=".venv/bin:$PATH"
 command -v fy >/dev/null || { echo "fy not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
-export PYTHONPATH=examples FORESTRY_ROOT=.forestry-optiver
+export FORESTRY_ROOT=.forestry-optiver
 export FORESTRY_ACTOR="${FORESTRY_ACTOR:-$USER}"
+D=examples/optiver/declarations.py
 
 echo "== ingest"
-DS=$(fy ingest optiver.capture "${1:-20}")
-C="optiver.declarations --dataset $DS"
-echo "dataset $DS"
+fy ingest examples/optiver/capture.py "${1:-20}"
 
 echo "== run"
-fy run $C
+fy run $D
 
-echo "== seat the incumbent, then read every pipeline against it"
-fy decide $C ridge_3m --kind promote --why "incumbent: the model in production" >/dev/null
-fy board $C
-
-echo "== history"
-fy history $C
+echo "== latest aggregate scores, age 1"
+sqlite3 -box $FORESTRY_ROOT/forestry.sqlite "
+SELECT p.name, s.metric, round(s.value, 2) AS value FROM latest_entry l
+JOIN aggregate_score s ON s.entry = l.entry JOIN pipeline p ON p.id = l.pipeline
+WHERE s.age = 1 ORDER BY s.metric, s.value DESC"
 
 echo
-echo "Next, from the repo root with the ledger named:"
-echo "  export FORESTRY_ROOT=$FORESTRY_ROOT"
-echo "  fy board examples/optiver/declarations.py --dataset $DS <pipeline>"
-echo "  fy decide examples/optiver/declarations.py --dataset $DS <pipeline> --kind promote|reject --why '...'"
+echo "Next: export FORESTRY_ROOT=$FORESTRY_ROOT, add a Pipeline to $D (or a file of pipelines), fy run $D <file>,"
+echo "      then sqlite3 -box \$FORESTRY_ROOT/forestry.sqlite over fold_score, aggregate_score, fit, failure."

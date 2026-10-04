@@ -1,12 +1,12 @@
-# forestry: design spec (draft 7, 2026-10-03)
+# forestry: design spec (draft 8, 2026-10-03)
 
-A local-first record of experimentation on frozen, time-ordered datasets. Git owns the code, a content-addressed blob store owns the bytes, an append-only event log owns what happened and what was decided. People and agents write through the same five commands. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
+A local-first record of experimentation on frozen, time-ordered datasets. Git owns the code, a content-addressed blob store owns the bytes, an append-only event log owns what happened. People and agents write through two commands and read with SQL. Companions: `docs/user-stories.md`, `reports/Forestry MLOps landscape survey.md`.
 
-The model is git plus code review, not a bank ledger. Datasets, pipelines, evaluations, fits, predictions and scored entries are content-addressed objects. Each evaluation has one movable ref, the baseline. Decisions are its reflog. An approval is pinned to content: new content resets review.
+Datasets, pipelines, evaluations, fits, predictions and scored entries are content-addressed objects, so the same work is never done twice and every number names the code, data and environment that produced it. Decisions over entries (a baseline, promote and reject, a board) are designed but deferred to Later: the first job is to analyze the evaluations by hand and let that refine the schema.
 
 ## Scope
 
-In: frozen datasets, pipeline and evaluation declarations, runs that memoize fits and predictions, per-fold and aggregate scores, decisions that move a baseline, read-back views, a shell command line, analytics over the log. Out: automation that moves a baseline, a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
+In: frozen datasets, pipeline and evaluation declarations, runs that memoize fits and predictions, per-fold and aggregate scores, SQL views, a two-verb command line, analytics over the log. Out, for now: decisions and a baseline (Later), automation that moves one, a DAG runner, a dashboard, the prod compile, feature stores, drift monitoring, non-temporal splits.
 
 ## Three systems and a boundary
 
@@ -14,7 +14,7 @@ In: frozen datasets, pipeline and evaluation declarations, runs that memoize fit
 |---|---|---|
 | code | git | per run: commit, dirty flag, the dirty diff as a blob; per fit: the git blob sha of every repo module imported while fitting, and the environment lock |
 | bytes | the blob store, `blobs/sha256/` | dataset rows, models, predictions, diffs, each under its sha, in a format that opens without this Python environment |
-| facts | the event log, `forestry.sqlite` | the eight event types below |
+| facts | the event log, `forestry.sqlite` | the seven event types below |
 
 The log never stores what a function is, only a dotted path and the blob shas git computed for the files. Reproducing a number is the join: the log says which shas and which commit, git has the content, the blob store has the bytes.
 
@@ -31,7 +31,7 @@ One table. Rows are only inserted.
 ```sql
 CREATE TABLE event (
   seq     INTEGER PRIMARY KEY,   -- global order
-  id      TEXT UNIQUE,           -- content hash for objects, ULID for runs and decisions
+  id      TEXT UNIQUE,           -- content hash for objects, ULID for runs and failures
   type    TEXT,                  -- one of eight
   stream  TEXT,                  -- the dataset or evaluation it belongs to
   key     TEXT,                  -- what it is about
@@ -51,45 +51,38 @@ CREATE TABLE event (
 | fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock sha) | run id, cutoff, model sha and format, import shas, env lock sha, duration |
 | predictions_computed | dataset | hash(fit id, range) | blob sha and format |
 | entry_scored | evaluation | entry id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per age |
-| decision_recorded | evaluation | entry id | kind (promote, reject), why, against (baseline entry at the time, verdict, deltas) |
 | pipeline_failed | evaluation | pipeline id | run id, error, traceback sha |
 
-Fits and predictions live on the dataset stream because a scoring change reuses them across evaluations. An entry is "this pipeline, under this evaluation, from exactly these predictions"; a rerun that reproduces the same predictions writes no entry, and a code change that changes them writes a new one with no decisions.
+Fits and predictions live on the dataset stream because a scoring change reuses them across evaluations. An entry is "this pipeline, under this evaluation, from exactly these predictions"; a rerun that reproduces the same predictions writes no entry, and a code change that changes them writes a new one.
 
 ### Views
 
-Shipped as SQL in the same file so `sqlite3` shows them as tables. The per-type views take `WHERE seq <= N` to read the log as it stood; the ranking views (latest_entry, baseline, status, board) read the whole log, and an as-of board is `ledger.events(upto=N)` folded in Python.
+Shipped as SQL in the same file so `sqlite3` shows them as tables. Every view takes `WHERE seq <= N` to read the log as it stood.
 
 | view | definition |
 |---|---|
-| dataset, pipeline, evaluation, run, fit, prediction | one event type each, payload fields as columns |
+| dataset, pipeline, evaluation, run, fit, prediction, entry | one event type each, payload fields as columns |
 | fold_score, aggregate_score | `entry_scored` unpacked one row per (fold, age, metric) and per (age, metric) |
 | latest_entry | per (evaluation, pipeline), the newest entry |
-| baseline | per evaluation, the entry of the last promote decision |
-| status | per entry: baseline if head, superseded if promoted earlier, rejected if its last decision is reject, else scored |
-| board | latest_entry beside baseline with both aggregates; verdict and relative deltas from the metric directions |
-| history | promote decisions in order |
 | failure | `pipeline_failed` with run and error |
 
-The payload is JSON so a shape change is a new payload version and an edited view, not a migration. Materialize a view only when a read is measured past a second; a `reproject` command then rebuilds it and nothing else writes it.
+The payload is JSON so a shape change is a new payload version and an edited view, not a migration. Materialize a view only when a read is measured past a second.
 
 ## Rules
 
 Memo: a fit is reused when one exists for (dataset, pipeline, train range) whose recorded import shas and environment lock all match the current tree. Dirty files hash like any other; the run records the diff. Predictions are reused per (fit, range).
 
-The environment lock is a text blob, one `name==version` line per installed distribution the pipeline's import closure reaches, with their requirements, plus the Python version. Installing an unrelated package changes nothing; bumping a dependency refits the pipelines that import it and `fy board <pipeline>` shows the version diff against the baseline. An editable install's version carries a hash of its source files. Platform is recorded on the run, not in the lock, so a GPU box reuses a laptop's fits.
+The environment lock is a text blob, one `name==version` line per installed distribution the pipeline's import closure reaches, with their requirements, plus the Python version. Installing an unrelated package changes nothing; bumping a dependency refits the pipelines that import it, and two lock blobs diff as text. An editable install's version carries a hash of its source files. Platform is recorded on the run, not in the lock, so a GPU box reuses a laptop's fits.
 
 The import closure is every module under the repo root reachable from the step modules' top-level imports, with `.venv` excluded. `declarations.py` is in it only if a step imports it, so editing a config there changes the pipeline id, not the fit shas. A repo module or a distribution imported lazily inside a step is invisible to the closure; after the first fit the run sees it loaded, refuses, and names it, because the memo would otherwise have missed its edits or its version bumps.
 
-Review: a decision is made on one entry and carries the baseline entry, verdict and deltas it saw. The baseline is the last promote. New content for a pipeline is a new entry with no decisions, so the board asks for review again. Nothing is deleted; a refutation is a new decision.
+Comparability: entries compare only within one evaluation. A scorer or schedule change is a new evaluation.
 
-Comparability: an entry compares only against the baseline of its own evaluation. A scorer or schedule change is a new evaluation.
-
-Faults: every blob is written before the event that names it, and each fit is its own event, so a killed process loses at most the fit in flight and a rerun resumes from the last recorded one with the same ids. A pipeline that raises is recorded as `pipeline_failed` with its traceback, the other pipelines continue, and `fy run` exits 1 naming it. Failures are not memoized: a rerun retries. The board shows the pipeline as `failed` with the error until a newer entry exists.
+Faults: every blob is written before the event that names it, and each fit is its own event, so a killed process loses at most the fit in flight and a rerun resumes from the last recorded one with the same ids. A pipeline that raises is recorded as `pipeline_failed` with its traceback, the other pipelines continue, and `fy run` exits 1 naming it. Failures are not memoized: a rerun retries. The `failure` view holds the error until a newer entry exists.
 
 Embargo: no fit's train range ends after its fold's eval start minus the embargo. The folds are in the evaluation payload, written once.
 
-Day one, because rows written wrong cannot be repaired: ids that merge across hosts (content hashes and ULIDs, no serial counters); the blob store writes to a temp file, fsyncs and renames; every fit carries its import shas and env lock. Two logs from two hosts merge by `INSERT OR IGNORE` on id, decisions on one host. The schema version is `PRAGMA user_version`; a log at another version is refused with the instruction to delete and rerun, since the log is a cache of the code plus the data.
+Day one, because rows written wrong cannot be repaired: ids that merge across hosts (content hashes and ULIDs, no serial counters); the blob store writes to a temp file, fsyncs and renames; every fit carries its import shas and env lock. Two logs from two hosts merge by `INSERT OR IGNORE` on id. The schema version is `PRAGMA user_version`; a log at another version is refused with the instruction to delete and rerun, since the log is a cache of the code plus the data.
 
 ## Blobs
 
@@ -115,33 +108,44 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'forestry.sqlite' (TYPE sql
 2. `fy ingest` appends `dataset_recorded` and stores the rows under their sha. Same recipe, same id, no write.
 3. The first `fy run` appends `evaluation_declared` with the schedule expanded once.
 4. A `fy run` with work appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `entry_scored` per pipeline whose predictions are new. A rerun of an unchanged tree writes nothing and prints what it reused; adding one pipeline costs only that pipeline's fits, predictions and entry.
-5. `fy decide <pipeline> --kind promote --why "incumbent"` appends the first decision; the baseline view resolves to that entry.
-6. Add a `Pipeline`, commit, `fy run`, `fy board`, `fy decide`. `fy history` is the reflog; `fy board <pipeline>` is one pipeline with every entry, run and decision.
-7. Code evolves: changed import shas refit, new entries appear as scored, old entries and their decisions stand with their commit and shas.
-8. Reproduce: the entry names its run and predictions, the run its commit and lock, the fit its shas and blob. Check out, sync, load, rerun, compare shas.
+5. Read with SQL: the latest entry per pipeline, its aggregate and per-fold scores, the failures. Add a `Pipeline`, `fy run`, query again.
+6. Code evolves: changed import shas refit, new entries appear, old entries stand with their commit and shas.
+7. Reproduce: the entry names its run and predictions, the run its commit and resolution file, the fit its shas, lock and blob. Check out, sync, load, rerun, compare shas.
 
 ## Command line
 
 ```
-DS=$(fy ingest project.capture <args>)
-C="project.declarations --dataset $DS"
-fy run $C
-fy decide $C <pipeline> --kind promote --why "incumbent"
-fy board $C
-fy board $C --all
-fy board $C <pipeline>
-fy decide $C <pipeline> --kind promote|reject --why "..."
-fy run project.declarations ideas/agent7.py --dataset $DS
-fy history $C
+fy ingest project/capture.py <args>              # prints the dataset id
+fy run project/declarations.py                   # newest dataset; --dataset <id prefix> to pick
+fy run project/declarations.py ideas/agent7.py   # pipelines from both, the evaluation from one
+sqlite3 -box .forestry/forestry.sqlite "..."
 ```
 
-Five verbs. A module is a dotted name importable from the current directory or a `.py` path, resolved by its package so its own imports work. The four after `ingest` take one or more modules: pipelines are concatenated, the evaluation comes from the one module that declares it. The board shows the pipelines currently declared plus the baseline; `--all` adds the ones no longer declared. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
+Two verbs. A module is a dotted name importable from the current directory or a `.py` path, resolved by its package so its own imports work. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
+
+Reads are SQL over the views. Three to start from:
+
+```sql
+-- latest aggregate scores per pipeline at the first age
+SELECT p.name, s.metric, s.value FROM latest_entry l
+JOIN aggregate_score s ON s.entry = l.entry JOIN pipeline p ON p.id = l.pipeline
+WHERE s.age = 1 ORDER BY s.metric, s.value DESC;
+
+-- one pipeline fold by fold
+SELECT f.fold, f.cutoff, f.age, f.metric, f.value FROM latest_entry l
+JOIN fold_score f ON f.entry = l.entry JOIN pipeline p ON p.id = l.pipeline
+WHERE p.name = 'ridge_3m' ORDER BY f.fold, f.age, f.metric;
+
+-- what failed, and in which run
+SELECT p.name, x.error, x.run, x.at FROM failure x JOIN pipeline p ON p.id = x.pipeline;
+```
 
 ## Later
 
 | item | reopener |
 |---|---|
-| ordering rule for incomparable sets | when reading the board's deltas by hand costs more than a rule hides; a band makes dominance intransitive, so a rule needs a seating story |
+| decisions: a baseline per evaluation, promote and reject on an entry, a board with Pareto verdict and relative deltas, history | when reading the SQL by hand stops being how the evaluations are judged. Design kept: an entry is content-addressed by its prediction ids, so a decision pins to content and new content needs a new decision; the baseline is the last promote; nothing is deleted, a retraction is a new decision. Stories S3 and S6 describe it |
+| ordering rule for incomparable sets | when reading deltas by hand costs more than a rule hides; a band makes dominance intransitive, so a rule needs a seating story |
 | staged scoring with recorded gates | when a full simulation is expensive enough that screening must be recorded; until then two evaluations do it |
 | execution config grids, tune steps, heads | when one fit must be scored under several settings in one evaluation |
 | sealed window with a pass rule | when a deploy decision needs a one-shot held-out month; today a second evaluation |

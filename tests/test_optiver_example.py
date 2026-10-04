@@ -58,24 +58,25 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
     assert (row["process"], row["instrument"]) == (capture.PROCESS, capture.INSTRUMENT)
 
 
-def test_the_script_steps_seat_an_incumbent_and_read_the_board(root, dataset):
-    decl = (DECL, "--dataset", dataset)
-    fy(root, "run", *decl)
-    assert "scored" in fy(root, "board", *decl)
-    fy(root, "decide", *decl, "ridge_3m", "--kind", "promote", "--why", "incumbent")
-    board = fy(root, "board", *decl)
-    assert "baseline" in board and "pnl " in board and "ridge_1m" in board
-    assert "incumbent" in fy(root, "history", *decl)
-    assert '"config_diff"' in fy(root, "board", *decl, "ridge_1m")
+def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
+    fy(root, "run", DECL)
+    rows = Ledger(root).sql(
+        "SELECT p.name, s.metric, s.value FROM latest_entry l "
+        "JOIN aggregate_score s ON s.entry = l.entry JOIN pipeline p ON p.id = l.pipeline "
+        "WHERE s.age = 1"
+    )
+    names = {r["name"] for r in rows}
+    assert {"ridge_1m", "ridge_3m", "ridge_6m"} <= names
+    assert {r["metric"] for r in rows} == {"pnl", "sharpe", "max_dd", "turnover"}
+    assert len(rows) == 4 * len(names)
 
 
-def test_a_rerun_writes_nothing_and_keeps_the_baseline(root, dataset):
+def test_a_rerun_writes_nothing(root, dataset):
     ledger = Ledger(root)
     before = len(ledger.events())
     out = fy(root, "run", DECL, "--dataset", dataset)
-    assert out.startswith("up to date: 5 entries") or out.startswith("up to date: 3 entries")
+    assert out.startswith("up to date:")
     assert ledger.events()[before:] == []
-    assert "baseline" in fy(root, "board", DECL, "--dataset", dataset)
 
 
 @pytest.mark.skipif(not declarations.bonsai_available, reason="bonsai not installed")

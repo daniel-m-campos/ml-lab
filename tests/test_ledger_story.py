@@ -1,4 +1,4 @@
-"""The ledger story on synthetic data: ingest, declare, run, decide, read back.
+"""The ledger story on synthetic data: ingest, declare, run, read back with SQL.
 
 Mirrors docs/user-stories.md; every event type in docs/spec.md is written and read back.
 """
@@ -14,7 +14,7 @@ import sys
 import pyarrow.parquet as pq
 import pytest
 
-from forestry import cli, data, decisions, hashing, review, runs
+from forestry import cli, data, hashing, runs
 from forestry.ledger import Event, Ledger, Refused
 from tests import synthetic
 
@@ -40,17 +40,20 @@ def _run(ledger, evaluation, *pipelines):
     return runs.run(ledger, list(pipelines), evaluation, code_root=REPO)
 
 
-def _seat(ledger, evaluation, pipeline) -> str:
-    _run(ledger, evaluation, pipeline)
-    decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="incumbent")
-    return pipeline.id
-
-
 def _types(ledger) -> dict[str, int]:
     out: dict[str, int] = {}
     for e in ledger.events():
         out[e["type"]] = out.get(e["type"], 0) + 1
     return out
+
+
+def _latest(ledger, evaluation) -> dict[str, str]:
+    rows = ledger.sql(
+        "SELECT p.name, l.entry FROM latest_entry l JOIN pipeline p ON p.id = l.pipeline "
+        "WHERE l.evaluation = ?",
+        (evaluation.id,),
+    )
+    return {r["name"]: r["entry"] for r in rows}
 
 
 # Dataset ==========================================================================================
@@ -174,16 +177,14 @@ def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledg
     evaluation = module.evaluation(dataset)
     pipeline = module.ridge(3)
     runs.run(ledger, [pipeline], evaluation, code_root=tmp_path)
-    decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="first")
-    first_entry = decisions.baseline(ledger, evaluation)
+    first_entry = _latest(ledger, evaluation)["ridge_3m"]
     code.write_text(code.read_text().replace("0.01 * np.sum", "0.02 * np.sum"))
     module = cli._load(str(code))
     report = runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
     assert module.ridge(3).id == pipeline.id
     assert report.fits_computed > 0 and report.entries_scored == 1
-    board = {r["pipeline"]: r for r in review.board(ledger, evaluation)}
-    assert board["ridge_3m"]["status"] == "scored"
-    assert decisions.baseline(ledger, evaluation) == first_entry
+    assert _latest(ledger, evaluation)["ridge_3m"] != first_entry
+    assert ledger.get(first_entry) is not None
 
 
 def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resumes(
@@ -195,14 +196,13 @@ def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resume
     report = _run(ledger, evaluation, flaky, synthetic.ridge(1))
     assert list(report.failed) == [flaky.id] and "boom" in report.failed[flaky.id]
     assert report.fits_computed == 2 + len(folds) and report.entries_scored == 1
-    failure = ledger.events(Event.FAILED, key=flaky.id)[-1]
-    assert "RuntimeError" in ledger.get_blob(failure["payload"]["traceback"]["sha"]).decode()
-    board = {r["pipeline"]: r for r in review.board(ledger, evaluation)}
-    assert board["flaky"]["status"] == "failed" and "boom" in board["flaky"]["why"]
-    assert "traceback" in review.detail(ledger, evaluation, flaky.id)
+    failure = ledger.sql("SELECT pipeline, error FROM failure")[0]
+    assert failure["pipeline"] == flaky.id and "boom" in failure["error"]
+    event = ledger.events(Event.FAILED, key=flaky.id)[-1]
+    assert "RuntimeError" in ledger.get_blob(event["payload"]["traceback"]["sha"]).decode()
     again = _run(ledger, evaluation, flaky)
     assert again.fits_computed == len(folds) - 2 and again.entries_scored == 1
-    assert review.board(ledger, evaluation, {flaky.id})[0]["status"] == "scored"
+    assert set(_latest(ledger, evaluation)) == {"flaky", "ridge_1m"}
 
 
 def test_a_fit_that_imports_a_distribution_lazily_is_refused():
@@ -214,139 +214,71 @@ def test_a_fit_that_imports_a_distribution_lazily_is_refused():
         runs._refuse_lazy_imports(pipeline, REPO, shas, dists, before_pytest)
 
 
-def test_the_board_shows_declared_pipelines_and_the_baseline(ledger, evaluation):
-    _seat(ledger, evaluation, synthetic.ridge(1))
-    _run(ledger, evaluation, synthetic.ridge(3), synthetic.ridge(6))
-    names = [r["pipeline"] for r in review.board(ledger, evaluation, {synthetic.ridge(6).id})]
-    assert names == ["ridge_1m", "ridge_6m"]
-    assert len(review.board(ledger, evaluation)) == 3
-    detail = review.detail(ledger, evaluation, synthetic.ridge(6).id)
-    assert detail["env_diff"] == {} and detail["config_diff"]
+def test_the_run_records_the_resolution_file_when_present(ledger, evaluation):
+    _run(ledger, evaluation, synthetic.ridge(3))
     run = ledger.events(Event.RUN)[0]["payload"]
     assert run["resolution"] is None or run["resolution"]["path"].startswith(
         ("uv.lock", "requirements")
     )
 
 
-# Decide ===========================================================================================
-
-
-def test_decide_refuses_an_unscored_pipeline_and_promote_seats_a_baseline(ledger, evaluation):
-    pipeline = synthetic.ridge(3)
-    with pytest.raises(Refused):
-        decisions.decide(ledger, pipeline.id, evaluation, kind="promote", why="x")
-    _seat(ledger, evaluation, pipeline)
-    entry = decisions.latest_entry(ledger, pipeline.id, evaluation)["id"]
-    assert decisions.baseline(ledger, evaluation) == entry
-    assert ledger.events(Event.DECISION)[0]["payload"]["against"] is None
-
-
-def test_a_promotion_records_what_it_was_made_against(ledger, evaluation):
-    _seat(ledger, evaluation, synthetic.ridge(6))
-    challenger = synthetic.ridge(1)
-    _run(ledger, evaluation, challenger)
-    seen = decisions.compare(ledger, challenger.id, evaluation)
-    assert set(seen["deltas"]) == set(evaluation.directions)
-    decisions.decide(ledger, challenger.id, evaluation, kind="promote", why="pnl up")
-    decision = ledger.events(Event.DECISION)[-1]
-    assert decision["payload"]["against"] == seen and decision["actor"]
-    assert (
-        decisions.baseline(ledger, evaluation)
-        == decisions.latest_entry(ledger, challenger.id, evaluation)["id"]
-    )
-
-
-def test_reject_records_why_and_leaves_the_baseline(ledger, evaluation):
-    _seat(ledger, evaluation, synthetic.ridge(6))
-    head = decisions.baseline(ledger, evaluation)
-    loser = synthetic.ridge(1)
-    _run(ledger, evaluation, loser)
-    decisions.decide(ledger, loser.id, evaluation, kind="reject", why="too much turnover")
-    assert decisions.baseline(ledger, evaluation) == head
-    assert review.detail(ledger, evaluation, loser.id)["status"] == "rejected"
-
-
-def test_a_pipeline_under_another_evaluation_is_not_decidable_here(ledger, dataset, evaluation):
-    other = synthetic.evaluation(dataset, cost=0.01)
-    _run(ledger, other, synthetic.ridge(1))
-    with pytest.raises(Refused):
-        decisions.decide(ledger, synthetic.ridge(1).id, evaluation, kind="promote", why="x")
-
-
-def test_dominance_reads_directions():
-    directions = {"pnl": "max", "turnover": "min"}
-    better = decisions.dominance({"pnl": 2, "turnover": 1}, {"pnl": 1, "turnover": 2}, directions)
-    worse = decisions.dominance({"pnl": 1, "turnover": 2}, {"pnl": 2, "turnover": 1}, directions)
-    mixed = decisions.dominance({"pnl": 2, "turnover": 2}, {"pnl": 1, "turnover": 1}, directions)
-    assert (better, worse, mixed) == ("dominates", "dominated", "incomparable")
-
-
-# Review ===========================================================================================
-
-
-def test_the_board_survives_a_rerun_and_answers_what_moved_the_baseline(ledger, evaluation):
-    base = _seat(ledger, evaluation, synthetic.ridge(6))
-    _run(ledger, evaluation, *synthetic.pipelines)
-    _run(ledger, evaluation, *synthetic.pipelines)
-    board = review.board(ledger, evaluation)
-    assert board[0]["id"] == base and board[0]["status"] == "baseline"
-    assert all(r["verdict"] and r["deltas"] for r in board[1:])
-    assert {r["pipeline"] for r in board} == {"ridge_1m", "ridge_3m", "ridge_6m"}
-    assert [h["against"] for h in review.history(ledger, evaluation)] == [None]
-    detail = review.detail(ledger, evaluation, board[1]["id"])
-    assert detail["config_diff"]["train_window_months"]["baseline"] == 6
-    assert detail["folds"] and detail["status"] == "scored" and len(detail["entries"]) == 1
-    decisions.decide(ledger, board[1]["id"], evaluation, kind="promote", why="better")
-    assert review.detail(ledger, evaluation, base)["status"] == "superseded"
-
-
-def test_the_views_read_with_sqlite_alone(ledger, evaluation, tmp_path):
-    _seat(ledger, evaluation, synthetic.ridge(6))
-    _run(ledger, evaluation, synthetic.ridge(1))
-    db = sqlite3.connect(tmp_path / "forestry" / "forestry.sqlite")
-    folds = db.execute("SELECT COUNT(*) FROM fold_score").fetchone()[0]
-    assert (
-        folds == 2 * len(ledger.get(decisions.baseline(ledger, evaluation))["payload"]["folds"]) * 2
-    )
-    assert db.execute("SELECT COUNT(*) FROM baseline").fetchone()[0] == 1
-    statuses = dict(db.execute("SELECT pipeline, status FROM status").fetchall())
-    assert sorted(statuses.values()) == ["baseline", "scored"]
-    assert db.execute("SELECT COUNT(*) FROM board").fetchone()[0] == 2
-
-
-def test_the_log_reads_as_it_stood(ledger, evaluation):
-    first = _seat(ledger, evaluation, synthetic.ridge(6))
-    before = ledger.events()[-1]["seq"]
-    second = synthetic.ridge(1)
-    _run(ledger, evaluation, second)
-    decisions.decide(ledger, second.id, evaluation, kind="promote", why="later")
-    assert (
-        decisions.baseline(ledger, evaluation, upto=before)
-        == decisions.latest_entry(ledger, first, evaluation)["id"]
-    )
-
-
 # Command line =====================================================================================
 
 
-def test_fy_run_merges_pipelines_from_several_modules(ledger, dataset, tmp_path, capsys):
+def test_fy_run_merges_pipelines_from_several_modules_and_defaults_the_dataset(
+    ledger, dataset, evaluation, tmp_path, capsys
+):
     extra = tmp_path / "agent7.py"
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     by_path = str(REPO / "tests" / "synthetic.py")
-    argv = ["--root", str(ledger.root), "run", by_path, str(extra), "--dataset", dataset]
-    assert cli.main(argv) == 0
+    assert cli.main(["--root", str(ledger.root), "run", by_path, str(extra)]) == 0
     assert "entries 4" in capsys.readouterr().out
-    names = {r["pipeline"] for r in review.board(ledger, synthetic.evaluation(dataset))}
-    assert names == {"ridge_1m", "ridge_3m", "ridge_6m", "ridge_12m"}
+    assert set(_latest(ledger, evaluation)) == {"ridge_1m", "ridge_3m", "ridge_6m", "ridge_12m"}
+    assert cli.main(["--root", str(ledger.root), "run", by_path, "--dataset", dataset[:6]]) == 0
+    assert "up to date" in capsys.readouterr().out
 
 
-def test_fy_run_refuses_modules_without_exactly_one_evaluation(ledger, dataset, tmp_path, capsys):
+def test_fy_run_refuses_bad_declarations(ledger, dataset, tmp_path, capsys):
     extra = tmp_path / "bare.py"
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
-    assert cli.main(["--root", str(ledger.root), "run", str(extra), "--dataset", dataset]) == 1
+    root = ["--root", str(ledger.root)]
+    assert cli.main([*root, "run", str(extra)]) == 1
     assert "0 evaluations" in capsys.readouterr().err
-    assert cli.main(["--root", str(ledger.root), "run", "nope.decl", "--dataset", dataset]) == 1
+    assert cli.main([*root, "run", "nope.decl"]) == 1
     assert "No module named 'nope'" in capsys.readouterr().err
+    assert cli.main([*root, "run", "tests.synthetic", "--dataset", "zzz"]) == 1
+    assert "0 matches" in capsys.readouterr().err
+
+
+def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
+    assert cli.main(["--root", str(tmp_path / "empty"), "run", "tests.synthetic"]) == 1
+    assert "fy ingest first" in capsys.readouterr().err
+
+
+# Read back ========================================================================================
+
+
+def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path):
+    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
+    db = sqlite3.connect(tmp_path / "forestry" / "forestry.sqlite")
+    metrics = len(evaluation.directions)
+    assert db.execute("SELECT COUNT(*) FROM fold_score").fetchone()[0] == (
+        2 * len(folds) * len(evaluation.ages) * metrics
+    )
+    assert db.execute("SELECT COUNT(*) FROM aggregate_score").fetchone()[0] == (
+        2 * len(evaluation.ages) * metrics
+    )
+    assert db.execute("SELECT COUNT(*) FROM latest_entry").fetchone()[0] == 2
+    assert db.execute("SELECT COUNT(*) FROM fit").fetchone()[0] == 2 * len(folds)
+
+
+def test_the_log_reads_as_it_stood(ledger, evaluation):
+    _run(ledger, evaluation, synthetic.ridge(6))
+    before = ledger.events()[-1]["seq"]
+    _run(ledger, evaluation, synthetic.ridge(1))
+    assert len(ledger.events(Event.ENTRY, upto=before)) == 1
+    assert len(ledger.events(Event.ENTRY)) == 2
 
 
 # Storage ==========================================================================================

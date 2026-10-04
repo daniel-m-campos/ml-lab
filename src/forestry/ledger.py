@@ -1,7 +1,7 @@
 """The ledger: one append-only SQLite table of events, SQL views over it, and a blob store.
 
 Every write is an insert with a global ``seq``, an actor and a host. Objects carry content ids,
-runs and decisions carry ULIDs, so two ledgers merge by id. Blobs live under their sha256.
+runs and failures carry ULIDs, so two ledgers merge by id. Blobs live under their sha256.
 
 Examples
 --------
@@ -23,7 +23,7 @@ from typing import Any, Final
 
 from forestry import hashing
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 ACTOR_ENV = "FORESTRY_ACTOR"
 
 
@@ -41,7 +41,6 @@ class Event:
     FIT: Final = "fit_computed"
     PREDICTIONS: Final = "predictions_computed"
     ENTRY: Final = "entry_scored"
-    DECISION: Final = "decision_recorded"
     FAILED: Final = "pipeline_failed"
 
 
@@ -110,44 +109,9 @@ CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS entry, e.stream AS e
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
 WHERE e.type='entry_scored';
 
-CREATE VIEW IF NOT EXISTS decision AS SELECT seq, id, at, actor, stream AS evaluation, key AS entry,
-  json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.kind') AS kind,
-  json_extract(payload,'$.why') AS why, json_extract(payload,'$.against.entry') AS against_entry,
-  json_extract(payload,'$.against.verdict') AS verdict
-FROM event WHERE type='decision_recorded';
-
 CREATE VIEW IF NOT EXISTS latest_entry AS SELECT evaluation, pipeline, id AS entry, run, seq
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM entry) WHERE rn = 1;
-
-CREATE VIEW IF NOT EXISTS baseline AS SELECT d.evaluation, d.entry, d.pipeline, d.seq
-FROM decision d
-WHERE d.kind='promote'
-  AND d.seq = (SELECT MAX(seq) FROM decision WHERE evaluation=d.evaluation AND kind='promote');
-
-CREATE VIEW IF NOT EXISTS status AS SELECT e.id AS entry, e.evaluation, e.pipeline,
-  CASE WHEN b.entry = e.id THEN 'baseline'
-       WHEN last.kind = 'promote' THEN 'superseded'
-       WHEN last.kind = 'reject' THEN 'rejected'
-       ELSE 'scored' END AS status
-FROM entry e
-LEFT JOIN baseline b ON b.evaluation = e.evaluation
-LEFT JOIN decision last ON last.entry = e.id
-  AND last.seq = (SELECT MAX(seq) FROM decision WHERE entry = e.id);
-
-CREATE VIEW IF NOT EXISTS board AS SELECT l.evaluation, l.pipeline, p.name, l.entry, l.run, l.seq,
-  s.status, b.entry AS baseline, json_extract(le.payload,'$.aggregate') AS aggregate,
-  json_extract(be.payload,'$.aggregate') AS baseline_aggregate
-FROM latest_entry l
-JOIN status s ON s.entry = l.entry
-JOIN pipeline p ON p.id = l.pipeline
-JOIN event le ON le.id = l.entry
-LEFT JOIN baseline b ON b.evaluation = l.evaluation
-LEFT JOIN event be ON be.id = b.entry;
-
-CREATE VIEW IF NOT EXISTS history AS SELECT d.seq, d.id, d.at, d.actor, d.evaluation, d.entry,
-  d.pipeline, p.name, d.why, d.against_entry, d.verdict
-FROM decision d JOIN pipeline p ON p.id = d.pipeline WHERE d.kind='promote';
 
 CREATE VIEW IF NOT EXISTS failure AS SELECT seq, id, at, actor, host, stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run, json_extract(payload,'$.error') AS error
