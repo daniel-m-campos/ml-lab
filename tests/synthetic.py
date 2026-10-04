@@ -266,7 +266,10 @@ def evaluation(dataset: str, cost: float = 0.001, split: Any = None) -> Evaluati
         dataset=dataset,
         split=split
         or CalendarWalkForward(
-            first_cutoff="2025-05-01", horizons=(1, 2), embargo_seconds=60, min_folds=3
+            first_cutoff="2025-05-01",
+            horizons=(1, 2),
+            embargo_timestamps=1,
+            min_folds=3,
         ),
         scorer=sign_sim,
         config=SimConfig(cost=cost),

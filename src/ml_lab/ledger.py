@@ -25,7 +25,7 @@ from typing import Any, Final
 
 from ml_lab import identity
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 ACTOR_ENV = "ML_LAB_ACTOR"
 
 

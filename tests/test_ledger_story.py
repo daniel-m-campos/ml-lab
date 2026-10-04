@@ -18,7 +18,7 @@ import polars as pl
 import pytest
 
 from ml_lab import cli, formats, identity, runs, splits
-from ml_lab.dataset import load, record
+from ml_lab.dataset import data_id, load, record
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.panel import Panel
 from ml_lab.runs import _load_predictions
@@ -124,8 +124,8 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     folds = evaluation.split.folds(session)
     assert len(folds) >= evaluation.split.min_folds
     for fold in folds:
-        gap = session.ts[fold.windows["1"][0]] - session.ts[fold.train[-1][1] - 1]
-        assert gap.astype(int) >= evaluation.split.embargo_seconds
+        skipped = session.ts[fold.train[-1][1] : fold.windows["1"][0]]
+        assert len(np.unique(skipped)) == evaluation.split.embargo_timestamps
     _run(ledger, evaluation, synthetic.ridge(3))
     stored = ledger.latest(Event.EVALUATION, evaluation.id)["payload"]
     assert (
@@ -198,6 +198,59 @@ def test_a_blocked_kfold_evaluation_scores_one_test_window_per_fold(ledger, data
     assert [r["window"] for r in rows] == ["test"]
     fit = ledger.sql("SELECT train, label FROM fit ORDER BY seq LIMIT 2")[1]
     assert fit["label"] == "block 1" and len(json.loads(fit["train"])) == 2
+
+
+def test_a_day_walk_forward_steps_over_dates_with_rows():
+    days = np.array(
+        [
+            "2019-06-07",
+            "2019-06-10",
+            "2019-06-11",
+            "2019-06-12",
+            "2019-06-13",
+            "2019-06-14",
+        ],
+        "datetime64[D]",
+    )
+    hours = np.array([9, 15], "timedelta64[h]")
+    session = Session({"x": np.arange(12.0)}, (days[:, None] + hours).ravel())
+    folds = splits.CalendarWalkForward(
+        "2019-06-08", unit="day", horizons=(1,), min_folds=1
+    ).folds(session)
+    assert [f.label for f in folds] == [f"2019-06-1{d}" for d in range(4)]
+    assert folds[0].windows == {"1": (2, 4)} and folds[0].train == ((0, 2),)
+    assert folds[-1].windows == {"1": (8, 10)}
+    with pytest.raises(Refused, match="plus 1 months reaches"):
+        splits.CalendarWalkForward("2019-06-12", horizons=(1,)).folds(session)
+
+
+def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
+    d = np.arange(np.datetime64("2021-01-04"), np.datetime64("2022-06-25"))
+    d = d[np.is_busday(d)]
+    session = Session({"x": np.arange(d.size, dtype=float)}, d)
+    folds = splits.CalendarWalkForward(
+        "2021-03-01",
+        every=2,
+        window=2,
+        horizons=(1,),
+        embargo_timestamps=2,
+        end="2021-12-06",
+        min_folds=1,
+    ).folds(session)
+    last = max(session.ts[hi - 1] for f in folds for _, hi in f.windows.values())
+    assert last < np.datetime64("2021-12-06")
+    gaps = [
+        len(np.unique(session.ts[f.train[0][1] : f.windows["1"][0]])) for f in folds
+    ]
+    assert gaps == [2] * len(folds) and len(folds) == 4
+
+
+def test_the_clock_keeps_nanoseconds_and_the_dataset_id_sees_them():
+    t0 = np.datetime64("2019-06-10T09:00:00", "ns")
+    a = Session({"x": np.zeros(2)}, t0 + np.array([1, 2], "timedelta64[ns]"))
+    b = Session({"x": np.zeros(2)}, t0 + np.array([1, 3], "timedelta64[ns]"))
+    assert data_id(a) != data_id(b)
+    assert np.array_equal(formats.session_load(formats.session_save(a)).ts, a.ts)
 
 
 # Run ==================================================================================

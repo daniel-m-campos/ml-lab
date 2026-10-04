@@ -54,10 +54,10 @@ declare one of these; add an entry to admit a new format."""
 
 
 def session_save(session: Session) -> bytes:
-    """A session as one Parquet file: ``ts`` as a millisecond timestamp plus one column
+    """A session as one Parquet file: ``ts`` as a nanosecond timestamp plus one column
     per array.
     """
-    stamps = {} if session.ts is None else {TS: session.ts.astype("datetime64[ms]")}
+    stamps = {} if session.ts is None else {TS: session.ts}
     return _parquet_bytes(pl.DataFrame({**stamps, **session.columns}))
 
 
@@ -67,9 +67,7 @@ def session_load(payload: bytes) -> Session:
 
 def session_from_frame(frame: pl.DataFrame, ts: str = TS) -> Session:
     """A session from a frame; a ``ts`` timestamp column is optional."""
-    stamps = (
-        frame[ts].to_numpy().astype("datetime64[s]") if ts in frame.columns else None
-    )
+    stamps = frame[ts].to_numpy() if ts in frame.columns else None
     columns = {name: frame[name].to_numpy() for name in frame.columns if name != ts}
     return Session(columns, stamps)
 

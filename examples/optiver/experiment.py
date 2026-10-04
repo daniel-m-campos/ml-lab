@@ -47,10 +47,8 @@ def evaluation(dataset: str) -> Evaluation:
         dataset=dataset,
         split=CalendarWalkForward(
             first_cutoff="2021-05-04",
-            every_months=1,
-            eval_months=1,
             horizons=(1, 2, 3),
-            embargo_seconds=60,
+            embargo_timestamps=0,
             min_folds=3,
         ),
         scorer=steps.taker_sim,

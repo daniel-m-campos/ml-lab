@@ -15,8 +15,6 @@ import datetime
 
 import numpy as np
 
-from ml_lab.dates import as_date
-
 Range = tuple[int, int]
 Rows = Range | tuple[Range, ...]
 
@@ -26,9 +24,8 @@ class Session:
 
     def __init__(self, columns: dict[str, np.ndarray], ts: np.ndarray | None = None):
         self.columns = columns
-        self.ts = None if ts is None else ts.astype("datetime64[s]")
-        self._seconds = None if self.ts is None else self.ts.astype(np.int64)
-        if self._seconds is not None and np.any(np.diff(self._seconds) < 0):
+        self.ts = None if ts is None else ts.astype("datetime64[ns]")
+        if self.ts is not None and np.any(self.ts[1:] < self.ts[:-1]):
             raise ValueError("timestamps must be sorted")
 
     def __repr__(self) -> str:
@@ -38,13 +35,9 @@ class Session:
     def rows(self) -> int:
         return int(next(iter(self.columns.values())).shape[0])
 
-    def index_of(
-        self, when: str | datetime.date | datetime.datetime, offset_seconds: int = 0
-    ) -> int:
-        """First row at or after ``when`` shifted by ``offset_seconds``."""
-        midnight = datetime.datetime.combine(as_date(when), datetime.time())
-        moment = np.datetime64(midnight, "s").astype(np.int64) + offset_seconds
-        return int(np.searchsorted(self._clock(), moment, side="left"))
+    def index_of(self, when: str | datetime.date | datetime.datetime) -> int:
+        """First row at or after ``when``; a date means its midnight."""
+        return int(np.searchsorted(self._clock(), np.datetime64(when, "ns"), "left"))
 
     def date_at(self, row: int) -> datetime.date:
         self._clock()
@@ -57,7 +50,6 @@ class Session:
         view = Session.__new__(Session)
         view.columns = {k: v[:row] for k, v in self.columns.items()}
         view.ts = None if self.ts is None else self.ts[:row]
-        view._seconds = None if self._seconds is None else self._seconds[:row]
         return view
 
     def masked(self, columns: tuple[str, ...], start: int) -> Session:
@@ -96,9 +88,9 @@ class Session:
         return np.concatenate([values[lo:hi] for lo, hi in segments(rows)])
 
     def _clock(self) -> np.ndarray:
-        if self._seconds is None:
+        if self.ts is None:
             raise ValueError("session has no timestamps; use a row-based split")
-        return self._seconds
+        return self.ts
 
 
 def segments(rows: Rows) -> tuple[Range, ...]:
