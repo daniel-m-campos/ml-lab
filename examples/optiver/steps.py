@@ -1,4 +1,4 @@
-"""Features, two model families and a per-stock taker simulation for the Optiver data."""
+"""Features, two model families and a per-stock taker simulation for Optiver."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ BOOK_COLUMNS = (
 )
 
 
-# Features =========================================================================================
+# Features =============================================================================
 
 
 def features(session: Session, rng: Range) -> np.ndarray:
@@ -46,7 +46,8 @@ def features(session: Session, rng: Range) -> np.ndarray:
             col["imbalance_buy_sell_flag"],
             (col["ask_price"] - col["bid_price"]) / wap * BPS,
             (wap - col["reference_price"]) / wap * BPS,
-            (col["bid_size"] - col["ask_size"]) / (col["bid_size"] + col["ask_size"] + 1.0),
+            (col["bid_size"] - col["ask_size"])
+            / (col["bid_size"] + col["ask_size"] + 1.0),
             (col["far_price"] - col["near_price"]) / wap * BPS,
             (col["near_price"] - wap) / wap * BPS,
             col["seconds_in_bucket"] / 540.0,
@@ -61,7 +62,7 @@ def window(session: Session, train: Range, months: int) -> Range:
     return (max(train[0], session.index_of(add_months(end_date, -months))), train[1])
 
 
-# Ridge ============================================================================================
+# Ridge ================================================================================
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,7 +84,9 @@ def ridge_fit(session: Session, train: Range, config: RidgeConfig) -> RidgeModel
     y = session.column(TARGET, rng)
     x_mean, y_mean = X.mean(axis=0), y.mean()
     Xc = X - x_mean
-    weights = np.linalg.solve(Xc.T @ Xc + config.alpha * np.eye(X.shape[1]), Xc.T @ (y - y_mean))
+    weights = np.linalg.solve(
+        Xc.T @ Xc + config.alpha * np.eye(X.shape[1]), Xc.T @ (y - y_mean)
+    )
     return RidgeModel(weights, float(y_mean - x_mean @ weights))
 
 
@@ -94,7 +97,9 @@ def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray
 
 @step(format=formats.Format.ARROW_ARRAYS)
 def ridge_save(model: RidgeModel) -> bytes:
-    return formats.arrays_save({"weights": model.weights, "bias": np.array([model.bias])})
+    return formats.arrays_save(
+        {"weights": model.weights, "bias": np.array([model.bias])}
+    )
 
 
 @step
@@ -103,7 +108,7 @@ def ridge_load(payload: bytes) -> RidgeModel:
     return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
 
 
-# bonsai ===========================================================================================
+# bonsai ===============================================================================
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,7 +151,7 @@ def bonsai_load(payload: bytes):
     return formats.load_via_file(payload, bonsai.BonsaiRegressor.from_file, ".msgpack")
 
 
-# Scorers ==========================================================================================
+# Scorers ==============================================================================
 
 
 def fit_metrics(series: np.ndarray) -> dict[str, float]:
@@ -160,14 +165,20 @@ def fit_metrics(series: np.ndarray) -> dict[str, float]:
     }
 
 
-@scorer(metrics=fit_metrics, directions={"corr": "max", "hit_rate": "max", "rmse": "min"})
-def fit_quality(pred: np.ndarray, session: Session, rng: Range, config: None) -> np.ndarray:
+@scorer(
+    metrics=fit_metrics, directions={"corr": "max", "hit_rate": "max", "rmse": "min"}
+)
+def fit_quality(
+    pred: np.ndarray, session: Session, rng: Range, config: None
+) -> np.ndarray:
     return np.column_stack([pred, session.column(TARGET, rng)])
 
 
 @dataclasses.dataclass(frozen=True)
 class SimConfig:
-    """Trade the sign of the predicted move above ``threshold_bps``; a flip costs ``cost_bps``."""
+    """Trade the sign of the predicted move above ``threshold_bps``; a flip costs
+    ``cost_bps``.
+    """
 
     cost_bps: float
     threshold_bps: float
@@ -177,9 +188,13 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
     """pnl, sharpe, max drawdown and turnover from a (pnl, flips) series."""
     pnl, flips = series[:, 0], series[:, 1]
     equity = np.cumsum(pnl)
-    drawdown = float(np.max(np.maximum.accumulate(equity) - equity)) if equity.size else 0.0
+    drawdown = (
+        float(np.max(np.maximum.accumulate(equity) - equity)) if equity.size else 0.0
+    )
     sharpe = (
-        float(pnl.mean() / pnl.std() * np.sqrt(pnl.size)) if pnl.size > 1 and pnl.std() > 0 else 0.0
+        float(pnl.mean() / pnl.std() * np.sqrt(pnl.size))
+        if pnl.size > 1 and pnl.std() > 0
+        else 0.0
     )
     return {
         "pnl": float(pnl.sum()),
@@ -193,7 +208,9 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
     metrics=sim_metrics,
     directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
 )
-def taker_sim(pred: np.ndarray, session: Session, rng: Range, config: SimConfig) -> np.ndarray:
+def taker_sim(
+    pred: np.ndarray, session: Session, rng: Range, config: SimConfig
+) -> np.ndarray:
     """Per-stock taker simulation in bps: a (pnl, flips) series."""
     truth = session.column(TARGET, rng)
     stock = session.column("stock_id", rng)

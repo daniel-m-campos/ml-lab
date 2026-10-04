@@ -1,4 +1,6 @@
-"""forestry: a local-first ledger for the lifecycle of experimentation on frozen datasets."""
+"""forestry: a local-first ledger for the lifecycle of experimentation on frozen
+datasets.
+"""
 
 from __future__ import annotations
 

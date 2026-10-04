@@ -1,9 +1,11 @@
-"""Identity: content hashes of declarations, ULIDs, and the code and environment a fit depends on.
+"""Identity: content hashes of declarations, ULIDs, and the code and environment a fit
+depends on.
 
-A declaration is hashed by its canonical form: dataclass fields minus labels, registered steps by
-dotted path. Code identity is separate: ``import_shas`` gives the git blob sha of every repo
-module a set of steps imports, computed the way ``git hash-object`` does, so dirty files count;
-``imported_dists`` gives the installed distributions the same closure reaches.
+A declaration is hashed by its canonical form: dataclass fields minus labels, registered
+steps by dotted path. Code identity is separate: ``import_shas`` gives the git blob sha
+of every repo module a set of steps imports, computed the way ``git hash-object`` does,
+so dirty files count; ``imported_dists`` gives the installed distributions the same
+closure reaches.
 
 Examples
 --------
@@ -38,21 +40,25 @@ HASH_LEN = 16
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
-# Declarations =====================================================================================
+# Declarations =========================================================================
 
 
 def register(func: Callable, **meta: Any) -> Callable:
-    """Mark a function as a hashable step by its ``module:qualname`` and return it unchanged."""
+    """Mark a function as a hashable step by its ``module:qualname`` and return it
+    unchanged.
+    """
     setattr(func, STEP_ATTR, f"{func.__module__}:{func.__qualname__}")
     func.__forestry_meta__ = meta  # type: ignore[attr-defined]
     return func
 
 
 def step_ref(func: Callable) -> str:
-    """The ``module:qualname`` of a step, or a TypeError for an unregistered callable."""
+    """The ``module:qualname`` of a step; TypeError for an unregistered callable."""
     ref = getattr(func, STEP_ATTR, None)
     if ref is None:
-        raise TypeError(f"{func!r} is not a registered step; closures and lambdas cannot be hashed")
+        raise TypeError(
+            f"{func!r} is not a registered step; closures and lambdas cannot be hashed"
+        )
     return ref
 
 
@@ -74,7 +80,10 @@ def canonical(obj: Any) -> Any:
         }
         return {"__type__": type(obj).__qualname__, **fields}
     if isinstance(obj, dict):
-        return {str(k): canonical(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+        return {
+            str(k): canonical(v)
+            for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))
+        }
     if isinstance(obj, (list, tuple)):
         return [canonical(v) for v in obj]
     raise TypeError(f"cannot serialize {type(obj).__name__} into a declaration")
@@ -91,7 +100,7 @@ def bytes_hash(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-# Ids ==============================================================================================
+# Ids ==================================================================================
 
 _last_ulid: list[int] = [0, 0]
 
@@ -109,7 +118,7 @@ def ulid() -> str:
     return "".join(CROCKFORD[(value >> (5 * i)) & 31] for i in reversed(range(26)))
 
 
-# Code identity ====================================================================================
+# Code identity ========================================================================
 
 
 def git_blob_sha(data: bytes) -> str:
@@ -118,7 +127,7 @@ def git_blob_sha(data: bytes) -> str:
 
 
 def repo_root(start: pathlib.Path) -> pathlib.Path:
-    """The git toplevel containing ``start``, or ``start``'s directory outside a repo."""
+    """The git toplevel containing ``start``, or its directory outside a repo."""
     directory = start if start.is_dir() else start.parent
     try:
         out = subprocess.run(
@@ -133,11 +142,13 @@ def repo_root(start: pathlib.Path) -> pathlib.Path:
         return directory.resolve()
 
 
-def imports(funcs: Iterable[Callable], code_root: pathlib.Path) -> list[types.ModuleType]:
+def imports(
+    funcs: Iterable[Callable], code_root: pathlib.Path
+) -> list[types.ModuleType]:
     """Every module reachable from the steps' modules through module-level names.
 
-    Modules outside ``code_root`` are reached but not expanded, so a third-party package appears
-    once and its internals are never walked.
+    Modules outside ``code_root`` are reached but not expanded, so a third-party package
+    appears once and its internals are never walked.
     """
     root = code_root.resolve()
     queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
@@ -160,7 +171,9 @@ def imports(funcs: Iterable[Callable], code_root: pathlib.Path) -> list[types.Mo
 
 
 def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
-    """Git blob shas of every module under ``code_root`` reachable from the steps' modules."""
+    """Git blob shas of every module under ``code_root`` reachable from the steps'
+    modules.
+    """
     root = code_root.resolve()
     seen: dict[str, str] = {}
     for module in imports(funcs, root):
@@ -170,11 +183,14 @@ def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str,
     return dict(sorted(seen.items()))
 
 
-def imported_dists(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
-    """Installed distributions the steps' closure imports, with their requirements, name to version.
+def imported_dists(
+    funcs: Iterable[Callable], code_root: pathlib.Path
+) -> dict[str, str]:
+    """Installed distributions the steps' closure imports, with their requirements, name
+    to version.
 
-    An editable install's version carries a hash of its source files, since the version does not
-    move when the files do.
+    An editable install's version carries a hash of its source files, since the version
+    does not move when the files do.
     """
     owners = distribution_owners()
     tops = {m.__name__.partition(".")[0] for m in imports(funcs, code_root)}
@@ -216,7 +232,11 @@ def _editable_suffix(dist: importlib.metadata.Distribution) -> str:
     if not info.get("dir_info", {}).get("editable"):
         return ""
     root = pathlib.Path(info["url"].removeprefix("file://"))
-    files = [f for f in sorted(root.rglob("*.py")) if not any(p.startswith(".") for p in f.parts)]
+    files = [
+        f
+        for f in sorted(root.rglob("*.py"))
+        if not any(p.startswith(".") for p in f.parts)
+    ]
     return "+" + content_hash(
         {f.relative_to(root).as_posix(): git_blob_sha(f.read_bytes()) for f in files}
     )

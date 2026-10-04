@@ -1,7 +1,8 @@
 """Recording a dataset and loading it back.
 
-A dataset is the rows of one (process, instrument, window) passed through filter steps, with
-named target columns. Its id covers the whole recipe; the event records the bytes as Parquet.
+A dataset is the rows of one (process, instrument, window) passed through filter steps,
+with named target columns. Its id covers the whole recipe; the event records the bytes
+as Parquet.
 
 Examples
 --------

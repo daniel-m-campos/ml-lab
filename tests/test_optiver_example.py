@@ -1,4 +1,5 @@
-"""The Optiver template on four stocks, driven through ``fy`` exactly as campaign.sh drives it.
+"""The Optiver template on four stocks, driven through ``fy`` exactly as campaign.sh
+drives it.
 
 Skipped when the Kaggle data is absent.
 """
@@ -21,7 +22,9 @@ sys.path.insert(0, str(REPO / "examples"))
 from forestry.ledger import Ledger  # noqa: E402
 from optiver import capture, experiment  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not capture.available(), reason="Optiver train.csv not downloaded")
+pytestmark = pytest.mark.skipif(
+    not capture.available(), reason="Optiver train.csv not downloaded"
+)
 DECL = "optiver.experiment"
 
 
@@ -36,7 +39,11 @@ def dataset(root: pathlib.Path) -> str:
 
 
 def fy(root: pathlib.Path, *argv: str) -> str:
-    env = {**os.environ, "PYTHONPATH": str(REPO / "examples"), "FORESTRY_ROOT": str(root)}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(REPO / "examples"),
+        "FORESTRY_ROOT": str(root),
+    }
     done = subprocess.run(
         [sys.executable, "-m", "forestry.cli", *argv],
         cwd=REPO,
@@ -62,7 +69,8 @@ def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
     fy(root, "run", DECL)
     rows = Ledger(root).sql(
         "SELECT p.name, s.metric, s.value FROM latest_score l "
-        "JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline "
+        "JOIN aggregate_score s ON s.score = l.score "
+        "JOIN pipeline p ON p.id = l.pipeline "
         "WHERE s.age = 1"
     )
     names = {r["name"] for r in rows}

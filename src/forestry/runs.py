@@ -1,7 +1,7 @@
-"""Runs: expand a schedule, memoize fits and predictions, score each pipeline into a score.
+"""Runs: expand a schedule, memoize fits and predictions, record a score per pipeline.
 
-A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``, ``save``
-and ``load``. Reading is SQL over the views in ``forestry.ledger``.
+A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``,
+``save`` and ``load``. Reading is SQL over the views in ``forestry.ledger``.
 
 Examples
 --------
@@ -42,7 +42,9 @@ class Fold:
 
 @dataclasses.dataclass
 class RunReport:
-    """What a run wrote; ``run`` is empty when every fit, prediction and score already existed."""
+    """What a run wrote; ``run`` is empty when every fit, prediction and score already
+    existed.
+    """
 
     run: str = ""
     fits_computed: int = 0
@@ -54,11 +56,13 @@ class RunReport:
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
-# Public Functions =================================================================================
+# Public Functions =====================================================================
 
 
 def folds(evaluation: Evaluation, session: Session) -> list[Fold]:
-    """Folds from the schedule: every cutoff whose oldest eval window still fits the data."""
+    """Folds from the schedule: every cutoff whose oldest eval window still fits the
+    data.
+    """
     span = max(evaluation.ages) * evaluation.eval_months
     folds: list[Fold] = []
     cutoff = as_date(evaluation.first_cutoff)
@@ -66,7 +70,9 @@ def folds(evaluation: Evaluation, session: Session) -> list[Fold]:
         train = (0, session.index_of(cutoff, -evaluation.embargo_seconds))
         evals = {
             age: (
-                session.index_of(add_months(cutoff, (age - 1) * evaluation.eval_months)),
+                session.index_of(
+                    add_months(cutoff, (age - 1) * evaluation.eval_months)
+                ),
                 session.index_of(add_months(cutoff, age * evaluation.eval_months)),
             )
             for age in evaluation.ages
@@ -74,7 +80,9 @@ def folds(evaluation: Evaluation, session: Session) -> list[Fold]:
         folds.append(Fold(len(folds), cutoff, train, evals))
         cutoff = add_months(cutoff, evaluation.every_months)
     if len(folds) < evaluation.min_folds:
-        raise Refused(f"schedule yields {len(folds)} folds, min_folds is {evaluation.min_folds}")
+        raise Refused(
+            f"schedule yields {len(folds)} folds, min_folds is {evaluation.min_folds}"
+        )
     return folds
 
 
@@ -87,16 +95,19 @@ def run(
 ) -> RunReport:
     """Fit, predict and score each pipeline, reusing what the memo rule allows.
 
-    ``run_started`` is appended only when something is computed, right before the first write,
-    so a rerun of an unchanged tree writes nothing and adding one pipeline costs only its own
-    fits, predictions and score. A pipeline that raises is recorded as ``pipeline_failed`` and
-    the others continue; what it had written stays and a rerun resumes from there.
+    ``run_started`` is appended only when something is computed, right before the first
+    write, so a rerun of an unchanged tree writes nothing and adding one pipeline costs
+    only its own fits, predictions and score. A pipeline that raises is recorded as
+    ``pipeline_failed`` and the others continue; what it had written stays and a rerun
+    resumes from there.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
     for pipeline in pipelines:
         if pipeline.format is None:
-            raise Refused(f"pipeline {pipeline.name or pipeline.id}: save step declares no format")
+            raise Refused(
+                f"pipeline {pipeline.name or pipeline.id}: save step declares no format"
+            )
     session = dataset.load(ledger, evaluation.dataset)
     schedule = folds(evaluation, session)
     _declare_evaluation(ledger, evaluation, schedule)
@@ -125,7 +136,9 @@ def run(
     for pipeline in pipelines:
         _declare_pipeline(ledger, pipeline)
         try:
-            _run_pipeline(ledger, session, schedule, pipeline, evaluation, root, report, start)
+            _run_pipeline(
+                ledger, session, schedule, pipeline, evaluation, root, report, start
+            )
         except Exception as error:  # noqa: BLE001
             report.failed[pipeline.id] = f"{type(error).__name__}: {error}"
             ledger.append(
@@ -142,7 +155,7 @@ def run(
     return report
 
 
-# Running one pipeline =============================================================================
+# Running one pipeline =================================================================
 
 
 def _run_pipeline(
@@ -164,7 +177,16 @@ def _run_pipeline(
     for fold in folds:
         computed_before = report.fits_computed
         fit_id = _ensure_fit(
-            ledger, session, evaluation, pipeline, fold, shas, env_lock, models, report, start
+            ledger,
+            session,
+            evaluation,
+            pipeline,
+            fold,
+            shas,
+            env_lock,
+            models,
+            report,
+            start,
         )
         if report.fits_computed > computed_before and loaded is not None:
             _refuse_lazy_imports(pipeline, root, shas, dists, loaded)
@@ -207,7 +229,8 @@ def _run_pipeline(
             "predictions": predictions,
             "folds": per_fold,
             "aggregate": {
-                str(age): evaluation.metrics(np.concatenate(parts)) for age, parts in series.items()
+                str(age): evaluation.metrics(np.concatenate(parts))
+                for age, parts in series.items()
             },
         },
         id=score_id,
@@ -256,7 +279,10 @@ def _ensure_fit(
             "import_shas": shas,
             "env_lock": env_lock,
             "duration_s": duration,
-            "model": {"sha": ledger.put_blob(pipeline.save(model)), "format": pipeline.format},
+            "model": {
+                "sha": ledger.put_blob(pipeline.save(model)),
+                "format": pipeline.format,
+            },
         },
         id=fit_id,
     )
@@ -310,7 +336,7 @@ def _load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
     return formats.series_load(ledger.get_blob(event["payload"]["blob"]["sha"]))
 
 
-# Declarations and provenance ======================================================================
+# Declarations and provenance ==========================================================
 
 
 def _declare_pipeline(ledger: Ledger, pipeline: Pipeline):
@@ -371,21 +397,31 @@ def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
 
 
 def _refuse_lazy_imports(
-    pipeline: Pipeline, root: pathlib.Path, shas: dict[str, str], dists: dict[str, str], loaded: set
+    pipeline: Pipeline,
+    root: pathlib.Path,
+    shas: dict[str, str],
+    dists: dict[str, str],
+    loaded: set,
 ):
-    """A fit that imports inside the function hides code from the memo; refuse and name it."""
+    """A fit that imports inside the function hides code from the memo; refuse and name
+    it.
+    """
     grown = sorted(set(identity.import_shas(pipeline.steps, root)) - set(shas))
     owners = identity.distribution_owners()
     tops = {name.partition(".")[0] for name in set(sys.modules) - loaded}
     lazy = sorted({d for top in tops for d in owners.get(top, ()) if d not in dists})
     if grown or lazy:
         raise Refused(
-            f"fit imported lazily: modules {grown}, distributions {lazy}; import at module level"
+            f"fit imported lazily: modules {grown}, distributions {lazy}; "
+            "import at module level"
         )
 
 
 def _lock_text(dists: dict[str, str]) -> str:
-    lines = [f"python=={platform.python_version()}", *(f"{n}=={v}" for n, v in dists.items())]
+    lines = [
+        f"python=={platform.python_version()}",
+        *(f"{n}=={v}" for n, v in dists.items()),
+    ]
     return "\n".join(lines) + "\n"
 
 

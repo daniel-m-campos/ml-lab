@@ -30,7 +30,9 @@ class Session:
             raise ValueError("timestamps must be sorted")
 
     def __repr__(self) -> str:
-        return f"Session(rows={self.rows}, start={self.start}, end={self.end_exclusive})"
+        return (
+            f"Session(rows={self.rows}, start={self.start}, end={self.end_exclusive})"
+        )
 
     @property
     def rows(self) -> int:
@@ -63,7 +65,7 @@ class Session:
         return self.columns[name][rng[0] : rng[1]]
 
 
-# Date helpers =====================================================================================
+# Date helpers =========================================================================
 
 
 def as_date(when: str | datetime.date | datetime.datetime) -> datetime.date:
@@ -80,4 +82,6 @@ def add_months(date: datetime.date, months: int) -> datetime.date:
     month_index = date.month - 1 + months
     year = date.year + month_index // 12
     month = month_index % 12 + 1
-    return datetime.date(year, month, min(date.day, calendar.monthrange(year, month)[1]))
+    return datetime.date(
+        year, month, min(date.day, calendar.monthrange(year, month)[1])
+    )

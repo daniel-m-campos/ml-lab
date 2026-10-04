@@ -1,12 +1,14 @@
-"""The ledger: one append-only SQLite table of events, SQL views over it, and a blob store.
+"""The ledger: one append-only SQLite table of events, SQL views over it, and a blob
+store.
 
-Every write is an insert with a global ``seq``, an actor and a host. Objects carry content ids,
-runs and failures carry ULIDs, so two ledgers merge by id. Blobs live under their sha256.
+Every write is an insert with a global ``seq``, an actor and a host. Objects carry
+content ids, runs and failures carry ULIDs, so two ledgers merge by id. Blobs live under
+their sha256.
 
 Examples
 --------
 >>> ledger = Ledger("/tmp/fy-example")  # doctest: +SKIP
->>> ledger.append("pipeline_declared", "abc", "abc", {"name": "ridge"})  # doctest: +SKIP
+>>> ledger.append("pipeline_declared", "p1", "p1", {"name": "r"})  # doctest: +SKIP
 'abc'
 """
 
@@ -46,7 +48,8 @@ class Event:
 
 DDL = """
 CREATE TABLE IF NOT EXISTS event (
-  seq INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, type TEXT NOT NULL, stream TEXT NOT NULL,
+  seq INTEGER PRIMARY KEY, id TEXT UNIQUE NOT NULL, type TEXT NOT NULL,
+  stream TEXT NOT NULL,
   key TEXT NOT NULL, at REAL NOT NULL, actor TEXT NOT NULL, host TEXT NOT NULL,
   payload TEXT NOT NULL CHECK (json_valid(payload)));
 CREATE INDEX IF NOT EXISTS event_stream ON event(stream, type, seq);
@@ -55,7 +58,8 @@ CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
 
 VIEWS = """
 CREATE VIEW IF NOT EXISTS dataset AS SELECT seq, id, at, actor,
-  json_extract(payload,'$.process') AS process, json_extract(payload,'$.instrument') AS instrument,
+  json_extract(payload,'$.process') AS process,
+  json_extract(payload,'$.instrument') AS instrument,
   json_extract(payload,'$.window[0]') AS window_start,
   json_extract(payload,'$.window[1]') AS window_end,
   json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
@@ -68,28 +72,36 @@ CREATE VIEW IF NOT EXISTS pipeline AS SELECT seq, id, at, actor,
 FROM event WHERE type='pipeline_declared';
 
 CREATE VIEW IF NOT EXISTS evaluation AS SELECT seq, id, at, actor,
-  json_extract(payload,'$.dataset') AS dataset, json_extract(payload,'$.metrics') AS metrics,
-  json_extract(payload,'$.declaration') AS declaration, json_extract(payload,'$.folds') AS folds
+  json_extract(payload,'$.dataset') AS dataset,
+  json_extract(payload,'$.metrics') AS metrics,
+  json_extract(payload,'$.declaration') AS declaration,
+  json_extract(payload,'$.folds') AS folds
 FROM event WHERE type='evaluation_declared';
 
 CREATE VIEW IF NOT EXISTS run AS SELECT seq, id, at, actor, host, stream AS evaluation,
-  json_extract(payload,'$.git.commit') AS "commit", json_extract(payload,'$.git.dirty') AS dirty,
-  json_extract(payload,'$.git.diff.sha') AS diff, json_extract(payload,'$.env_lock') AS env_lock
+  json_extract(payload,'$.git.commit') AS "commit",
+  json_extract(payload,'$.git.dirty') AS dirty,
+  json_extract(payload,'$.git.diff.sha') AS diff,
+  json_extract(payload,'$.env_lock') AS env_lock
 FROM event WHERE type='run_started';
 
 CREATE VIEW IF NOT EXISTS fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.train[0]') AS train_start,
   json_extract(payload,'$.train[1]') AS train_end,
-  json_extract(payload,'$.cutoff') AS cutoff, json_extract(payload,'$.env_lock') AS env_lock,
+  json_extract(payload,'$.cutoff') AS cutoff,
+  json_extract(payload,'$.env_lock') AS env_lock,
   json_extract(payload,'$.import_shas') AS import_shas,
-  json_extract(payload,'$.model.sha') AS model, json_extract(payload,'$.model.format') AS format,
+  json_extract(payload,'$.model.sha') AS model,
+  json_extract(payload,'$.model.format') AS format,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='fit_computed';
 
 CREATE VIEW IF NOT EXISTS prediction AS SELECT seq, id, at, stream AS dataset,
-  json_extract(payload,'$.fit') AS fit, json_extract(payload,'$.range[0]') AS range_start,
-  json_extract(payload,'$.range[1]') AS range_end, json_extract(payload,'$.fold') AS fold,
+  json_extract(payload,'$.fit') AS fit,
+  json_extract(payload,'$.range[0]') AS range_start,
+  json_extract(payload,'$.range[1]') AS range_end,
+  json_extract(payload,'$.fold') AS fold,
   json_extract(payload,'$.age') AS age, json_extract(payload,'$.blob.sha') AS blob
 FROM event WHERE type='predictions_computed';
 
@@ -98,23 +110,29 @@ CREATE VIEW IF NOT EXISTS score AS SELECT seq, id, at, actor, stream AS evaluati
 FROM event WHERE type='score_recorded';
 
 CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS score, e.stream AS evaluation,
-  json_extract(e.payload,'$.pipeline') AS pipeline, json_extract(f.value,'$.fold') AS fold,
+  json_extract(e.payload,'$.pipeline') AS pipeline,
+  json_extract(f.value,'$.fold') AS fold,
   json_extract(f.value,'$.age') AS age, m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
 WHERE e.type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS score, e.stream AS evaluation,
+CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS score,
+  e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, CAST(a.key AS INTEGER) AS age,
   m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
 WHERE e.type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS latest_score AS SELECT evaluation, pipeline, id AS score, run, seq
-FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
+CREATE VIEW IF NOT EXISTS latest_score AS SELECT evaluation, pipeline, id AS score,
+  run, seq
+FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY evaluation,
+  pipeline ORDER BY seq DESC) AS rn
       FROM score) WHERE rn = 1;
 
-CREATE VIEW IF NOT EXISTS failure AS SELECT seq, id, at, actor, host, stream AS evaluation,
-  key AS pipeline, json_extract(payload,'$.run') AS run, json_extract(payload,'$.error') AS error
+CREATE VIEW IF NOT EXISTS failure AS SELECT seq, id, at, actor, host,
+  stream AS evaluation,
+  key AS pipeline, json_extract(payload,'$.run') AS run,
+  json_extract(payload,'$.error') AS error
 FROM event WHERE type='pipeline_failed';
 """
 
@@ -131,21 +149,30 @@ class Ledger:
         self._db.execute("PRAGMA journal_mode=WAL")
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, SCHEMA_VERSION):
-            raise RuntimeError(f"ledger schema {version}, this build is {SCHEMA_VERSION}")
+            raise RuntimeError(
+                f"ledger schema {version}, this build is {SCHEMA_VERSION}"
+            )
         self._db.executescript(DDL + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};")
 
     def __repr__(self) -> str:
         return f"Ledger({self.root})"
 
-    # Events ---------------------------------------------------------------------------------------
+    # Events ---------------------------------------------------------------------------
 
     def append(
-        self, type: str, stream: str, key: str, payload: dict[str, Any], *, id: str | None = None
+        self,
+        type: str,
+        stream: str,
+        key: str,
+        payload: dict[str, Any],
+        *,
+        id: str | None = None,
     ) -> str:
-        """Insert one event; an id that already exists writes nothing. Returns the id."""
+        """Insert one event and return its id; an existing id writes nothing."""
         event_id = id or identity.ulid()
         self._db.execute(
-            "INSERT OR IGNORE INTO event (id, type, stream, key, at, actor, host, payload) "
+            "INSERT OR IGNORE INTO event "
+            "(id, type, stream, key, at, actor, host, payload) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id,
@@ -182,7 +209,10 @@ class Ledger:
             clauses.append("seq <= ?")
             params.append(upto)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return [_event(r) for r in self.sql(f"SELECT * FROM event {where} ORDER BY seq", params)]
+        return [
+            _event(r)
+            for r in self.sql(f"SELECT * FROM event {where} ORDER BY seq", params)
+        ]
 
     def latest(self, type: str, key: str) -> dict[str, Any] | None:
         rows = self.events(type=type, key=key)
@@ -192,7 +222,7 @@ class Ledger:
         """Rows of any query or view as dicts."""
         return [dict(r) for r in self._db.execute(query, params).fetchall()]
 
-    # Blobs ----------------------------------------------------------------------------------------
+    # Blobs ----------------------------------------------------------------------------
 
     def put_blob(self, payload: bytes) -> str:
         """Store bytes under their sha256 atomically; returns the sha."""

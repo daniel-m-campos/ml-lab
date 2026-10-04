@@ -1,9 +1,9 @@
 """What an experiment is made of: steps, scorers, pipelines and the evaluation.
 
-An experiment module exposes ``pipelines`` and ``evaluation``; ``fy run`` reads both by name.
-Declarations are frozen dataclasses hashed by canonical serialization; see docs/spec.md. A
-pipeline's name is a label and does not enter its hash. Identity is declaration only: code
-changes are caught by the fit memo, not by hashing files.
+An experiment module exposes ``pipelines`` and ``evaluation``; ``fy run`` reads both by
+name. Declarations are frozen dataclasses hashed by canonical serialization; see
+docs/spec.md. A pipeline's name is a label and does not enter its hash. Identity is
+declaration only: code changes are caught by the fit memo, not by hashing files.
 
 Examples
 --------
@@ -28,7 +28,8 @@ def step(func: Callable | None = None, *, format: str | None = None) -> Callable
     Parameters
     ----------
     format : str, optional
-        For a ``save`` step: the name of the byte format it writes, recorded on every model blob.
+        For a ``save`` step: the name of the byte format it writes, recorded on every
+        model blob.
     """
 
     def decorate(f: Callable) -> Callable:
@@ -56,9 +57,11 @@ def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
 
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
-    """How a training range becomes a model, a model becomes predictions, and a model becomes bytes.
+    """How a training range becomes a model, a model becomes predictions, and a model
+    becomes bytes.
 
-    ``save(model) -> bytes`` and ``load(bytes) -> model`` name a format that opens without Python.
+    ``save(model) -> bytes`` and ``load(bytes) -> model`` name a format that opens
+    without Python.
     """
 
     fit: Callable
@@ -82,7 +85,9 @@ class Pipeline:
 
     def with_config(self, **changes: Any) -> Pipeline:
         """A copy with config fields replaced."""
-        return dataclasses.replace(self, config=dataclasses.replace(self.config, **changes))
+        return dataclasses.replace(
+            self, config=dataclasses.replace(self.config, **changes)
+        )
 
     def named(self, name: str) -> Pipeline:
         return dataclasses.replace(self, name=name)
@@ -90,7 +95,9 @@ class Pipeline:
 
 @dataclasses.dataclass(frozen=True)
 class Evaluation:
-    """How every pipeline on a dataset is scored: the walk-forward schedule and the scorer."""
+    """How every pipeline on a dataset is scored: the walk-forward schedule and the
+    scorer.
+    """
 
     dataset: str
     scorer: Callable

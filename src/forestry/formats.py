@@ -1,7 +1,8 @@
-"""Every byte conversion the ledger writes, in formats that open without this environment.
+"""Every byte conversion the ledger writes, in formats that open without this
+environment.
 
-Datasets and predictions are Parquet. A dict of arrays is one Arrow IPC file. Libraries with a
-path-only API round-trip through a temp file.
+Datasets and predictions are Parquet. A dict of arrays is one Arrow IPC file. Libraries
+with a path-only API round-trip through a temp file.
 
 Examples
 --------
@@ -35,12 +36,14 @@ class Format:
     TEXT = "text/plain"
 
 
-# Sessions =========================================================================================
+# Sessions =============================================================================
 
 
 def session_save(session: Session) -> bytes:
-    """A session as one Parquet file: ``ts`` as timestamp[s] plus one column per array."""
-    table = pa.table({TS: pa.array(session.ts, type=pa.timestamp("s")), **session.columns})
+    """A session as one Parquet file: ``ts`` timestamp[s] plus one column per array."""
+    table = pa.table(
+        {TS: pa.array(session.ts, type=pa.timestamp("s")), **session.columns}
+    )
     return _parquet_bytes(table)
 
 
@@ -59,7 +62,7 @@ def session_from_table(table: pa.Table, ts: str = TS) -> Session:
     return Session(stamps, columns)
 
 
-# Series ===========================================================================================
+# Series ===============================================================================
 
 
 def series_save(values: np.ndarray) -> bytes:
@@ -71,11 +74,13 @@ def series_load(payload: bytes) -> np.ndarray:
     return pq.read_table(io.BytesIO(payload))[PREDICTION].to_numpy()
 
 
-# Arrays ===========================================================================================
+# Arrays ===============================================================================
 
 
 def arrays_save(arrays: dict[str, np.ndarray]) -> bytes:
-    """A dict of float arrays as an Arrow IPC file: one row per array with its name and shape."""
+    """A dict of float arrays as an Arrow IPC file: one row per array with its name and
+    shape.
+    """
     names = list(arrays)
     table = pa.table(
         {
@@ -98,10 +103,13 @@ def arrays_load(payload: bytes) -> dict[str, np.ndarray]:
         table["data"].to_pylist(),
         strict=True,
     )
-    return {name: np.asarray(data, dtype=np.float64).reshape(shape) for name, shape, data in rows}
+    return {
+        name: np.asarray(data, dtype=np.float64).reshape(shape)
+        for name, shape, data in rows
+    }
 
 
-# Path-only libraries ==============================================================================
+# Path-only libraries ==================================================================
 
 
 def bytes_via_file(write: Callable[[str], Any], suffix: str) -> bytes:

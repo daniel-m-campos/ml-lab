@@ -13,7 +13,9 @@ ridge = Pipeline(
     load=steps.ridge_load,
     config=steps.RidgeConfig(train_window_months=3, alpha=1.0),
 )
-ridge_windows = [ridge.with_config(train_window_months=m).named(f"ridge_{m}m") for m in (1, 3, 6)]
+ridge_windows = [
+    ridge.with_config(train_window_months=m).named(f"ridge_{m}m") for m in (1, 3, 6)
+]
 
 bonsai_depthwise = Pipeline(
     name="bonsai_dw",
@@ -33,7 +35,9 @@ bonsai_depthwise = Pipeline(
 bonsai_leafwise = bonsai_depthwise.with_config(grower="leafwise").named("bonsai_lw")
 bonsai_available = steps.bonsai is not None
 
-pipelines = ridge_windows + ([bonsai_depthwise, bonsai_leafwise] if bonsai_available else [])
+pipelines = ridge_windows + (
+    [bonsai_depthwise, bonsai_leafwise] if bonsai_available else []
+)
 
 
 def evaluation(dataset: str) -> Evaluation:

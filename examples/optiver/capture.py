@@ -41,7 +41,9 @@ def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Sess
     )
     order = pa.array(np.lexsort((table["stock_id"].to_numpy(), seconds)))
     ts = np.datetime64(BASE_DATE, "s") + seconds.astype("timedelta64[s]")
-    kept = table.drop_columns(list(DROPPED)).append_column("ts", pa.array(ts, pa.timestamp("s")))
+    kept = table.drop_columns(list(DROPPED)).append_column(
+        "ts", pa.array(ts, pa.timestamp("s"))
+    )
     floats = pa.table(
         {
             name: pc.cast(kept[name], pa.float64()) if name != "ts" else kept[name]
@@ -58,13 +60,18 @@ def drop_null_target(session: Session) -> Session:
 
 
 def dataset(ledger: Ledger, stocks: str = "all") -> str:
-    """Ingest a stock subset with null targets dropped; ``stocks`` is "all", "20" or "0,1,2"."""
+    """Ingest a stock subset with null targets dropped; ``stocks`` is "all", "20" or
+    "0,1,2".
+    """
     selected = parse_stocks(stocks)
     return record(
         ledger,
         load(selected),
         process=PROCESS,
-        params={"stocks": list(selected) if selected else "all", "base_date": str(BASE_DATE)},
+        params={
+            "stocks": list(selected) if selected else "all",
+            "base_date": str(BASE_DATE),
+        },
         instrument=INSTRUMENT,
         filters=(drop_null_target,),
         targets=(TARGET,),
