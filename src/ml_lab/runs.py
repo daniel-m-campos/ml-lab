@@ -91,6 +91,8 @@ def run(
                 f"not one of {sorted(formats.KNOWN)}"
             )
     session = dataset.load(ledger, evaluation.dataset)
+    recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
+    targets = tuple(recipe["targets"])
     schedule = evaluation.split.folds(session)
     _declare_evaluation(ledger, evaluation, schedule)
     root = code_root or identity.repo_root(
@@ -122,6 +124,7 @@ def run(
             _run_pipeline(
                 ledger,
                 session,
+                targets,
                 schedule,
                 pipeline,
                 evaluation,
@@ -153,6 +156,7 @@ def run(
 def _run_pipeline(
     ledger: Ledger,
     session: Session,
+    targets: tuple[str, ...],
     folds: list[Fold],
     pipeline: Pipeline,
     evaluation: Evaluation,
@@ -161,7 +165,9 @@ def _run_pipeline(
     start: Callable[[], str],
     log: Callable[[str], None],
 ):
-    stage = _Stage(ledger, session, pipeline, evaluation, root, report, start, log)
+    stage = _Stage(
+        ledger, session, targets, pipeline, evaluation, root, report, start, log
+    )
     loaded: set[str] | None = set(sys.modules)
     predictions: dict[str, str] = {}
     for index, fold in enumerate(folds):
@@ -195,6 +201,7 @@ class _Stage:
         self,
         ledger: Ledger,
         session: Session,
+        targets: tuple[str, ...],
         pipeline: Pipeline,
         evaluation: Evaluation,
         root: pathlib.Path,
@@ -203,6 +210,7 @@ class _Stage:
         log: Callable[[str], None],
     ):
         self.ledger, self.session, self.pipeline = ledger, session, pipeline
+        self.targets, self.root = targets, root
         self.evaluation, self.report, self.start, self.log = (
             evaluation,
             report,
@@ -211,19 +219,22 @@ class _Stage:
         )
         self.name = pipeline.name or pipeline.id
         self.shas = identity.import_shas(pipeline.steps, root)
-        own = (pipeline.fit, pipeline.save, pipeline.load)
-        post = (pipeline.postprocess,) if pipeline.postprocess else ()
+        self.steps = {
+            "fit": (pipeline.fit, pipeline.save, pipeline.load),
+            "predict": (pipeline.predict,),
+            "postprocess": (pipeline.postprocess,) if pipeline.postprocess else (),
+        }
         self.stage_shas = {
-            "fit": identity.import_shas(own, root),
-            "predict": identity.import_shas((pipeline.predict,), root),
-            "postprocess": identity.import_shas(post, root),
+            stage: identity.import_shas(steps, root)
+            for stage, steps in self.steps.items()
         }
         self.dists = identity.imported_dists(pipeline.steps, root)
         self.env_lock = _text_blob(ledger, _lock_text(self.dists))
         self.models: dict[str, Any] = {}
         self.fits: dict[str, str] = {}
+        self.probed = False
         self.members = [
-            _Stage(ledger, session, m, evaluation, root, report, start, log)
+            _Stage(ledger, session, targets, m, evaluation, root, report, start, log)
             for m in pipeline.members
         ]
 
@@ -255,6 +266,7 @@ class _Stage:
         visible = self.session.upto(max(hi for _, hi in fold.train))
         model = self.pipeline.fit(visible, fold.train, self.pipeline.config, *inputs)
         duration = time.perf_counter() - started
+        self._unchanged("fit")
         self.models[fit_id] = model
         self.ledger.append(
             Event.FIT,
@@ -318,21 +330,38 @@ class _Stage:
             "window": window,
             **({"members": member_preds} if self.members else {}),
         }
-        visible = self.session.upto(rng[1])
+        visible = self.session.upto(rng[1]).masked(self.targets, rng[0])
         if self.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
             raw = _load_predictions(self.ledger, raw_id)
         else:
             inputs = [_load_predictions(self.ledger, p) for p in member_preds]
             extra = [inputs] if self.members else []
             model = self._model(fit_id)
+            self._unchanged("predict")
             raw = self._write(
                 raw_id, self.pipeline.predict(model, visible, rng, *extra), where
             )
             self.log(f"predictions {self.name} {window} rows {rng[0]}:{rng[1]}")
+            self._probe(
+                "predict",
+                raw,
+                lambda view: self.pipeline.predict(model, view, rng, *extra),
+                visible,
+                rng,
+            )
         if self.pipeline.postprocess is not None:
+            self._unchanged("postprocess")
+            post = self.pipeline.postprocess(raw, visible, rng)
+            self._probe(
+                "postprocess",
+                post,
+                lambda view: self.pipeline.postprocess(raw, view, rng),
+                visible,
+                rng,
+            )
             self._write(
                 pred_id,
-                self.pipeline.postprocess(raw, visible, rng),
+                post,
                 {
                     **where,
                     "raw": raw_id,
@@ -359,6 +388,40 @@ class _Stage:
             ]
             arrays.append(np.concatenate(parts))
         return [arrays]
+
+    def _unchanged(self, stage: str):
+        """Refuse to record a sha for code that is not the code that ran."""
+        now = identity.import_shas(self.steps[stage], self.root)
+        moved = sorted(
+            k
+            for k in set(now) | set(self.stage_shas[stage])
+            if now.get(k) != self.stage_shas[stage].get(k)
+        )
+        if moved:
+            raise Refused(f"{self.name}: source changed during the run: {moved}; rerun")
+
+    def _probe(
+        self,
+        stage: str,
+        output: np.ndarray,
+        compute: Callable[[Session], Any],
+        visible: Session,
+        rng: Range,
+    ):
+        """Once per pipeline, on its first computed window: freeze the rows after the
+        window's midpoint and require the predictions before it to stand.
+        """
+        if self.probed or rng[1] - rng[0] < 2:
+            return
+        self.probed = True
+        mid = (rng[0] + rng[1]) // 2
+        again = np.asarray(compute(visible.frozen(mid)), dtype=np.float64)
+        head = mid - rng[0]
+        if not np.array_equal(output[:head], again[:head], equal_nan=True):
+            raise Refused(
+                f"{self.name}: {stage} reads rows after the one it predicts: "
+                f"predictions before row {mid} changed when rows from {mid} were frozen"
+            )
 
     def _model(self, fit_id: str) -> Any:
         if fit_id not in self.models:
@@ -519,11 +582,20 @@ def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
     commit = git("rev-parse", "HEAD")
     if commit is None:
         return {"commit": None, "dirty": None, "diff": None}
-    dirty = bool((git("status", "--porcelain", "--untracked-files=no") or "").strip())
+    dirty = bool((git("status", "--porcelain") or "").strip())
     diff = None
     if dirty:
-        sha = ledger.put_blob((git("diff", "HEAD") or "").encode())
-        diff = {"sha": sha, "format": formats.Format.DIFF}
+        untracked = (git("ls-files", "--others", "--exclude-standard") or "").split()
+        text = (git("diff", "HEAD") or "") + "".join(
+            subprocess.run(
+                ["git", "diff", "--no-index", "--", os.devnull, path],
+                cwd=root,
+                capture_output=True,
+                text=True,
+            ).stdout
+            for path in untracked
+        )
+        diff = {"sha": ledger.put_blob(text.encode()), "format": formats.Format.DIFF}
     return {"commit": commit.strip(), "dirty": dirty, "diff": diff}
 
 

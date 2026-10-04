@@ -10,6 +10,7 @@ import io
 import json
 import pathlib
 import sqlite3
+import subprocess
 import sys
 
 import numpy as np
@@ -245,6 +246,63 @@ def test_steps_see_only_the_rows_before_their_cutoff(ledger, dataset, evaluation
     assert first.column("f0", (np.int64(8), np.int64(10))).shape == (2,)
     with pytest.raises(ValueError, match="before"):
         first.matrix((8, 12), ("f0",))
+
+
+def test_targets_are_hidden_inside_the_window(ledger, dataset, evaluation):
+    cheat = dataclasses.replace(synthetic.ridge(1), predict=synthetic.cheating_predict)
+    _run(ledger, evaluation, cheat)
+    pred = _load_predictions(ledger, ledger.events(Event.PREDICTIONS)[0]["id"])
+    assert np.isnan(pred).all()
+
+
+def test_a_predict_that_reads_the_future_inside_its_window_is_refused(
+    ledger, dataset, evaluation
+):
+    peek = dataclasses.replace(synthetic.ridge(1), predict=synthetic.peeking_predict)
+    report = _run(ledger, evaluation, peek)
+    assert "reads rows after the one it predicts" in report.failed["ridge_1m"]
+    assert ledger.events(Event.SCORE) == []
+
+
+def test_a_module_edited_during_the_run_is_refused_not_recorded(ledger, tmp_path):
+    code = tmp_path / "steps_e.py"
+    code.write_text(
+        (REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNE")
+    )
+    module = cli._load(str(code))
+    evaluation = module.evaluation(module.dataset(ledger))
+    editing = dataclasses.replace(module.ridge(1), fit=module.self_editing_fit)
+    report = runs.run(ledger, [editing], evaluation, code_root=tmp_path)
+    assert "source changed during the run" in report.failed["ridge_1m"]
+    assert ledger.events(Event.FIT) == []
+
+
+def test_untracked_step_modules_are_in_the_run_diff(ledger, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", repo], check=True)
+    (repo / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "-C", repo, "add", "a.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            repo,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            "a",
+        ],
+        check=True,
+    )
+    (repo / "new_steps.py").write_text("y = 2\n")
+    git = runs._git(ledger, repo)
+    diff = ledger.get_blob(git["diff"]["sha"]).decode()
+    assert git["dirty"] and "new_steps.py" in diff and "+y = 2" in diff
 
 
 def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(

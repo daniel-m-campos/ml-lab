@@ -60,6 +60,28 @@ class Session:
         view._seconds = None if self._seconds is None else self._seconds[:row]
         return view
 
+    def masked(self, columns: tuple[str, ...], start: int) -> Session:
+        """A view with ``columns`` set to NaN from ``start`` on: the targets inside a
+        prediction window, hidden from predict and postprocess.
+        """
+        view = self.upto(self.rows)
+        for name in columns:
+            values = view.columns[name].astype(np.float64, copy=True)
+            values[start:] = np.nan
+            view.columns[name] = values
+        return view
+
+    def frozen(self, start: int) -> Session:
+        """A view whose rows from ``start`` on repeat row ``start - 1``: a future that
+        never moves, so a step that reads it predicts differently before ``start``.
+        """
+        view = self.upto(self.rows)
+        for name, values in view.columns.items():
+            values = values.copy()
+            values[start:] = values[start - 1]
+            view.columns[name] = values
+        return view
+
     def matrix(self, rows: Rows, cols: tuple[str, ...]) -> np.ndarray:
         """Column-stacked features over a range or segments, shape (rows, len(cols))."""
         return np.column_stack([self.column(c, rows) for c in cols])

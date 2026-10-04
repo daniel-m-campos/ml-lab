@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import pathlib
 import pickle
 from typing import Any
 
@@ -203,6 +204,26 @@ def blend(*members: Pipeline, shrink: float = 1.0) -> Pipeline:
         config=BlendConfig(shrink),
         members=members,
     )
+
+
+@step
+def cheating_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+    """Returns the target itself; the run hides it inside the window."""
+    return session.column(TARGET, rng)
+
+
+@step
+def peeking_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+    """Adds the window's mean feature to every row: reads the future inside it."""
+    return ridge_predict(model, session, rng) + session.column("f0", rng).mean()
+
+
+@step
+def self_editing_fit(session: Session, train: Segments, config: RidgeConfig):
+    """Appends a comment to its own module while fitting."""
+    path = pathlib.Path(__file__)
+    path.write_text(path.read_text() + "\n# edited during the run\n")
+    return ridge_fit(session, train, config)
 
 
 @step(format="zip")
