@@ -3,7 +3,7 @@ __pycache__/
 blobs/
 .venv/
 *.egg-info/
-data/
+data
 .ml-lab-optiver/
 .ml-lab/
 .scratch/

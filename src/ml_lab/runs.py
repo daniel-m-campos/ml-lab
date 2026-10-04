@@ -352,7 +352,7 @@ def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
     commit = git("rev-parse", "HEAD")
     if commit is None:
         return {"commit": None, "dirty": None, "diff": None}
-    dirty = bool((git("status", "--porcelain") or "").strip())
+    dirty = bool((git("status", "--porcelain", "--untracked-files=no") or "").strip())
     diff = None
     if dirty:
         sha = ledger.put_blob((git("diff", "HEAD") or "").encode())

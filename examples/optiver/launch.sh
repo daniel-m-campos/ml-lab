@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 [ -x .venv/bin/lab ] && PATH=".venv/bin:$PATH"
 command -v lab >/dev/null || { echo "lab not found: uv venv .venv && uv pip install -e '.[dev]'" >&2; exit 1; }
-export ML_LAB_ROOT=.ml-lab-optiver
+export ML_LAB_ROOT="${ML_LAB_ROOT:-.ml-lab-optiver}"
 export ML_LAB_ACTOR="${ML_LAB_ACTOR:-$USER}"
 D=examples/optiver/experiment.py
 

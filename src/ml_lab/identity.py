@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import os
 import pathlib
@@ -228,12 +229,16 @@ def _editable_suffix(dist: importlib.metadata.Distribution) -> str:
     info = json.loads(text) if text else {}
     if not info.get("dir_info", {}).get("editable"):
         return ""
-    root = pathlib.Path(info["url"].removeprefix("file://"))
-    files = [
-        f
-        for f in sorted(root.rglob("*.py"))
-        if not any(p.startswith(".") for p in f.parts)
-    ]
-    return "+" + content_hash(
-        {f.relative_to(root).as_posix(): git_blob_sha(f.read_bytes()) for f in files}
-    )
+    name = dist.metadata["Name"]
+    tops = [t for t, owners in distribution_owners().items() if name in owners]
+    files: dict[str, str] = {}
+    for top in tops or [name.replace("-", "_")]:
+        spec = importlib.util.find_spec(top)
+        if spec is None:
+            continue
+        for location in spec.submodule_search_locations or [spec.origin]:
+            for f in sorted(pathlib.Path(location).rglob("*.py")):
+                files[f"{top}/{f.relative_to(location).as_posix()}"] = git_blob_sha(
+                    f.read_bytes()
+                )
+    return "+" + content_hash(files)
