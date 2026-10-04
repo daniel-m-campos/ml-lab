@@ -18,7 +18,6 @@ True
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import functools
 import hashlib
 import importlib.metadata
@@ -68,8 +67,6 @@ def canonical(obj: Any) -> Any:
         return obj
     if isinstance(obj, (np.integer, np.floating)):
         return obj.item()
-    if isinstance(obj, (datetime.date, datetime.datetime)):
-        return obj.isoformat()
     if callable(obj):
         return {"__step__": step_ref(obj)}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):

@@ -62,11 +62,11 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
     table = pq.read_table(io.BytesIO(ledger.get_blob(event["payload"]["blob"]["sha"])))
     assert table.num_rows > 100_000 and table.num_rows == event["payload"]["rows"]
     assert not pc.any(pc.is_nan(table[optiver_dataset.TARGET])).as_py()
-    row = ledger.sql("SELECT process, instrument FROM dataset")[0]
-    assert (row["process"], row["instrument"]) == (
-        optiver_dataset.PROCESS,
-        optiver_dataset.INSTRUMENT,
-    )
+    row = ledger.sql(
+        "SELECT source, payload FROM event WHERE type = 'dataset_recorded'"
+    )[0]
+    assert row["source"] == optiver_dataset.SOURCE
+    assert optiver_dataset.INSTRUMENT in row["payload"]
 
 
 def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):

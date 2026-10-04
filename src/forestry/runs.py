@@ -105,7 +105,8 @@ def run(
                 ledger, session, schedule, pipeline, evaluation, root, report, start
             )
         except Exception as error:  # noqa: BLE001
-            report.failed[pipeline.id] = f"{type(error).__name__}: {error}"
+            name = pipeline.name or pipeline.id
+            report.failed[name] = f"{type(error).__name__}: {error}"
             ledger.append(
                 Event.FAILED,
                 evaluation.id,
@@ -113,7 +114,7 @@ def run(
                 {
                     "run": start(),
                     "pipeline": pipeline.id,
-                    "error": report.failed[pipeline.id],
+                    "error": report.failed[name],
                     "traceback": _text_blob(ledger, traceback.format_exc()),
                 },
             )
@@ -139,35 +140,90 @@ def _run_pipeline(
     loaded: set[str] | None = set(sys.modules)
     models: dict[str, Any] = {}
     predictions: dict[str, str] = {}
-    for fold in folds:
-        computed_before = report.fits_computed
-        fit_id = _ensure_fit(
-            ledger,
-            session,
-            evaluation,
-            pipeline,
-            fold,
-            shas,
-            env_lock,
-            models,
-            report,
-            start,
+
+    def ensure_fit(fold: Fold) -> str:
+        train = [list(seg) for seg in fold.train]
+        fit_id = identity.content_hash(
+            {
+                "dataset": evaluation.dataset,
+                "pipeline": pipeline.id,
+                "train": train,
+                "import_shas": shas,
+                "env_lock": env_lock["sha"],
+            }
         )
+        if ledger.latest(Event.FIT, fit_id) is not None:
+            report.fits_reused += 1
+            return fit_id
+        run_id = start()
+        started = time.perf_counter()
+        model = pipeline.fit(session, fold.train, pipeline.config)
+        duration = time.perf_counter() - started
+        models[fit_id] = model
+        ledger.append(
+            Event.FIT,
+            evaluation.dataset,
+            fit_id,
+            {
+                "pipeline": pipeline.id,
+                "run": run_id,
+                "train": train,
+                "label": fold.label,
+                "import_shas": shas,
+                "env_lock": env_lock,
+                "duration_s": duration,
+                "model": {
+                    "sha": ledger.put_blob(pipeline.save(model)),
+                    "format": pipeline.format,
+                },
+            },
+            id=fit_id,
+        )
+        report.fits_computed += 1
+        return fit_id
+
+    def ensure_predictions(fit_id: str, index: int, window: str, rng: Range) -> str:
+        pred_id = identity.content_hash({"fit": fit_id, "range": list(rng)})
+        if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
+            report.predictions_reused += 1
+            return pred_id
+        start()
+        if fit_id not in models:
+            fit = ledger.latest(Event.FIT, fit_id)
+            models[fit_id] = pipeline.load(
+                ledger.get_blob(fit["payload"]["model"]["sha"])
+            )
+        pred = np.asarray(
+            pipeline.predict(models[fit_id], session, rng), dtype=np.float64
+        )
+        ledger.append(
+            Event.PREDICTIONS,
+            evaluation.dataset,
+            pred_id,
+            {
+                "fit": fit_id,
+                "range": list(rng),
+                "fold": index,
+                "window": window,
+                "blob": {
+                    "sha": ledger.put_blob(formats.series_save(pred)),
+                    "format": formats.Format.PARQUET,
+                },
+            },
+            id=pred_id,
+        )
+        report.predictions_computed += 1
+        return pred_id
+
+    for index, fold in enumerate(folds):
+        computed_before = report.fits_computed
+        fit_id = ensure_fit(fold)
         if report.fits_computed > computed_before and loaded is not None:
             _refuse_lazy_imports(pipeline, root, shas, dists, loaded)
             loaded = None
         for window, rng in fold.windows.items():
-            predictions[f"{fold.index}:{window}"] = _ensure_predictions(
-                ledger,
-                session,
-                pipeline,
-                fit_id,
-                rng,
-                fold,
-                window,
-                models,
-                report,
-                start,
+            predictions[f"{index}:{window}"] = ensure_predictions(
+                fit_id, index, window, rng
             )
     score_id = identity.content_hash(
         {
@@ -180,14 +236,14 @@ def _run_pipeline(
         report.scores_reused += 1
         return
     per_fold, series = [], {}
-    for fold in folds:
+    for index, fold in enumerate(folds):
         for window, rng in fold.windows.items():
-            pred = _load_predictions(ledger, predictions[f"{fold.index}:{window}"])
+            pred = _load_predictions(ledger, predictions[f"{index}:{window}"])
             rows = np.asarray(evaluation.scorer(pred, session, rng, evaluation.config))
             series.setdefault(window, []).append(rows)
             per_fold.append(
                 {
-                    "fold": fold.index,
+                    "fold": index,
                     "label": fold.label,
                     "window": window,
                     "metrics": evaluation.metrics(rows),
@@ -210,99 +266,6 @@ def _run_pipeline(
         id=score_id,
     )
     report.scores_recorded += 1
-
-
-def _ensure_fit(
-    ledger: Ledger,
-    session: Session,
-    evaluation: Evaluation,
-    pipeline: Pipeline,
-    fold: Fold,
-    shas: dict[str, str],
-    env_lock: dict[str, str],
-    models: dict[str, Any],
-    report: RunReport,
-    start: Callable[[], str],
-) -> str:
-    fit_id = identity.content_hash(
-        {
-            "dataset": evaluation.dataset,
-            "pipeline": pipeline.id,
-            "train": [list(seg) for seg in fold.train],
-            "import_shas": shas,
-            "env_lock": env_lock["sha"],
-        }
-    )
-    if ledger.latest(Event.FIT, fit_id) is not None:
-        report.fits_reused += 1
-        return fit_id
-    run_id = start()
-    started = time.perf_counter()
-    model = pipeline.fit(session, fold.train, pipeline.config)
-    duration = time.perf_counter() - started
-    models[fit_id] = model
-    ledger.append(
-        Event.FIT,
-        evaluation.dataset,
-        fit_id,
-        {
-            "pipeline": pipeline.id,
-            "run": run_id,
-            "train": [list(seg) for seg in fold.train],
-            "label": fold.label,
-            "import_shas": shas,
-            "env_lock": env_lock,
-            "duration_s": duration,
-            "model": {
-                "sha": ledger.put_blob(pipeline.save(model)),
-                "format": pipeline.format,
-            },
-        },
-        id=fit_id,
-    )
-    report.fits_computed += 1
-    return fit_id
-
-
-def _ensure_predictions(
-    ledger: Ledger,
-    session: Session,
-    pipeline: Pipeline,
-    fit_id: str,
-    rng: Range,
-    fold: Fold,
-    window: str,
-    models: dict[str, Any],
-    report: RunReport,
-    start: Callable[[], str],
-) -> str:
-    pred_id = identity.content_hash({"fit": fit_id, "range": list(rng)})
-    if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
-        report.predictions_reused += 1
-        return pred_id
-    start()
-    if fit_id not in models:
-        fit = ledger.latest(Event.FIT, fit_id)
-        models[fit_id] = pipeline.load(ledger.get_blob(fit["payload"]["model"]["sha"]))
-    pred = np.asarray(pipeline.predict(models[fit_id], session, rng), dtype=np.float64)
-    ledger.append(
-        Event.PREDICTIONS,
-        ledger.latest(Event.FIT, fit_id)["stream"],
-        pred_id,
-        {
-            "fit": fit_id,
-            "range": list(rng),
-            "fold": fold.index,
-            "window": window,
-            "blob": {
-                "sha": ledger.put_blob(formats.series_save(pred)),
-                "format": formats.Format.PARQUET,
-            },
-        },
-        id=pred_id,
-    )
-    report.predictions_computed += 1
-    return pred_id
 
 
 def _load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
@@ -338,12 +301,12 @@ def _declare_evaluation(ledger: Ledger, evaluation: Evaluation, folds: list[Fold
             "metrics": evaluation.directions,
             "folds": [
                 {
-                    "index": f.index,
+                    "index": i,
                     "label": f.label,
                     "train": [list(seg) for seg in f.train],
                     "windows": f.windows,
                 }
-                for f in folds
+                for i, f in enumerate(folds)
             ],
         },
         id=evaluation.id,
@@ -411,16 +374,10 @@ def _text_blob(ledger: Ledger, text: str) -> dict[str, str]:
 
 
 def _host() -> dict[str, Any]:
-    cpu_max = None
-    try:
-        cpu_max = open("/sys/fs/cgroup/cpu.max").read().strip()
-    except OSError:
-        pass
     return {
         "hostname": platform.node(),
         "system": platform.system(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count() or 1,
-        "cgroup_cpu_max": cpu_max,
         "python": platform.python_version(),
     }

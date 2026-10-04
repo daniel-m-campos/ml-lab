@@ -25,7 +25,7 @@ from typing import Any, Final
 
 from forestry import identity
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 ACTOR_ENV = "FORESTRY_ACTOR"
 
 
@@ -58,8 +58,7 @@ CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
 
 VIEWS = """
 CREATE VIEW IF NOT EXISTS dataset AS SELECT seq, id, at, actor,
-  json_extract(payload,'$.process') AS process,
-  json_extract(payload,'$.instrument') AS instrument,
+  json_extract(payload,'$.source') AS source,
   json_extract(payload,'$.window[0]') AS window_start,
   json_extract(payload,'$.window[1]') AS window_end,
   json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
@@ -187,26 +186,18 @@ class Ledger:
         self._db.commit()
         return event_id
 
-    def get(self, id: str) -> dict[str, Any] | None:
-        rows = self.sql("SELECT * FROM event WHERE id = ?", (id,))
-        return _event(rows[0]) if rows else None
-
     def events(
         self,
         type: str | None = None,
         stream: str | None = None,
         key: str | None = None,
-        upto: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Events in seq order, filtered by any of type, stream, key and a seq bound."""
+        """Events in seq order, filtered by any of type, stream and key."""
         clauses, params = [], []
         for column, value in (("type", type), ("stream", stream), ("key", key)):
             if value is not None:
                 clauses.append(f"{column} = ?")
                 params.append(value)
-        if upto is not None:
-            clauses.append("seq <= ?")
-            params.append(upto)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return [
             _event(r)

@@ -85,9 +85,8 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
         f"run {report.run}: fits {report.fits_computed}, predictions "
         f"{report.predictions_computed}, scores {report.scores_recorded}"
     )
-    names = {p.id: p.name or p.id for p in pipelines}
-    for pipeline_id, error in report.failed.items():
-        print(f"fy run: {names[pipeline_id]} failed: {error}", file=sys.stderr)
+    for name, error in report.failed.items():
+        print(f"fy run: {name} failed: {error}", file=sys.stderr)
     return 1 if report.failed else 0
 
 

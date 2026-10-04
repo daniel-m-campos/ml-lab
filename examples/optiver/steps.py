@@ -160,26 +160,6 @@ def bonsai_load(payload: bytes):
 # Scorers ==============================================================================
 
 
-def fit_metrics(series: np.ndarray) -> dict[str, float]:
-    """Prediction quality from a (pred, truth) series, no trading."""
-    pred, truth = series[:, 0], series[:, 1]
-    corr = float(np.corrcoef(pred, truth)[0, 1]) if pred.std() > 0 else 0.0
-    return {
-        "corr": corr,
-        "hit_rate": float(np.mean(np.sign(pred) == np.sign(truth))),
-        "rmse": float(np.sqrt(np.mean((pred - truth) ** 2))),
-    }
-
-
-@scorer(
-    metrics=fit_metrics, directions={"corr": "max", "hit_rate": "max", "rmse": "min"}
-)
-def fit_quality(
-    pred: np.ndarray, session: Session, rng: Range, config: None
-) -> np.ndarray:
-    return np.column_stack([pred, session.column(TARGET, rng)])
-
-
 @dataclasses.dataclass(frozen=True)
 class SimConfig:
     """Trade the sign of the predicted move above ``threshold_bps``; a flip costs

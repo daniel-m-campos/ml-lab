@@ -26,7 +26,6 @@ Segments = tuple[Range, ...]
 
 @dataclasses.dataclass(frozen=True)
 class Fold:
-    index: int
     label: str
     train: Segments
     windows: dict[str, Range]
@@ -60,7 +59,7 @@ class WalkForward:
                 )
                 for h in names
             }
-            out.append(Fold(len(out), f"row {cutoff}", train, windows))
+            out.append(Fold(f"row {cutoff}", train, windows))
             cutoff += self.step_rows
         return _at_least(out, self.min_folds)
 
@@ -95,7 +94,7 @@ class CalendarWalkForward:
                 )
                 for h in self.horizons
             }
-            out.append(Fold(len(out), str(cutoff), train, windows))
+            out.append(Fold(str(cutoff), train, windows))
             cutoff = dates.add_months(cutoff, self.every_months)
         return _at_least(out, self.min_folds)
 
@@ -120,7 +119,7 @@ class BlockedKFold:
                 for seg in ((0, lo - self.embargo_rows), (hi + self.embargo_rows, n))
                 if seg[0] < seg[1]
             )
-            out.append(Fold(i, f"block {i}", train, {"test": (lo, hi)}))
+            out.append(Fold(f"block {i}", train, {"test": (lo, hi)}))
         return _at_least(out, 2)
 
 
@@ -137,7 +136,7 @@ class Holdout:
         n = session.rows
         cut = round(n * self.train_fraction)
         test = (min(cut + self.embargo_rows, n), n)
-        return _at_least([Fold(0, "holdout", ((0, cut),), {"test": test})], 1)
+        return _at_least([Fold("holdout", ((0, cut),), {"test": test})], 1)
 
 
 def _at_least(folds: list[Fold], minimum: int) -> list[Fold]:

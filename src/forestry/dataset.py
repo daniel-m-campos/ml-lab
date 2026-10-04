@@ -1,12 +1,12 @@
 """Recording a dataset and loading it back.
 
-A dataset is the rows of one (process, instrument, window) passed through filter steps,
+A dataset is the rows of one (source, params, window) passed through filter steps,
 with named target columns. Its id covers the whole recipe; the event records the bytes
 as Parquet.
 
 Examples
 --------
->>> dataset = record(ledger, session, process="toy", params={}, instrument="X",
+>>> dataset = record(ledger, session, source="toy", params={},
 ...                  filters=(), targets=("ret_1",))  # doctest: +SKIP
 """
 
@@ -24,9 +24,8 @@ def record(
     ledger: Ledger,
     session: Session,
     *,
-    process: str,
+    source: str,
     params: Mapping[str, Any],
-    instrument: str,
     filters: Sequence[Callable],
     targets: Sequence[str],
 ) -> str:
@@ -34,9 +33,8 @@ def record(
     has_clock = session.ts is not None
     window = [str(d) for d in dates.span(session)] if has_clock else None
     recipe = {
-        "process": process,
+        "source": source,
         "params": params,
-        "instrument": instrument,
         "window": window,
         "filters": list(filters),
         "targets": list(targets),
@@ -51,8 +49,7 @@ def record(
         raise KeyError(f"targets not in session: {missing}")
     sha = ledger.put_blob(formats.session_save(session))
     payload = {
-        "process": process,
-        "instrument": instrument,
+        "source": source,
         "window": window,
         "recipe": identity.canonical(recipe),
         "rows": session.rows,

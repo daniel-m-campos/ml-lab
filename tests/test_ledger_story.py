@@ -77,10 +77,7 @@ def test_the_dataset_blob_opens_with_pyarrow_alone(ledger, dataset):
         synthetic.TARGET in table.column_names
         and table.num_rows == event["payload"]["rows"]
     )
-    assert ledger.sql("SELECT process, instrument FROM dataset")[0] == {
-        "process": "synthetic",
-        "instrument": "SYN",
-    }
+    assert ledger.sql("SELECT source FROM dataset")[0] == {"source": "synthetic"}
 
 
 # Declarations =========================================================================
@@ -251,8 +248,8 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
     )
     assert {"python", "numpy", "pyarrow"} <= set(lock) and "pytest" not in lock
     assert lock["forestry"].count("+") == 1
-    run = ledger.get(payload["run"])
-    assert run["type"] == Event.RUN and "commit" in run["payload"]["git"]
+    run = ledger.latest(Event.RUN, payload["run"])
+    assert "commit" in run["payload"]["git"]
     model = pipeline.load(ledger.get_blob(payload["model"]["sha"]))
     assert model.weights.shape == (3,)
 
@@ -276,7 +273,7 @@ def test_a_changed_source_file_is_a_new_fit_and_score_but_the_same_pipeline(
     assert module.ridge(3).id == pipeline.id
     assert report.fits_computed > 0 and report.scores_recorded == 1
     assert _latest(ledger, evaluation)["ridge_3m"] != first_score
-    assert ledger.get(first_score) is not None
+    assert ledger.latest(Event.SCORE, first_score) is not None
 
 
 def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resumes(
@@ -286,7 +283,7 @@ def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resume
     synthetic.FLAKY_CALLS.clear()
     flaky = synthetic.flaky()
     report = _run(ledger, evaluation, flaky, synthetic.ridge(1))
-    assert list(report.failed) == [flaky.id] and "boom" in report.failed[flaky.id]
+    assert list(report.failed) == ["flaky"] and "boom" in report.failed["flaky"]
     assert report.fits_computed == 2 + len(folds) and report.scores_recorded == 1
     failure = ledger.sql("SELECT pipeline, error FROM failure")[0]
     assert failure["pipeline"] == flaky.id and "boom" in failure["error"]
@@ -379,8 +376,8 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(6))
     before = ledger.events()[-1]["seq"]
     _run(ledger, evaluation, synthetic.ridge(1))
-    assert len(ledger.events(Event.SCORE, upto=before)) == 1
-    assert len(ledger.events(Event.SCORE)) == 2
+    rows = ledger.sql("SELECT COUNT(*) AS n FROM score WHERE seq <= ?", (before,))
+    assert rows[0]["n"] == 1 and len(ledger.events(Event.SCORE)) == 2
 
 
 # Storage ==============================================================================

@@ -62,9 +62,8 @@ def dataset(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
     return record(
         ledger,
         rows,
-        process="synthetic",
-        params={"months": months, "seed": seed},
-        instrument="SYN",
+        source="synthetic",
+        params={"months": months, "seed": seed, "instrument": "SYN"},
         filters=(keep_all,),
         targets=(TARGET,),
     )

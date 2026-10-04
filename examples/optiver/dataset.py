@@ -19,7 +19,7 @@ from forestry.session import Session
 TRAIN_CSV = pathlib.Path("data/optiver/optiver-trading-at-the-close/train.csv")
 BASE_DATE = datetime.date(2021, 1, 4)
 CLOSE_AUCTION_START_S = 15 * 3600 + 50 * 60
-PROCESS = "optiver-close-2023"
+SOURCE = "optiver-close-2023"
 INSTRUMENT = "nasdaq-close-auction"
 TARGET = "target"
 DROPPED = ("row_id", "time_id")
@@ -67,12 +67,11 @@ def dataset(ledger: Ledger, stocks: str = "all") -> str:
     return record(
         ledger,
         load(selected),
-        process=PROCESS,
+        source=SOURCE,
         params={
             "stocks": list(selected) if selected else "all",
             "base_date": str(BASE_DATE),
         },
-        instrument=INSTRUMENT,
         filters=(drop_null_target,),
         targets=(TARGET,),
     )

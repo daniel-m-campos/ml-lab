@@ -44,7 +44,7 @@ CREATE TABLE event (
 
 | type | stream | key | payload |
 |---|---|---|---|
-| dataset_recorded | dataset | dataset id = hash(recipe) | process, instrument, window, recipe (params, filter paths, targets), rows, blob sha |
+| dataset_recorded | dataset | dataset id = hash(recipe) | source, window, recipe (params, filter paths, targets), rows, blob sha |
 | pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, split, scorer path, config, metric directions, the expanded folds (label, train segments, named windows) |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, resolution file sha (`uv.lock` or `requirements*.txt` if present), host facts |
