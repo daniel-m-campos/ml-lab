@@ -242,6 +242,7 @@ def test_steps_see_only_the_rows_before_their_cutoff(ledger, dataset, evaluation
     assert synthetic.SEEN_ROWS == [fold.train[-1][1] for fold in folds]
     first = load(ledger, dataset).upto(10)
     assert first.rows == 10 and first.column("f0", (8, 10)).shape == (2,)
+    assert first.column("f0", (np.int64(8), np.int64(10))).shape == (2,)
     with pytest.raises(ValueError, match="before"):
         first.matrix((8, 12), ("f0",))
 
@@ -285,6 +286,11 @@ def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evalua
     assert np.allclose(_load_predictions(ledger, first["id"]), np.mean(parts, axis=0))
     fit = ledger.latest(Event.FIT, first["payload"]["fit"])
     assert len(fit["payload"]["members"]) == 2
+    stands_on = ledger.sql(
+        "SELECT COUNT(*) AS n FROM score_fit WHERE pipeline = ?",
+        (synthetic.blend(one, three).id,),
+    )
+    assert stands_on[0]["n"] == 3 * len(folds)
     assert _run(ledger, evaluation, synthetic.blend(one, three)).run == ""
     assert _run(
         ledger, evaluation, synthetic.blend(one, three, shrink=0.5)
@@ -362,6 +368,35 @@ def test_a_changed_source_file_is_a_new_fit_and_score_but_the_same_pipeline(
     assert report.fits_computed > 0 and report.scores_recorded == 1
     assert _latest(ledger, evaluation)["ridge_3m"] != first_score
     assert ledger.latest(Event.SCORE, first_score) is not None
+
+
+def test_a_changed_scorer_rescores_without_refitting(ledger, tmp_path):
+    steps = tmp_path / "steps_w.py"
+    steps.write_text(
+        (REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNW")
+    )
+    scoring = tmp_path / "scoring_w.py"
+    scoring.write_text(
+        "import numpy as np\n"
+        "from ml_lab.experiment import scorer\n"
+        "from steps_w import TARGET, sim_metrics\n\n"
+        '@scorer(metrics=sim_metrics, directions={"pnl": "max", "turnover": "min"})\n'
+        "def sim(pred, session, rng, config):\n"
+        "    truth = session.column(TARGET, rng)\n"
+        "    flips = np.abs(np.diff(np.sign(pred), prepend=0.0))\n"
+        "    return np.column_stack([np.sign(pred) * truth - 0.001 * flips, flips])\n"
+    )
+    module = cli._load(str(steps))
+    evaluation = dataclasses.replace(
+        module.evaluation(module.dataset(ledger)), scorer=cli._load(str(scoring)).sim
+    )
+    runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    first = _latest(ledger, evaluation)["ridge_3m"]
+    scoring.write_text(scoring.read_text().replace("0.001 * flips", "0.002 * flips"))
+    changed = dataclasses.replace(evaluation, scorer=cli._load(str(scoring)).sim)
+    report = runs.run(ledger, [module.ridge(3)], changed, code_root=tmp_path)
+    assert report.fits_computed == 0 and report.scores_recorded == 1
+    assert _latest(ledger, evaluation)["ridge_3m"] != first
 
 
 def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resumes(

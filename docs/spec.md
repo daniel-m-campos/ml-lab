@@ -50,7 +50,7 @@ CREATE TABLE event (
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, resolution file sha (`uv.lock` or `requirements*.txt` if present), host facts |
 | fit_computed | dataset | fit id = hash(dataset, fit + save + load steps and config, train segments, their import shas, env lock sha) | run id, label, model sha, format and whether it is portable, import shas, env lock sha, duration; a blend's fit also hashes and records its members' fit ids |
 | predictions_computed | dataset | raw: hash(fit id, range, predict step and its import shas); postprocessed: hash(raw id, postprocess step with kwargs and its import shas) | blob sha and format, fold, window; a postprocessed one names its raw id and step; a blend's names its members' prediction ids, and its members' in-sample predictions over the train segments are predictions too, window `train:k` |
-| score_recorded | evaluation | score id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per window, and per window the scorer's series as an `arrow-arrays` blob with the fold row counts, so any uncertainty method can be run later |
+| score_recorded | evaluation | score id = hash(evaluation, pipeline, prediction ids, the scorer's import shas) | per-fold metrics, aggregate per window, and per window the scorer's series as an `arrow-arrays` blob with the fold row counts, so any uncertainty method can be run later |
 | pipeline_failed | evaluation | pipeline id | run id, error, traceback sha |
 
 Fits and predictions live on the dataset stream because a scoring change reuses them across evaluations. A score is "this pipeline, under this evaluation, from exactly these predictions"; a rerun that reproduces the same predictions writes no score, and a code change that changes them writes a new one.
@@ -64,7 +64,7 @@ Shipped as SQL in the same file so `sqlite3` shows them as tables. Every view ta
 | dataset, pipeline, evaluation, run, fit, prediction, score | one event type each, payload fields as columns |
 | fold_score, aggregate_score | `score_recorded` unpacked one row per (fold, window, metric) and per (window, metric); the aggregate row carries the fold count, fold mean and fold standard deviation of the metric and the series blob sha |
 | latest_score | per (evaluation, pipeline), the newest score, with the pipeline name and the dataset's id and source joined on |
-| score_fit | one row per (score, fit): the fits a score stands on, with their labels and seconds |
+| score_fit | one row per (score, fit): the fits a score stands on, including a blend's members, with the fit's pipeline, label and seconds |
 | failure | `pipeline_failed` with run and error |
 
 The payload is JSON so a shape change is a new payload version and an edited view, not a migration. Materialize a view only when a read is measured past a second.

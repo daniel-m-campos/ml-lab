@@ -155,14 +155,23 @@ JOIN dataset d ON d.id = e.dataset
 WHERE l.rn = 1;
 
 DROP VIEW IF EXISTS score_fit;
-CREATE VIEW score_fit AS SELECT DISTINCT s.id AS score,
-  s.stream AS evaluation, json_extract(s.payload,'$.pipeline') AS pipeline,
-  f.id AS fit, json_extract(f.payload,'$.label') AS label,
+CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, fit) AS (
+  SELECT s.id, s.stream, json_extract(s.payload,'$.pipeline'),
+         json_extract(pr.payload,'$.fit')
+  FROM event s, json_each(s.payload,'$.predictions') p
+  JOIN event pr ON pr.type='predictions_computed' AND pr.id = p.value
+  WHERE s.type='score_recorded'
+  UNION
+  SELECT so.score, so.evaluation, so.pipeline, m.value
+  FROM stands_on so
+  JOIN event f ON f.type='fit_computed' AND f.id = so.fit,
+  json_each(f.payload,'$.members') m
+)
+SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
+  json_extract(f.payload,'$.pipeline') AS fit_pipeline,
+  json_extract(f.payload,'$.label') AS label,
   json_extract(f.payload,'$.duration_s') AS duration_s
-FROM event s, json_each(s.payload,'$.predictions') p
-JOIN event pr ON pr.type='predictions_computed' AND pr.id = p.value
-JOIN event f ON f.type='fit_computed' AND f.id = json_extract(pr.payload,'$.fit')
-WHERE s.type='score_recorded';
+FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
 DROP VIEW IF EXISTS failure;
 CREATE VIEW failure AS SELECT seq, id, at, actor, host,

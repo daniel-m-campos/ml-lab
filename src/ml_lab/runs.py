@@ -175,7 +175,16 @@ def _run_pipeline(
                 fit_id, fold, index, window, rng
             )
     _score(
-        ledger, session, folds, pipeline, evaluation, predictions, report, start, log
+        ledger,
+        session,
+        folds,
+        pipeline,
+        evaluation,
+        predictions,
+        root,
+        report,
+        start,
+        log,
     )
 
 
@@ -383,16 +392,19 @@ def _score(
     pipeline: Pipeline,
     evaluation: Evaluation,
     predictions: dict[str, str],
+    root: pathlib.Path,
     report: RunReport,
     start: Callable[[], str],
     log: Callable[[str], None],
 ):
     name = pipeline.name or pipeline.id
+    scorer_shas = identity.import_shas((evaluation.scorer,), root)
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
             "pipeline": pipeline.id,
             "predictions": sorted(predictions.values()),
+            "scorer_shas": scorer_shas,
         }
     )
     if ledger.latest(Event.SCORE, score_id) is not None:
@@ -438,6 +450,7 @@ def _score(
             "folds": per_fold,
             "aggregate": aggregate,
             "series": stored,
+            "scorer_shas": scorer_shas,
         },
         id=score_id,
     )

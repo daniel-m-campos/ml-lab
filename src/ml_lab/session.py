@@ -81,4 +81,4 @@ class Session:
 
 def segments(rows: Rows) -> tuple[Range, ...]:
     """A range or a tuple of ranges as a tuple of ranges."""
-    return (rows,) if isinstance(rows[0], int) else rows
+    return (rows,) if isinstance(rows[0], (int, np.integer)) else rows
