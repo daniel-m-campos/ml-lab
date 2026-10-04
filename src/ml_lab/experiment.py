@@ -72,14 +72,21 @@ class Pipeline:
     """How a training range becomes a model, a model becomes predictions, and a model
     becomes bytes.
 
+    The slots are the three scopes of a time-ordered evaluation, not a chain of
+    transforms, and a step's slot says what it may read: ``features`` has dataset
+    scope (the whole session without its target columns, computed and stored once per
+    dataset, step, code and environment, however many pipelines and folds share it);
+    ``fit`` has fold scope (the prefix up to its train end, once per train range);
+    ``predict`` and ``postprocess`` have window scope (the prefix up to the window
+    end with targets masked, once per fit and range). A step belongs in the broadest
+    scope of what it reads, so a per-fold standardiser or a lagged target lives in
+    ``fit`` and ``predict``, and composition within a scope is the object ``fit``
+    returns, an sklearn pipeline included.
+
     ``save(model) -> bytes`` and ``load(bytes) -> model`` declare a format from
-    ``formats.KNOWN``. ``features(session) -> {name: array}`` is the optional step
-    before ``fit``: it sees the whole session without its target columns and adds one
-    column per array, computed and stored once per (dataset, step, its code and
-    environment) however many pipelines and folds share it, so lagged-target features
-    belong in ``fit`` and ``predict``. ``postprocess(predictions, session, range)`` is
-    the optional cheap stage after ``predict``: neutralise, clip, rank. Its knobs are
-    bound with
+    ``formats.KNOWN``. ``features(session) -> {name: array}`` adds one column per
+    array. ``postprocess(predictions, session, range)`` is the cheap stateless stage
+    after ``predict``: neutralise, clip, rank. Its knobs are bound with
     ``step.configured(**kwargs)`` so they enter the prediction's identity and not the
     fit's. A pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a
     fourth argument, the members' predictions as a list of arrays: over the window for
