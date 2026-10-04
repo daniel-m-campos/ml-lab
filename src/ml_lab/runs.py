@@ -37,7 +37,7 @@ from ml_lab.splits import Fold
 @dataclasses.dataclass
 class RunReport:
     """What a run wrote; ``run`` is empty when every fit, prediction and score already
-    existed.
+    existed. In a dry run the computed counts are what a run would compute.
     """
 
     run: str = ""
@@ -63,6 +63,7 @@ def run(
     *,
     code_root: pathlib.Path | None = None,
     log: Callable[[str], None] = lambda line: None,
+    dry: bool = False,
 ) -> RunReport:
     """Fit, predict and score each pipeline, reusing what the memo rule allows.
 
@@ -73,9 +74,11 @@ def run(
     resumes from there. Every step sees a prefix of the session: fit up to the end of
     its last train segment, predict, postprocess and the scorer up to the end of the
     window, so nothing after the cutoff can be read. Two names on one declaration are
-    refused, since the ledger
-    keeps one name per id and would score the second as a duplicate. ``log`` receives
-    one line per fit, prediction set and score as it is written.
+    refused, since the ledger keeps one name per id and would score the second as a
+    duplicate. ``log`` receives one line per feature set, fit, prediction set and score
+    as it is written. A ``dry`` run computes every id, looks each one up and writes
+    nothing; it logs what it would compute and, for a fit, which repo files moved
+    against the newest earlier fit of the same pipeline and label.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -96,7 +99,8 @@ def run(
     recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
     targets = tuple(recipe["targets"])
     schedule = evaluation.split.folds(session)
-    _declare_evaluation(ledger, evaluation, schedule)
+    if not dry:
+        _declare_evaluation(ledger, evaluation, schedule)
     root = code_root or identity.repo_root(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
     )
@@ -119,25 +123,29 @@ def run(
             )
         return report.run
 
+    context = _Run(
+        ledger,
+        session,
+        targets,
+        evaluation,
+        root,
+        report,
+        start,
+        log,
+        min(f.train[-1][1] for f in schedule),
+        dry,
+    )
     for pipeline in pipelines:
-        for declared in (pipeline, *pipeline.members):
-            _declare_pipeline(ledger, declared)
+        if not dry:
+            for declared in (pipeline, *pipeline.members):
+                _declare_pipeline(ledger, declared)
         try:
-            _run_pipeline(
-                ledger,
-                session,
-                targets,
-                schedule,
-                pipeline,
-                evaluation,
-                root,
-                report,
-                start,
-                log,
-            )
+            _run_pipeline(context, schedule, pipeline)
         except Exception as error:  # noqa: BLE001
             name = pipeline.name or pipeline.id
             report.failed[name] = f"{type(error).__name__}: {error}"
+            if dry:
+                continue
             ledger.append(
                 Event.FAILED,
                 evaluation.id,
@@ -155,21 +163,25 @@ def run(
 # Running one pipeline =================================================================
 
 
-def _run_pipeline(
-    ledger: Ledger,
-    session: Session,
-    targets: tuple[str, ...],
-    folds: list[Fold],
-    pipeline: Pipeline,
-    evaluation: Evaluation,
-    root: pathlib.Path,
-    report: RunReport,
-    start: Callable[[], str],
-    log: Callable[[str], None],
-):
-    stage = _Stage(
-        ledger, session, targets, pipeline, evaluation, root, report, start, log
-    )
+@dataclasses.dataclass
+class _Run:
+    """What every stage of one run shares."""
+
+    ledger: Ledger
+    session: Session
+    targets: tuple[str, ...]
+    evaluation: Evaluation
+    root: pathlib.Path
+    report: RunReport
+    start: Callable[[], str]
+    log: Callable[[str], None]
+    probe_at: int
+    dry: bool
+
+
+def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
+    stage = _Stage(context, pipeline)
+    report, root = context.report, context.root
     loaded: set[str] | None = set(sys.modules)
     predictions: dict[str, str] = {}
     for index, fold in enumerate(folds):
@@ -182,65 +194,63 @@ def _run_pipeline(
             predictions[f"{index}:{window}"] = stage.predictions(
                 fit_id, fold, index, window, rng
             )
-    _score(
-        ledger,
-        session,
-        folds,
-        pipeline,
-        evaluation,
-        predictions,
-        root,
-        report,
-        start,
-        log,
-    )
+    _score(context, folds, pipeline, predictions)
 
 
 class _Stage:
-    """One pipeline's memoized fits and predictions; a blend holds one per member."""
+    """One pipeline's memoized features, fits and predictions; a blend holds one per
+    member.
+    """
 
-    def __init__(
-        self,
-        ledger: Ledger,
-        session: Session,
-        targets: tuple[str, ...],
-        pipeline: Pipeline,
-        evaluation: Evaluation,
-        root: pathlib.Path,
-        report: RunReport,
-        start: Callable[[], str],
-        log: Callable[[str], None],
-    ):
-        self.ledger, self.session, self.pipeline = ledger, session, pipeline
-        self.targets, self.root = targets, root
-        self.evaluation, self.report, self.start, self.log = (
-            evaluation,
-            report,
-            start,
-            log,
+    def __init__(self, context: _Run, pipeline: Pipeline):
+        self.context, self.pipeline = context, pipeline
+        self.ledger, self.session, self.root = (
+            context.ledger,
+            context.session,
+            context.root,
         )
+        self.targets, self.evaluation, self.report = (
+            context.targets,
+            context.evaluation,
+            context.report,
+        )
+        self.start, self.log, self.dry = context.start, context.log, context.dry
         self.name = pipeline.name or pipeline.id
-        self.shas = identity.import_shas(pipeline.steps, root)
+        self.shas = identity.import_shas(pipeline.steps, self.root)
         self.steps = {
+            "features": (pipeline.features,) if pipeline.features else (),
             "fit": (pipeline.fit, pipeline.save, pipeline.load),
             "predict": (pipeline.predict,),
             "postprocess": (pipeline.postprocess,) if pipeline.postprocess else (),
         }
         self.stage_shas = {
-            stage: identity.import_shas(steps, root)
+            stage: identity.import_shas(steps, self.root)
             for stage, steps in self.steps.items()
         }
         self.takes_members = bool(pipeline.members) and _positional(pipeline.fit) > 3
-        _refuse_unseen_class(pipeline.config, self.stage_shas["fit"], root, "fit")
-        self.dists = identity.imported_dists(pipeline.steps, root)
-        self.env_lock = _text_blob(ledger, _lock_text(self.dists))
+        _refuse_unseen_class(pipeline.config, self.stage_shas["fit"], self.root, "fit")
+        self.dists = identity.imported_dists(pipeline.steps, self.root)
+        self.lock_text = _lock_text(self.dists)
+        self.env_lock = {
+            "sha": identity.bytes_hash(self.lock_text.encode()),
+            "format": formats.Format.TEXT,
+        }
+        self.feature_id = None
+        if pipeline.features is not None:
+            lock = _lock_text(identity.imported_dists((pipeline.features,), self.root))
+            self.feature_id = identity.content_hash(
+                {
+                    "dataset": self.evaluation.dataset,
+                    "features": pipeline.features,
+                    "import_shas": self.stage_shas["features"],
+                    "env_lock": identity.bytes_hash(lock.encode()),
+                }
+            )
+        self.featured: Session | None = None
         self.models: dict[str, Any] = {}
         self.fits: dict[str, str] = {}
         self.probed = False
-        self.members = [
-            _Stage(ledger, session, targets, m, evaluation, root, report, start, log)
-            for m in pipeline.members
-        ]
+        self.members = [_Stage(context, m) for m in pipeline.members]
 
     def fit(self, fold: Fold) -> str:
         if fold.label in self.fits:
@@ -259,19 +269,25 @@ class _Stage:
                 "import_shas": self.stage_shas["fit"],
                 "env_lock": self.env_lock["sha"],
                 **({"members": member_fits} if self.members else {}),
+                **({"features": self.feature_id} if self.feature_id else {}),
             }
         )
         if self.ledger.latest(Event.FIT, fit_id) is not None:
             self.report.fits_reused += 1
             return fit_id
+        if self.dry:
+            self.report.fits_computed += 1
+            self.log(f"would fit {self.name} {fold.label}: {self._why(fold.label)}")
+            return fit_id
         inputs = self._member_inputs(member_fits, fold) if self.takes_members else []
+        visible = self._visible(max(hi for _, hi in fold.train))
         run_id = self.start()
         started = time.perf_counter()
-        visible = self.session.upto(max(hi for _, hi in fold.train))
         model = self.pipeline.fit(visible, fold.train, self.pipeline.config, *inputs)
         duration = time.perf_counter() - started
         self._unchanged("fit")
         self.models[fit_id] = model
+        self.ledger.put_blob(self.lock_text.encode())
         self.ledger.append(
             Event.FIT,
             self.evaluation.dataset,
@@ -326,7 +342,9 @@ class _Stage:
         if self.ledger.latest(Event.PREDICTIONS, pred_id) is not None:
             self.report.predictions_reused += 1
             return pred_id
-        self.start()
+        if self.dry:
+            self.report.predictions_computed += 1
+            return pred_id
         where: dict[str, Any] = {
             "fit": fit_id,
             "range": list(rng),
@@ -334,7 +352,8 @@ class _Stage:
             "window": window,
             **({"members": member_preds} if self.members else {}),
         }
-        visible = self.session.upto(rng[1]).masked(self.targets, rng[0])
+        visible = self._visible(rng[1]).masked(self.targets, rng[0])
+        self.start()
         if self.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
             raw = _load_predictions(self.ledger, raw_id)
         else:
@@ -404,6 +423,104 @@ class _Stage:
         if moved:
             raise Refused(f"{self.name}: source changed during the run: {moved}; rerun")
 
+    def _visible(self, cut: int) -> Session:
+        """The session's first ``cut`` rows, with the pipeline's feature columns."""
+        if self.pipeline.features is None:
+            return self.session.upto(cut)
+        if self.featured is None:
+            self.featured = Session(
+                {**self.session.columns, **self._features()}, self.session.ts
+            )
+        return self.featured.upto(cut)
+
+    def _features(self) -> dict[str, np.ndarray]:
+        """The feature step's columns, computed once per feature id over the session
+        without its targets and probed at the schedule's first cutoff.
+        """
+        event = self.ledger.latest(Event.FEATURES, self.feature_id)
+        if event is not None:
+            blob = self.ledger.get_blob(event["payload"]["blob"]["sha"])
+            return formats.session_load(blob).columns
+        bare = Session(
+            {k: v for k, v in self.session.columns.items() if k not in self.targets},
+            self.session.ts,
+        )
+        started = time.perf_counter()
+        columns = self._feature_columns(bare)
+        duration = time.perf_counter() - started
+        self._unchanged("features")
+        at = self.context.probe_at
+        again = self._feature_columns(bare.frozen(at))
+        for name, values in columns.items():
+            if not np.array_equal(values[:at], again[name][:at], equal_nan=True):
+                raise Refused(
+                    f"{self.name}: features read past row {at}: column {name} "
+                    f"changed before row {at} when rows from {at} were frozen"
+                )
+        run_id = self.start()
+        self.ledger.append(
+            Event.FEATURES,
+            self.evaluation.dataset,
+            self.feature_id,
+            {
+                "pipeline": self.pipeline.id,
+                "run": run_id,
+                "features": identity.canonical(self.pipeline.features),
+                "import_shas": self.stage_shas["features"],
+                "columns": list(columns),
+                "probe_at": at,
+                "duration_s": duration,
+                "blob": {
+                    "sha": self.ledger.put_blob(
+                        formats.session_save(Session(columns, None))
+                    ),
+                    "format": PARQUET,
+                },
+            },
+            id=self.feature_id,
+        )
+        self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
+        return columns
+
+    def _feature_columns(self, bare: Session) -> dict[str, np.ndarray]:
+        out = self.pipeline.features(bare)
+        clash = sorted(set(out) & set(self.session.columns))
+        if clash:
+            raise Refused(f"{self.name}: features redefine dataset columns {clash}")
+        columns = {}
+        for name, values in out.items():
+            values = np.asarray(values)
+            if values.shape != (self.session.rows,):
+                raise Refused(
+                    f"{self.name}: feature {name} has shape {values.shape}, not "
+                    f"({self.session.rows},)"
+                )
+            columns[name] = values
+        return columns
+
+    def _why(self, label: str) -> str:
+        """Why a dry run would fit: the repo files and lock that moved against the
+        newest earlier fit of this pipeline and label.
+        """
+        rows = self.ledger.sql(
+            "SELECT import_shas, env_lock FROM fit WHERE pipeline = ? AND label = ? "
+            "ORDER BY seq DESC LIMIT 1",
+            (self.pipeline.id, label),
+        )
+        moved = ["no earlier fit of this pipeline and label"]
+        if rows:
+            before = json.loads(rows[0]["import_shas"])
+            moved = sorted(
+                k
+                for k in set(before) | set(self.shas)
+                if before.get(k) != self.shas.get(k)
+            )
+            if json.loads(rows[0]["env_lock"])["sha"] != self.env_lock["sha"]:
+                moved.append("environment lock")
+        if self.feature_id and not self.ledger.latest(Event.FEATURES, self.feature_id):
+            moved.append("features not computed")
+        return ", ".join(moved) or "train segments or members changed"
+
     def _probe(
         self,
         stage: str,
@@ -453,17 +570,15 @@ class _Stage:
 
 
 def _score(
-    ledger: Ledger,
-    session: Session,
-    folds: list[Fold],
-    pipeline: Pipeline,
-    evaluation: Evaluation,
-    predictions: dict[str, str],
-    root: pathlib.Path,
-    report: RunReport,
-    start: Callable[[], str],
-    log: Callable[[str], None],
+    context: _Run, folds: list[Fold], pipeline: Pipeline, predictions: dict[str, str]
 ):
+    ledger, session, evaluation, root = (
+        context.ledger,
+        context.session,
+        context.evaluation,
+        context.root,
+    )
+    report, start, log = context.report, context.start, context.log
     name = pipeline.name or pipeline.id
     scorer_shas = identity.import_shas((evaluation.scorer,), root)
     _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
@@ -477,6 +592,10 @@ def _score(
     )
     if ledger.latest(Event.SCORE, score_id) is not None:
         report.scores_reused += 1
+        return
+    if context.dry:
+        report.scores_recorded += 1
+        log(f"would score {name}")
         return
     per_fold, series = [], {}
     aggregate: dict[str, dict[str, float]] = {}

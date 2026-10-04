@@ -2,8 +2,10 @@
 
 Both Kaggle examples are panels: Optiver is (auction second, stock), JPX is (date,
 security). Each step used to rebuild the grid by hand; this does it once per session.
-Positions on the time axis are the session's distinct timestamps in order, so a grid
-of a prefix view is a prefix of the full grid and the lookahead guard still holds.
+Positions on the time axis are the session's distinct timestamps in order, so the
+time axis of a prefix view's grid is a prefix of the full one; a key first seen after
+the cutoff is absent, so compare grids through ``rows``. Build a Panel inside a
+``Pipeline.features`` step to grid once per dataset rather than once per call.
 
 Examples
 --------
@@ -20,6 +22,8 @@ array([10., 20., 11.])
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 
@@ -43,9 +47,11 @@ class Panel:
     def shape(self) -> tuple[int, int]:
         return len(self.times), len(self.keys)
 
-    def grid(self, name: str, fill: float = np.nan) -> np.ndarray:
+    def grid(
+        self, name: str, fill: float = np.nan, dtype: Any = np.float64
+    ) -> np.ndarray:
         """One column as a (time, key) array; a missing (time, key) holds ``fill``."""
-        out = np.full(self.shape, fill, dtype=np.float64)
+        out = np.full(self.shape, fill, dtype=dtype)
         out[self.ti, self.ki] = self.session.columns[name]
         return out
 

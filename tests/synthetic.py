@@ -75,6 +75,7 @@ def dataset(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
 class RidgeConfig:
     train_window_months: int
     alpha: float
+    columns: tuple[str, ...] = FEATURES
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,7 +93,7 @@ def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeMo
             add_months(session.date_at(end - 1), -config.train_window_months)
         )
         rows = ((max(start, since), end),)
-    X = session.matrix(rows, FEATURES)
+    X = session.matrix(rows, config.columns)
     y = session.column(TARGET, rows)
     x_mean, y_mean = X.mean(axis=0), y.mean()
     Xc = X - x_mean
@@ -104,7 +105,36 @@ def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeMo
 
 @step
 def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
-    return session.matrix(rng, FEATURES) @ model.weights + model.bias
+    columns = FEATURES + ("f0_lag",) if "f0_lag" in session.columns else FEATURES
+    return session.matrix(rng, columns) @ model.weights + model.bias
+
+
+FEATURE_CALLS: list[int] = []
+
+
+@step
+def lagged_f0(session: Session) -> dict[str, np.ndarray]:
+    """Yesterday's f0: row-causal, so the probe passes."""
+    FEATURE_CALLS.append(session.rows)
+    return {"f0_lag": np.concatenate([[np.nan], session.columns["f0"][:-1]])}
+
+
+@step
+def next_f0(session: Session) -> dict[str, np.ndarray]:
+    """Tomorrow's f0: reads past the row, so the probe refuses it."""
+    return {"f0_lag": np.roll(session.columns["f0"], -1)}
+
+
+@step
+def target_copy(session: Session) -> dict[str, np.ndarray]:
+    return {"f0_lag": session.columns[TARGET]}
+
+
+def featured(pipeline: Pipeline, features: Any = lagged_f0, name: str = "") -> Pipeline:
+    config = dataclasses.replace(pipeline.config, columns=FEATURES + ("f0_lag",))
+    return dataclasses.replace(
+        pipeline, features=features, config=config, name=name or pipeline.name + "_lag"
+    )
 
 
 FLAKY_CALLS: list[int] = []

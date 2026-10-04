@@ -40,6 +40,7 @@ class Event:
     PIPELINE: Final = "pipeline_declared"
     EVALUATION: Final = "evaluation_declared"
     RUN: Final = "run_started"
+    FEATURES: Final = "features_computed"
     FIT: Final = "fit_computed"
     PREDICTIONS: Final = "predictions_computed"
     SCORE: Final = "score_recorded"
@@ -92,6 +93,16 @@ CREATE VIEW run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.resolution.sha') AS resolution_sha,
   json_extract(payload,'$.pipelines') AS pipelines
 FROM event WHERE type='run_started';
+
+DROP VIEW IF EXISTS feature;
+CREATE VIEW feature AS SELECT seq, id, at, actor, host, stream AS dataset,
+  json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
+  json_extract(payload,'$.columns') AS columns,
+  json_extract(payload,'$.import_shas') AS import_shas,
+  json_extract(payload,'$.probe_at') AS probe_at,
+  json_extract(payload,'$.blob.sha') AS blob,
+  json_extract(payload,'$.duration_s') AS duration_s
+FROM event WHERE type='features_computed';
 
 DROP VIEW IF EXISTS fit;
 CREATE VIEW fit AS SELECT seq, id, at, actor, host, stream AS dataset,

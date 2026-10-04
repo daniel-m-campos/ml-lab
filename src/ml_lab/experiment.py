@@ -62,8 +62,13 @@ class Pipeline:
     becomes bytes.
 
     ``save(model) -> bytes`` and ``load(bytes) -> model`` declare a format from
-    ``formats.KNOWN``. ``postprocess(predictions, session, range)`` is the optional
-    cheap stage after ``predict``: neutralise, clip, rank. Its knobs are bound with
+    ``formats.KNOWN``. ``features(session) -> {name: array}`` is the optional step
+    before ``fit``: it sees the whole session without its target columns and adds one
+    column per array, computed and stored once per (dataset, step, its code and
+    environment) however many pipelines and folds share it, so lagged-target features
+    belong in ``fit`` and ``predict``. ``postprocess(predictions, session, range)`` is
+    the optional cheap stage after ``predict``: neutralise, clip, rank. Its knobs are
+    bound with
     ``step.configured(**kwargs)`` so they enter the prediction's identity and not the
     fit's. A pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a
     fourth argument, the members' predictions as a list of arrays: over the window for
@@ -84,6 +89,7 @@ class Pipeline:
     save: Callable
     load: Callable
     config: Any
+    features: Callable | None = None
     postprocess: Callable | None = None
     members: tuple[Pipeline, ...] = ()
     name: str = dataclasses.field(default="", metadata={"label": True})
@@ -98,7 +104,14 @@ class Pipeline:
 
     @property
     def steps(self) -> tuple[Callable, ...]:
-        stages = (self.fit, self.predict, self.save, self.load, self.postprocess)
+        stages = (
+            self.features,
+            self.fit,
+            self.predict,
+            self.save,
+            self.load,
+            self.postprocess,
+        )
         own = tuple(s for s in stages if s is not None)
         return own + tuple(s for m in self.members for s in m.steps)
 

@@ -56,6 +56,11 @@ def main(argv: list[str] | None = None) -> int:
         help="dataset id prefix or source name; default: the newest, when the ledger "
         "holds one source",
     )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="compute nothing, write nothing; say what a run would compute and why",
+    )
     p.set_defaults(handler=_run)
 
     args = parser.parse_args(argv)
@@ -80,7 +85,15 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     for evaluation in evaluations:
         if len(evaluations) > 1:
             print(f"evaluation {evaluation.name or evaluation.id}")
-        report = runs.run(ledger, pipelines, evaluation, log=print)
+        report = runs.run(ledger, pipelines, evaluation, log=print, dry=args.dry_run)
+        if args.dry_run:
+            print(
+                f"dry run: would compute fits {report.fits_computed}, predictions "
+                f"{report.predictions_computed}, scores {report.scores_recorded}; "
+                f"reuse {report.fits_reused}, {report.predictions_reused}, "
+                f"{report.scores_reused}"
+            )
+            continue
         if not report.run:
             print(
                 f"up to date: {report.scores_reused} scores; {report.fits_reused} fits "

@@ -436,6 +436,62 @@ def test_untracked_step_modules_are_in_the_run_diff(ledger, tmp_path):
     assert git["dirty"] and "new_steps.py" in diff and "+y = 2" in diff
 
 
+def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
+    ledger, evaluation
+):
+    synthetic.FEATURE_CALLS.clear()
+    a = synthetic.featured(synthetic.ridge(1))
+    b = synthetic.featured(synthetic.ridge(3))
+    report = _run(ledger, evaluation, a, b)
+    assert not report.failed and len(synthetic.FEATURE_CALLS) == 2
+    rows = ledger.sql("SELECT columns, probe_at FROM feature")
+    assert len(rows) == 1 and json.loads(rows[0]["columns"]) == ["f0_lag"]
+    assert ledger.sql("SELECT COUNT(*) AS n FROM fit")[0]["n"] == report.fits_computed
+    assert set(_latest(ledger, evaluation)) == {"ridge_1m_lag", "ridge_3m_lag"}
+    assert a.id != synthetic.ridge(1).id
+    leaky = synthetic.featured(synthetic.ridge(1), synthetic.next_f0, "leaky")
+    copier = synthetic.featured(synthetic.ridge(1), synthetic.target_copy, "copier")
+    report = _run(ledger, evaluation, leaky, copier)
+    assert "features read past row" in report.failed["leaky"]
+    assert synthetic.TARGET in report.failed["copier"]
+    assert ledger.sql("SELECT COUNT(*) AS n FROM feature")[0]["n"] == 1
+
+
+def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
+    code = tmp_path / "steps_d.py"
+    code.write_text((REPO / "tests" / "synthetic.py").read_text())
+    module = cli._load(str(code))
+    evaluation = module.evaluation(module.dataset(ledger))
+    runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    code.write_text(code.read_text().replace("0.01 * np.sum", "0.02 * np.sum"))
+    seq = ledger.sql("SELECT max(seq) AS m FROM event")[0]["m"]
+    blobs, lines = set(ledger.blobs.iterdir()), []
+    report = runs.run(
+        ledger,
+        [module.ridge(3), module.featured(module.ridge(3))],
+        evaluation,
+        code_root=tmp_path,
+        dry=True,
+        log=lines.append,
+    )
+    folds = len(evaluation.split.folds(load(ledger, evaluation.dataset)))
+    assert report.run == "" and report.fits_computed == 2 * folds
+    assert report.scores_recorded == 2 and not report.failed
+    would = [line for line in lines if line.startswith("would fit")]
+    assert len(would) == 2 * folds
+    plain = [line for line in would if "ridge_3m " in line]
+    assert len(plain) == folds and all(line.endswith(": steps_d.py") for line in plain)
+    lag = [line for line in would if "ridge_3m_lag" in line]
+    assert all(
+        line.endswith(
+            "no earlier fit of this pipeline and label, features not computed"
+        )
+        for line in lag
+    )
+    assert ledger.sql("SELECT max(seq) AS m FROM event")[0]["m"] == seq
+    assert set(ledger.blobs.iterdir()) == blobs
+
+
 def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     ledger, dataset, evaluation
 ):
@@ -771,6 +827,7 @@ def test_a_panel_grids_a_session_by_time_and_key_and_back():
     assert panel.shape == (2, 2) and np.isnan(grid[1, 1])
     assert np.array_equal(grid[:, 0], [10.0, 11.0])
     assert np.array_equal(panel.rows(grid), session.columns["px"])
+    assert panel.grid("px", dtype=np.float32).dtype == np.float32
     demeaned = grid - np.nanmean(grid, axis=1, keepdims=True)
     assert np.allclose(panel.rows(demeaned), [-5.0, 5.0, 0.0])
     assert Panel(session.upto(2), "stock").shape == (1, 2)
