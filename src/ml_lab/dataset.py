@@ -1,8 +1,9 @@
 """Recording a dataset and loading it back.
 
 A dataset is the rows of one (source, params, window) passed through filter steps,
-with named target columns. Its id covers the whole recipe; the event records the bytes
-as Parquet.
+with named target columns. Its id is the data: column names, dtypes and bytes, so a
+loader fix that changes rows is a new dataset and an edit that changes nothing is not.
+The recipe rides on the event as provenance; the bytes are Parquet.
 
 Examples
 --------
@@ -14,6 +15,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+
+import numpy as np
 
 from ml_lab import dates, formats, identity
 from ml_lab.ledger import Event, Ledger
@@ -39,14 +42,14 @@ def record(
         "filters": list(filters),
         "targets": list(targets),
     }
-    dataset_id = identity.content_hash(recipe)
-    if ledger.latest(Event.DATASET, dataset_id) is not None:
-        return dataset_id
     for filt in filters:
         session = filt(session)
     missing = [t for t in targets if t not in session.columns]
     if missing:
         raise KeyError(f"targets not in session: {missing}")
+    dataset_id = data_id(session)
+    if ledger.latest(Event.DATASET, dataset_id) is not None:
+        return dataset_id
     sha = ledger.put_blob(formats.session_save(session))
     payload = {
         "source": source,
@@ -57,6 +60,16 @@ def record(
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
     return dataset_id
+
+
+def data_id(session: Session) -> str:
+    """The content id of a session: its column names, dtypes and bytes."""
+    ts = None if session.ts is None else identity.bytes_hash(session.ts.tobytes())
+    columns = {
+        name: [str(a.dtype), identity.bytes_hash(np.ascontiguousarray(a).tobytes())]
+        for name, a in session.columns.items()
+    }
+    return identity.content_hash({"ts": ts, "columns": columns})
 
 
 def load(ledger: Ledger, dataset_id: str) -> Session:

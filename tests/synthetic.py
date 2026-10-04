@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import pickle
 from typing import Any
 
 import numpy as np
@@ -128,6 +129,26 @@ def ridge_save(model: RidgeModel) -> bytes:
 def ridge_load(payload: bytes) -> RidgeModel:
     arrays = formats.arrays_load(payload)
     return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
+
+
+@step
+def scale(pred: np.ndarray, session: Session, rng: Range, factor: float) -> np.ndarray:
+    return pred * factor
+
+
+@step(format=formats.Format.PICKLE)
+def pickle_save(model: RidgeModel) -> bytes:
+    return pickle.dumps(model)
+
+
+@step
+def pickle_load(payload: bytes) -> RidgeModel:
+    return pickle.loads(payload)
+
+
+@step(format="zip")
+def zip_save(model: RidgeModel) -> bytes:
+    return b""
 
 
 @dataclasses.dataclass(frozen=True)

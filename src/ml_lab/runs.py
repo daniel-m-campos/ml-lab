@@ -48,6 +48,9 @@ class RunReport:
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
+PARQUET = formats.Format.PARQUET
+
+
 # Public Functions =====================================================================
 
 
@@ -79,9 +82,10 @@ def run(
                 f"pipelines {names[pipeline.id]} and {name} declare the same steps and "
                 f"config, one id {pipeline.id}; rename or change one"
             )
-        if pipeline.format is None:
+        if pipeline.format not in formats.KNOWN:
             raise Refused(
-                f"pipeline {pipeline.name or pipeline.id}: save step declares no format"
+                f"pipeline {name}: save step declares format {pipeline.format!r}, "
+                f"not one of {sorted(formats.KNOWN)}"
             )
     session = dataset.load(ledger, evaluation.dataset)
     schedule = evaluation.split.folds(session)
@@ -155,6 +159,14 @@ def _run_pipeline(
 ):
     name = pipeline.name or pipeline.id
     shas = identity.import_shas(pipeline.steps, root)
+    stage_shas = {
+        stage: identity.import_shas(steps, root)
+        for stage, steps in {
+            "fit": (pipeline.fit, pipeline.save, pipeline.load),
+            "predict": (pipeline.predict,),
+            "postprocess": (pipeline.postprocess,) if pipeline.postprocess else (),
+        }.items()
+    }
     dists = identity.imported_dists(pipeline.steps, root)
     env_lock = _text_blob(ledger, _lock_text(dists))
     loaded: set[str] | None = set(sys.modules)
@@ -166,9 +178,9 @@ def _run_pipeline(
         fit_id = identity.content_hash(
             {
                 "dataset": evaluation.dataset,
-                "pipeline": pipeline.id,
+                "pipeline": pipeline.fit_declaration,
                 "train": train,
-                "import_shas": shas,
+                "import_shas": stage_shas["fit"],
                 "env_lock": env_lock["sha"],
             }
         )
@@ -195,6 +207,7 @@ def _run_pipeline(
                 "model": {
                     "sha": ledger.put_blob(pipeline.save(model)),
                     "format": pipeline.format,
+                    "portable": formats.KNOWN[pipeline.format],
                 },
             },
             id=fit_id,
@@ -203,38 +216,65 @@ def _run_pipeline(
         log(f"fit {name} {fold.label} {duration:.1f}s")
         return fit_id
 
-    def ensure_predictions(fit_id: str, index: int, window: str, rng: Range) -> str:
-        pred_id = identity.content_hash({"fit": fit_id, "range": list(rng)})
-        if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
-            report.predictions_reused += 1
-            return pred_id
-        start()
-        if fit_id not in models:
-            fit = ledger.latest(Event.FIT, fit_id)
-            models[fit_id] = pipeline.load(
-                ledger.get_blob(fit["payload"]["model"]["sha"])
-            )
-        pred = np.asarray(
-            pipeline.predict(models[fit_id], session, rng), dtype=np.float64
-        )
+    def write_predictions(pred_id: str, pred: np.ndarray, payload: dict[str, Any]):
+        pred = np.asarray(pred, dtype=np.float64)
+        blob = {"sha": ledger.put_blob(formats.series_save(pred)), "format": PARQUET}
         ledger.append(
             Event.PREDICTIONS,
             evaluation.dataset,
             pred_id,
-            {
-                "fit": fit_id,
-                "range": list(rng),
-                "fold": index,
-                "window": window,
-                "blob": {
-                    "sha": ledger.put_blob(formats.series_save(pred)),
-                    "format": formats.Format.PARQUET,
-                },
-            },
+            {**payload, "blob": blob},
             id=pred_id,
         )
         report.predictions_computed += 1
-        log(f"predictions {name} {window} rows {rng[0]}:{rng[1]}")
+        return pred
+
+    def ensure_predictions(fit_id: str, index: int, window: str, rng: Range) -> str:
+        raw_id = identity.content_hash(
+            {
+                "fit": fit_id,
+                "range": list(rng),
+                "predict": pipeline.predict,
+                "import_shas": stage_shas["predict"],
+            }
+        )
+        pred_id = raw_id
+        if pipeline.postprocess is not None:
+            pred_id = identity.content_hash(
+                {
+                    "raw": raw_id,
+                    "postprocess": pipeline.postprocess,
+                    "import_shas": stage_shas["postprocess"],
+                }
+            )
+        if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
+            report.predictions_reused += 1
+            return pred_id
+        start()
+        where = {"fit": fit_id, "range": list(rng), "fold": index, "window": window}
+        if ledger.latest(Event.PREDICTIONS, raw_id) is not None:
+            raw = _load_predictions(ledger, raw_id)
+        else:
+            if fit_id not in models:
+                fit = ledger.latest(Event.FIT, fit_id)
+                models[fit_id] = pipeline.load(
+                    ledger.get_blob(fit["payload"]["model"]["sha"])
+                )
+            raw = write_predictions(
+                raw_id, pipeline.predict(models[fit_id], session, rng), where
+            )
+            log(f"predictions {name} {window} rows {rng[0]}:{rng[1]}")
+        if pipeline.postprocess is not None:
+            write_predictions(
+                pred_id,
+                pipeline.postprocess(raw, session, rng),
+                {
+                    **where,
+                    "raw": raw_id,
+                    "postprocess": identity.canonical(pipeline.postprocess),
+                },
+            )
+            log(f"postprocess {name} {window} rows {rng[0]}:{rng[1]}")
         return pred_id
 
     for index, fold in enumerate(folds):

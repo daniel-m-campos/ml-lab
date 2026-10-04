@@ -58,9 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(handler=_run)
 
     args = parser.parse_args(argv)
-    ledger = Ledger(pathlib.Path(args.root))
     try:
-        return args.handler(args, ledger)
+        return args.handler(args, Ledger(pathlib.Path(args.root)))
     except (Refused, KeyError, ImportError) as refused:
         print(f"lab {args.command}: {refused}", file=sys.stderr)
         return 1

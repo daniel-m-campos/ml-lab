@@ -19,6 +19,7 @@ import pytest
 from ml_lab import cli, identity, runs, splits
 from ml_lab.dataset import load, record
 from ml_lab.ledger import Event, Ledger, Refused
+from ml_lab.runs import _load_predictions
 from ml_lab.session import Session
 from tests import synthetic
 
@@ -67,6 +68,18 @@ def _latest(ledger, evaluation) -> dict[str, str]:
 def test_ingesting_the_same_recipe_twice_appends_one_event(ledger):
     assert synthetic.dataset(ledger) == synthetic.dataset(ledger)
     assert _types(ledger) == {Event.DATASET: 1}
+
+
+def test_the_dataset_id_is_the_data_not_the_recipe(ledger, dataset):
+    same_rows = synthetic.dataset(ledger, seed=7)
+    assert same_rows == dataset
+    kwargs = dict(filters=(synthetic.keep_all,), targets=(synthetic.TARGET,))
+    rows = synthetic.generate(
+        start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
+    )
+    assert record(ledger, rows, source="other", params={"v": 2}, **kwargs) == dataset
+    assert synthetic.dataset(ledger, seed=8) != dataset
+    assert _types(ledger) == {Event.DATASET: 2}
 
 
 def test_the_dataset_blob_opens_with_pyarrow_alone(ledger, dataset):
@@ -213,6 +226,41 @@ def test_adding_a_pipeline_costs_only_its_own_fits(ledger, dataset, evaluation):
     assert report.fits_computed == len(folds) and report.scores_recorded == 1
     assert report.fits_reused == len(folds) and report.scores_reused == 1
     assert len(ledger.events(Event.RUN)) == 2
+
+
+def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
+    ledger, dataset, evaluation
+):
+    folds = evaluation.split.folds(load(ledger, dataset))
+    windows = sum(len(f.windows) for f in folds)
+    plain = synthetic.ridge(1)
+    doubled = dataclasses.replace(
+        plain, postprocess=synthetic.scale.configured(factor=2.0), name="ridge_1m_x2"
+    )
+    assert doubled.id != plain.id
+    report = _run(ledger, evaluation, plain, doubled)
+    assert report.fits_computed == len(folds) and report.fits_reused == len(folds)
+    assert report.predictions_computed == 2 * windows
+    assert report.predictions_reused == 0 and report.scores_recorded == 2
+    post = [e for e in ledger.events(Event.PREDICTIONS) if "raw" in e["payload"]]
+    assert len(post) == windows
+    assert post[0]["payload"]["postprocess"]["kwargs"] == {"factor": 2.0}
+    raw = _load_predictions(ledger, post[0]["payload"]["raw"])
+    assert np.allclose(_load_predictions(ledger, post[0]["id"]), 2 * raw)
+    again = _run(ledger, evaluation, plain, doubled)
+    assert again.run == "" and again.predictions_reused == 2 * windows
+
+
+def test_pickle_is_marked_not_portable_and_an_unknown_format_is_refused(
+    ledger, dataset, evaluation
+):
+    pickled = dataclasses.replace(
+        synthetic.ridge(1), save=synthetic.pickle_save, load=synthetic.pickle_load
+    )
+    _run(ledger, evaluation, pickled)
+    assert ledger.sql("SELECT portable FROM fit")[0]["portable"] == 0
+    with pytest.raises(Refused, match="'zip', not one of"):
+        _run(ledger, evaluation, dataclasses.replace(pickled, save=synthetic.zip_save))
 
 
 def test_fits_land_on_the_dataset_stream_and_scores_on_the_evaluation_stream(

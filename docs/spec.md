@@ -44,12 +44,12 @@ CREATE TABLE event (
 
 | type | stream | key | payload |
 |---|---|---|---|
-| dataset_recorded | dataset | dataset id = hash(recipe) | source, window, recipe (params, filter paths, targets), rows, blob sha |
-| pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
+| dataset_recorded | dataset | dataset id = hash(column names, dtypes, bytes) | source, window, recipe (params, filter paths, targets) as provenance, rows, blob sha |
+| pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit, predict, save, load and postprocess paths with bound kwargs, config |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, split, scorer path, config, metric directions, the expanded folds (label, train segments, named windows) |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, resolution file sha (`uv.lock` or `requirements*.txt` if present), host facts |
-| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock sha) | run id, cutoff, model sha and format, import shas, env lock sha, duration |
-| predictions_computed | dataset | hash(fit id, range) | blob sha and format |
+| fit_computed | dataset | fit id = hash(dataset, fit + save + load steps and config, train segments, their import shas, env lock sha) | run id, label, model sha, format and whether it is portable, import shas, env lock sha, duration |
+| predictions_computed | dataset | raw: hash(fit id, range, predict step and its import shas); postprocessed: hash(raw id, postprocess step with kwargs and its import shas) | blob sha and format, fold, window; a postprocessed one names its raw id and step |
 | score_recorded | evaluation | score id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per age |
 | pipeline_failed | evaluation | pipeline id | run id, error, traceback sha |
 
@@ -87,7 +87,7 @@ Day one, because rows written wrong cannot be repaired: ids that merge across ho
 
 ## Blobs
 
-Every blob opens without this Python environment, and every sha reference in a payload carries a `format`. Pickle is never written.
+Every sha reference in a payload carries a `format` from `formats.KNOWN`, which also says whether the format opens without this Python environment. Every shipped format does except `pickle`, admitted because scikit-learn has nothing else; a fit whose model is a pickle carries `portable = false`, so `SELECT ... FROM fit WHERE NOT portable` names the models hostage to the environment. A save step declaring a format outside the set is refused at run.
 
 | blob | format name | bytes |
 |---|---|---|
@@ -106,7 +106,7 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'ml_lab.sqlite' (TYPE sqlit
 ## From inception to experimentation
 
 1. A project is a git repo exposing three module attributes, in one file or several: `dataset(ledger, *args)`, `pipelines` and `evaluation` (a value or a function of the dataset id). `lab` reads them by name, so a file holding only new pipelines runs beside the project's declarations.
-2. `lab ingest` appends `dataset_recorded` and stores the rows under their sha. Same recipe, same id, no write.
+2. `lab ingest` appends `dataset_recorded` and stores the rows under their sha. The id is the data, so a loader fix that changes rows is a new dataset and a re-ingest of identical rows writes nothing.
 3. The first `lab run` appends `evaluation_declared` with the schedule expanded once.
 4. A `lab run` with work appends `run_started`, then only the fits and predictions the memo rule does not cover, then one `score_recorded` per pipeline whose predictions are new. A rerun of an unchanged tree writes nothing and prints what it reused; adding one pipeline costs only that pipeline's fits, predictions and score.
 5. Read with SQL: the latest score per pipeline, its aggregate and per-fold scores, the failures. Add a `Pipeline`, `lab run`, query again.

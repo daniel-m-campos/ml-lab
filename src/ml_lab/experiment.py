@@ -60,8 +60,11 @@ class Pipeline:
     """How a training range becomes a model, a model becomes predictions, and a model
     becomes bytes.
 
-    ``save(model) -> bytes`` and ``load(bytes) -> model`` name a format that opens
-    without Python.
+    ``save(model) -> bytes`` and ``load(bytes) -> model`` declare a format from
+    ``formats.KNOWN``. ``postprocess(predictions, session, range)`` is the optional
+    cheap stage after ``predict``: neutralise, clip, rank. Its knobs are bound with
+    ``step.configured(**kwargs)`` so they enter the prediction's identity and not the
+    fit's.
     """
 
     fit: Callable
@@ -69,6 +72,7 @@ class Pipeline:
     save: Callable
     load: Callable
     config: Any
+    postprocess: Callable | None = None
     name: str = dataclasses.field(default="", metadata={"label": True})
 
     @property
@@ -81,7 +85,18 @@ class Pipeline:
 
     @property
     def steps(self) -> tuple[Callable, ...]:
-        return (self.fit, self.predict, self.save, self.load)
+        stages = (self.fit, self.predict, self.save, self.load, self.postprocess)
+        return tuple(s for s in stages if s is not None)
+
+    @property
+    def fit_declaration(self) -> dict[str, Any]:
+        """What a fit depends on: the fit, save and load steps and the config."""
+        return {
+            "fit": self.fit,
+            "save": self.save,
+            "load": self.load,
+            "config": self.config,
+        }
 
     def with_config(self, **changes: Any) -> Pipeline:
         """A copy with config fields replaced."""

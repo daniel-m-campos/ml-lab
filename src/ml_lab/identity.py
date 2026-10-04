@@ -49,7 +49,19 @@ def register(func: Callable, **meta: Any) -> Callable:
     """
     setattr(func, STEP_ATTR, f"{func.__module__}:{func.__qualname__}")
     func.__ml_lab_meta__ = meta  # type: ignore[attr-defined]
+    func.configured = functools.partial(configured, func)  # type: ignore[attr-defined]
     return func
+
+
+def configured(func: Callable, **kwargs: Any) -> Callable:
+    """A step bound to keyword arguments that enter its identity, so two settings of
+    one function are two steps without two definitions.
+    """
+    bound = functools.partial(func, **kwargs)
+    setattr(bound, STEP_ATTR, step_ref(func))
+    bound.__ml_lab_meta__ = {**func.__ml_lab_meta__, "kwargs": kwargs}
+    bound.__module__ = func.__module__
+    return bound
 
 
 def step_ref(func: Callable) -> str:
@@ -69,7 +81,11 @@ def canonical(obj: Any) -> Any:
     if isinstance(obj, (np.integer, np.floating)):
         return obj.item()
     if callable(obj):
-        return {"__step__": step_ref(obj)}
+        kwargs = getattr(obj, "__ml_lab_meta__", {}).get("kwargs")
+        return {
+            "__step__": step_ref(obj),
+            **({"kwargs": canonical(kwargs)} if kwargs else {}),
+        }
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         fields = {
             f.name: canonical(getattr(obj, f.name))

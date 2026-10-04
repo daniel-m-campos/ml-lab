@@ -25,7 +25,7 @@ from typing import Any, Final
 
 from ml_lab import identity
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 ACTOR_ENV = "ML_LAB_ACTOR"
 
 
@@ -98,6 +98,7 @@ CREATE VIEW fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.import_shas') AS import_shas,
   json_extract(payload,'$.model.sha') AS model,
   json_extract(payload,'$.model.format') AS format,
+  json_extract(payload,'$.model.portable') AS portable,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='fit_computed';
 
@@ -107,7 +108,9 @@ CREATE VIEW prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.range[0]') AS range_start,
   json_extract(payload,'$.range[1]') AS range_end,
   json_extract(payload,'$.fold') AS fold,
-  json_extract(payload,'$.window') AS window, json_extract(payload,'$.blob.sha') AS blob
+  json_extract(payload,'$.window') AS window,
+  json_extract(payload,'$.blob.sha') AS blob, json_extract(payload,'$.raw') AS raw,
+  json_extract(payload,'$.postprocess') AS postprocess
 FROM event WHERE type='predictions_computed';
 
 DROP VIEW IF EXISTS score;
@@ -174,8 +177,9 @@ class Ledger:
         self._db.execute("PRAGMA journal_mode=WAL")
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, SCHEMA_VERSION):
-            raise RuntimeError(
-                f"ledger schema {version}, this build is {SCHEMA_VERSION}"
+            raise Refused(
+                f"ledger schema {version}, this build is {SCHEMA_VERSION}; the log is a "
+                "cache of code plus data, delete the root and rerun"
             )
         self._db.executescript(DDL + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};")
 

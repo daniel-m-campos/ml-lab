@@ -32,8 +32,22 @@ PREDICTION = "prediction"
 class Format:
     PARQUET = "parquet"
     ARROW_ARRAYS = "arrow-arrays"
+    BONSAI_MSGPACK = "bonsai-msgpack"
     DIFF = "text/x-diff"
     TEXT = "text/plain"
+    PICKLE = "pickle"
+
+
+KNOWN: dict[str, bool] = {
+    Format.PARQUET: True,
+    Format.ARROW_ARRAYS: True,
+    Format.BONSAI_MSGPACK: True,
+    Format.DIFF: True,
+    Format.TEXT: True,
+    Format.PICKLE: False,
+}
+"""Format name to whether it opens without this Python environment. A save step must
+declare one of these; add an entry to admit a new format."""
 
 
 # Sessions =============================================================================
