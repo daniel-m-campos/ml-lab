@@ -64,7 +64,10 @@ class Pipeline:
     ``formats.KNOWN``. ``postprocess(predictions, session, range)`` is the optional
     cheap stage after ``predict``: neutralise, clip, rank. Its knobs are bound with
     ``step.configured(**kwargs)`` so they enter the prediction's identity and not the
-    fit's.
+    fit's. A pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a
+    fourth argument, the members' predictions as a list of arrays (over the train
+    segments for ``fit``, over the window for ``predict``), and the members' fits and
+    predictions are memoized on their own.
     """
 
     fit: Callable
@@ -73,6 +76,7 @@ class Pipeline:
     load: Callable
     config: Any
     postprocess: Callable | None = None
+    members: tuple[Pipeline, ...] = ()
     name: str = dataclasses.field(default="", metadata={"label": True})
 
     @property
@@ -86,7 +90,8 @@ class Pipeline:
     @property
     def steps(self) -> tuple[Callable, ...]:
         stages = (self.fit, self.predict, self.save, self.load, self.postprocess)
-        return tuple(s for s in stages if s is not None)
+        own = tuple(s for s in stages if s is not None)
+        return own + tuple(s for m in self.members for s in m.steps)
 
     @property
     def fit_declaration(self) -> dict[str, Any]:

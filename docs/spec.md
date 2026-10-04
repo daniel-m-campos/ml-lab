@@ -45,11 +45,11 @@ CREATE TABLE event (
 | type | stream | key | payload |
 |---|---|---|---|
 | dataset_recorded | dataset | dataset id = hash(column names, dtypes, bytes) | source, window, recipe (params, filter paths, targets) as provenance, rows, blob sha |
-| pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit, predict, save, load and postprocess paths with bound kwargs, config |
+| pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit, predict, save, load and postprocess paths with bound kwargs, config, member declarations for a blend |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, split, scorer path, config, metric directions, the expanded folds (label, train segments, named windows) |
 | run_started | evaluation | run id (ULID) | commit, dirty, diff sha, resolution file sha (`uv.lock` or `requirements*.txt` if present), host facts |
-| fit_computed | dataset | fit id = hash(dataset, fit + save + load steps and config, train segments, their import shas, env lock sha) | run id, label, model sha, format and whether it is portable, import shas, env lock sha, duration |
-| predictions_computed | dataset | raw: hash(fit id, range, predict step and its import shas); postprocessed: hash(raw id, postprocess step with kwargs and its import shas) | blob sha and format, fold, window; a postprocessed one names its raw id and step |
+| fit_computed | dataset | fit id = hash(dataset, fit + save + load steps and config, train segments, their import shas, env lock sha) | run id, label, model sha, format and whether it is portable, import shas, env lock sha, duration; a blend's fit also hashes and records its members' fit ids |
+| predictions_computed | dataset | raw: hash(fit id, range, predict step and its import shas); postprocessed: hash(raw id, postprocess step with kwargs and its import shas) | blob sha and format, fold, window; a postprocessed one names its raw id and step; a blend's names its members' prediction ids, and its members' in-sample predictions over the train segments are predictions too, window `train:k` |
 | score_recorded | evaluation | score id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per window, and per window the scorer's series as an `arrow-arrays` blob with the fold row counts, so any uncertainty method can be run later |
 | pipeline_failed | evaluation | pipeline id | run id, error, traceback sha |
 

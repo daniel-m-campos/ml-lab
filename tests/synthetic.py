@@ -154,6 +154,57 @@ def pickle_load(payload: bytes) -> RidgeModel:
     return pickle.loads(payload)
 
 
+@dataclasses.dataclass(frozen=True)
+class BlendConfig:
+    shrink: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
+class BlendModel:
+    weights: np.ndarray
+
+
+@step
+def blend_fit(
+    session: Session, train: Segments, config: BlendConfig, members: list[np.ndarray]
+) -> BlendModel:
+    """Least squares on the members' in-sample predictions, shrunk toward equal."""
+    x = np.column_stack(members)
+    y = session.column(TARGET, train)
+    fitted = np.linalg.lstsq(x, y, rcond=None)[0]
+    equal = np.full(len(members), 1.0 / len(members))
+    return BlendModel((1 - config.shrink) * fitted + config.shrink * equal)
+
+
+@step
+def blend_predict(
+    model: BlendModel, session: Session, rng: Range, members: list[np.ndarray]
+) -> np.ndarray:
+    return np.column_stack(members) @ model.weights
+
+
+@step(format=formats.Format.ARROW_ARRAYS)
+def blend_save(model: BlendModel) -> bytes:
+    return formats.arrays_save({"weights": model.weights})
+
+
+@step
+def blend_load(payload: bytes) -> BlendModel:
+    return BlendModel(formats.arrays_load(payload)["weights"])
+
+
+def blend(*members: Pipeline, shrink: float = 1.0) -> Pipeline:
+    return Pipeline(
+        name="blend_" + "_".join(m.name for m in members),
+        fit=blend_fit,
+        predict=blend_predict,
+        save=blend_save,
+        load=blend_load,
+        config=BlendConfig(shrink),
+        members=members,
+    )
+
+
 @step(format="zip")
 def zip_save(model: RidgeModel) -> bytes:
     return b""

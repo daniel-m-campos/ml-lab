@@ -268,6 +268,28 @@ def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     assert again.run == "" and again.predictions_reused == 2 * windows
 
 
+def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evaluation):
+    folds = evaluation.split.folds(load(ledger, dataset))
+    windows = sum(len(f.windows) for f in folds)
+    one, three = synthetic.ridge(1), synthetic.ridge(3)
+    _run(ledger, evaluation, one, three)
+    report = _run(ledger, evaluation, synthetic.blend(one, three))
+    assert report.fits_reused == 2 * len(folds) and report.fits_computed == len(folds)
+    assert report.predictions_reused == 2 * windows
+    assert report.predictions_computed == windows + 2 * len(folds)
+    assert report.scores_recorded == 1
+    blended = [e for e in ledger.events(Event.PREDICTIONS) if "members" in e["payload"]]
+    first = next(e for e in blended if e["payload"]["window"] != "train:0")
+    parts = [_load_predictions(ledger, p) for p in first["payload"]["members"]]
+    assert np.allclose(_load_predictions(ledger, first["id"]), np.mean(parts, axis=0))
+    fit = ledger.latest(Event.FIT, first["payload"]["fit"])
+    assert len(fit["payload"]["members"]) == 2
+    assert _run(ledger, evaluation, synthetic.blend(one, three)).run == ""
+    assert _run(
+        ledger, evaluation, synthetic.blend(one, three, shrink=0.5)
+    ).fits_computed == len(folds)
+
+
 def test_pickle_is_marked_not_portable_and_an_unknown_format_is_refused(
     ledger, dataset, evaluation
 ):
@@ -470,14 +492,11 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     assert db.execute("SELECT DISTINCT source FROM latest_score").fetchall() == [
         ("synthetic",)
     ]
-    folds_, std, sha = db.execute(
-        "SELECT folds, fold_std, series FROM aggregate_score WHERE window = '1'"
+    scored, folds_, std, sha = db.execute(
+        "SELECT score, folds, fold_std, series FROM aggregate_score WHERE window = '1'"
     ).fetchone()
     assert folds_ == len(folds) and std > 0
-    score = ledger.latest(
-        Event.SCORE, db.execute("SELECT score FROM latest_score").fetchone()[0]
-    )
-    stored = score["payload"]["series"]["1"]
+    stored = ledger.latest(Event.SCORE, scored)["payload"]["series"]["1"]
     assert stored["sha"] == sha
     assert len(_load_series(ledger, sha)) == sum(stored["fold_rows"])
     assert db.execute("SELECT resolution, pipelines FROM run").fetchone()[1]

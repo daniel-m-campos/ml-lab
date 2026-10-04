@@ -116,7 +116,8 @@ def run(
         return report.run
 
     for pipeline in pipelines:
-        _declare_pipeline(ledger, pipeline)
+        for declared in (pipeline, *pipeline.members):
+            _declare_pipeline(ledger, declared)
         try:
             _run_pipeline(
                 ledger,
@@ -160,139 +161,233 @@ def _run_pipeline(
     start: Callable[[], str],
     log: Callable[[str], None],
 ):
-    name = pipeline.name or pipeline.id
-    shas = identity.import_shas(pipeline.steps, root)
-    stage_shas = {
-        stage: identity.import_shas(steps, root)
-        for stage, steps in {
-            "fit": (pipeline.fit, pipeline.save, pipeline.load),
-            "predict": (pipeline.predict,),
-            "postprocess": (pipeline.postprocess,) if pipeline.postprocess else (),
-        }.items()
-    }
-    dists = identity.imported_dists(pipeline.steps, root)
-    env_lock = _text_blob(ledger, _lock_text(dists))
+    stage = _Stage(ledger, session, pipeline, evaluation, root, report, start, log)
     loaded: set[str] | None = set(sys.modules)
-    models: dict[str, Any] = {}
     predictions: dict[str, str] = {}
+    for index, fold in enumerate(folds):
+        computed_before = report.fits_computed
+        fit_id = stage.fit(fold)
+        if report.fits_computed > computed_before and loaded is not None:
+            _refuse_lazy_imports(pipeline, root, stage.shas, stage.dists, loaded)
+            loaded = None
+        for window, rng in fold.windows.items():
+            predictions[f"{index}:{window}"] = stage.predictions(
+                fit_id, fold, index, window, rng
+            )
+    _score(
+        ledger, session, folds, pipeline, evaluation, predictions, report, start, log
+    )
 
-    def ensure_fit(fold: Fold) -> str:
+
+class _Stage:
+    """One pipeline's memoized fits and predictions; a blend holds one per member."""
+
+    def __init__(
+        self,
+        ledger: Ledger,
+        session: Session,
+        pipeline: Pipeline,
+        evaluation: Evaluation,
+        root: pathlib.Path,
+        report: RunReport,
+        start: Callable[[], str],
+        log: Callable[[str], None],
+    ):
+        self.ledger, self.session, self.pipeline = ledger, session, pipeline
+        self.evaluation, self.report, self.start, self.log = (
+            evaluation,
+            report,
+            start,
+            log,
+        )
+        self.name = pipeline.name or pipeline.id
+        self.shas = identity.import_shas(pipeline.steps, root)
+        own = (pipeline.fit, pipeline.save, pipeline.load)
+        post = (pipeline.postprocess,) if pipeline.postprocess else ()
+        self.stage_shas = {
+            "fit": identity.import_shas(own, root),
+            "predict": identity.import_shas((pipeline.predict,), root),
+            "postprocess": identity.import_shas(post, root),
+        }
+        self.dists = identity.imported_dists(pipeline.steps, root)
+        self.env_lock = _text_blob(ledger, _lock_text(self.dists))
+        self.models: dict[str, Any] = {}
+        self.fits: dict[str, str] = {}
+        self.members = [
+            _Stage(ledger, session, m, evaluation, root, report, start, log)
+            for m in pipeline.members
+        ]
+
+    def fit(self, fold: Fold) -> str:
+        if fold.label in self.fits:
+            return self.fits[fold.label]
+        self.fits[fold.label] = fit_id = self._fit(fold)
+        return fit_id
+
+    def _fit(self, fold: Fold) -> str:
         train = [list(seg) for seg in fold.train]
+        member_fits = [m.fit(fold) for m in self.members]
         fit_id = identity.content_hash(
             {
-                "dataset": evaluation.dataset,
-                "pipeline": pipeline.fit_declaration,
+                "dataset": self.evaluation.dataset,
+                "pipeline": self.pipeline.fit_declaration,
                 "train": train,
-                "import_shas": stage_shas["fit"],
-                "env_lock": env_lock["sha"],
+                "import_shas": self.stage_shas["fit"],
+                "env_lock": self.env_lock["sha"],
+                **({"members": member_fits} if self.members else {}),
             }
         )
-        if ledger.latest(Event.FIT, fit_id) is not None:
-            report.fits_reused += 1
+        if self.ledger.latest(Event.FIT, fit_id) is not None:
+            self.report.fits_reused += 1
             return fit_id
-        run_id = start()
+        inputs = self._member_inputs(member_fits, fold, fold.train)
+        run_id = self.start()
         started = time.perf_counter()
-        visible = session.upto(max(hi for _, hi in fold.train))
-        model = pipeline.fit(visible, fold.train, pipeline.config)
+        visible = self.session.upto(max(hi for _, hi in fold.train))
+        model = self.pipeline.fit(visible, fold.train, self.pipeline.config, *inputs)
         duration = time.perf_counter() - started
-        models[fit_id] = model
-        ledger.append(
+        self.models[fit_id] = model
+        self.ledger.append(
             Event.FIT,
-            evaluation.dataset,
+            self.evaluation.dataset,
             fit_id,
             {
-                "pipeline": pipeline.id,
+                "pipeline": self.pipeline.id,
                 "run": run_id,
                 "train": train,
                 "label": fold.label,
-                "import_shas": shas,
-                "env_lock": env_lock,
+                "import_shas": self.shas,
+                "env_lock": self.env_lock,
                 "duration_s": duration,
                 "model": {
-                    "sha": ledger.put_blob(pipeline.save(model)),
-                    "format": pipeline.format,
-                    "portable": formats.KNOWN[pipeline.format],
+                    "sha": self.ledger.put_blob(self.pipeline.save(model)),
+                    "format": self.pipeline.format,
+                    "portable": formats.KNOWN[self.pipeline.format],
                 },
+                **({"members": member_fits} if self.members else {}),
             },
             id=fit_id,
         )
-        report.fits_computed += 1
-        log(f"fit {name} {fold.label} {duration:.1f}s")
+        self.report.fits_computed += 1
+        self.log(f"fit {self.name} {fold.label} {duration:.1f}s")
         return fit_id
 
-    def write_predictions(pred_id: str, pred: np.ndarray, payload: dict[str, Any]):
-        pred = np.asarray(pred, dtype=np.float64)
-        blob = {"sha": ledger.put_blob(formats.series_save(pred)), "format": PARQUET}
-        ledger.append(
-            Event.PREDICTIONS,
-            evaluation.dataset,
-            pred_id,
-            {**payload, "blob": blob},
-            id=pred_id,
-        )
-        report.predictions_computed += 1
-        return pred
-
-    def ensure_predictions(fit_id: str, index: int, window: str, rng: Range) -> str:
+    def predictions(
+        self, fit_id: str, fold: Fold, index: int, window: str, rng: Range
+    ) -> str:
+        member_fits = [m.fit(fold) for m in self.members]
+        member_preds = [
+            m.predictions(f, fold, index, window, rng)
+            for m, f in zip(self.members, member_fits, strict=True)
+        ]
         raw_id = identity.content_hash(
             {
                 "fit": fit_id,
                 "range": list(rng),
-                "predict": pipeline.predict,
-                "import_shas": stage_shas["predict"],
+                "predict": self.pipeline.predict,
+                "import_shas": self.stage_shas["predict"],
+                **({"members": member_preds} if self.members else {}),
             }
         )
         pred_id = raw_id
-        if pipeline.postprocess is not None:
+        if self.pipeline.postprocess is not None:
             pred_id = identity.content_hash(
                 {
                     "raw": raw_id,
-                    "postprocess": pipeline.postprocess,
-                    "import_shas": stage_shas["postprocess"],
+                    "postprocess": self.pipeline.postprocess,
+                    "import_shas": self.stage_shas["postprocess"],
                 }
             )
-        if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
-            report.predictions_reused += 1
+        if self.ledger.latest(Event.PREDICTIONS, pred_id) is not None:
+            self.report.predictions_reused += 1
             return pred_id
-        start()
-        where = {"fit": fit_id, "range": list(rng), "fold": index, "window": window}
-        if ledger.latest(Event.PREDICTIONS, raw_id) is not None:
-            raw = _load_predictions(ledger, raw_id)
+        self.start()
+        where: dict[str, Any] = {
+            "fit": fit_id,
+            "range": list(rng),
+            "fold": index,
+            "window": window,
+            **({"members": member_preds} if self.members else {}),
+        }
+        visible = self.session.upto(rng[1])
+        if self.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
+            raw = _load_predictions(self.ledger, raw_id)
         else:
-            if fit_id not in models:
-                fit = ledger.latest(Event.FIT, fit_id)
-                models[fit_id] = pipeline.load(
-                    ledger.get_blob(fit["payload"]["model"]["sha"])
-                )
-            raw = write_predictions(
-                raw_id,
-                pipeline.predict(models[fit_id], session.upto(rng[1]), rng),
-                where,
+            inputs = [_load_predictions(self.ledger, p) for p in member_preds]
+            extra = [inputs] if self.members else []
+            model = self._model(fit_id)
+            raw = self._write(
+                raw_id, self.pipeline.predict(model, visible, rng, *extra), where
             )
-            log(f"predictions {name} {window} rows {rng[0]}:{rng[1]}")
-        if pipeline.postprocess is not None:
-            write_predictions(
+            self.log(f"predictions {self.name} {window} rows {rng[0]}:{rng[1]}")
+        if self.pipeline.postprocess is not None:
+            self._write(
                 pred_id,
-                pipeline.postprocess(raw, session.upto(rng[1]), rng),
+                self.pipeline.postprocess(raw, visible, rng),
                 {
                     **where,
                     "raw": raw_id,
-                    "postprocess": identity.canonical(pipeline.postprocess),
+                    "postprocess": identity.canonical(self.pipeline.postprocess),
                 },
             )
-            log(f"postprocess {name} {window} rows {rng[0]}:{rng[1]}")
+            self.log(f"postprocess {self.name} {window} rows {rng[0]}:{rng[1]}")
         return pred_id
 
-    for index, fold in enumerate(folds):
-        computed_before = report.fits_computed
-        fit_id = ensure_fit(fold)
-        if report.fits_computed > computed_before and loaded is not None:
-            _refuse_lazy_imports(pipeline, root, shas, dists, loaded)
-            loaded = None
-        for window, rng in fold.windows.items():
-            predictions[f"{index}:{window}"] = ensure_predictions(
-                fit_id, index, window, rng
+    def _member_inputs(
+        self, member_fits: list[str], fold: Fold, segments: tuple[Range, ...]
+    ) -> list[list[np.ndarray]]:
+        """Each member's predictions over the train segments, as one array each."""
+        if not self.members:
+            return []
+        arrays = []
+        for member, fit_id in zip(self.members, member_fits, strict=True):
+            parts = [
+                _load_predictions(
+                    self.ledger,
+                    member.predictions(fit_id, fold, -1, f"train:{k}", seg),
+                )
+                for k, seg in enumerate(segments)
+            ]
+            arrays.append(np.concatenate(parts))
+        return [arrays]
+
+    def _model(self, fit_id: str) -> Any:
+        if fit_id not in self.models:
+            fit = self.ledger.latest(Event.FIT, fit_id)
+            self.models[fit_id] = self.pipeline.load(
+                self.ledger.get_blob(fit["payload"]["model"]["sha"])
             )
+        return self.models[fit_id]
+
+    def _write(self, pred_id: str, pred: Any, payload: dict[str, Any]) -> np.ndarray:
+        values = np.asarray(pred, dtype=np.float64)
+        blob = {
+            "sha": self.ledger.put_blob(formats.series_save(values)),
+            "format": PARQUET,
+        }
+        self.ledger.append(
+            Event.PREDICTIONS,
+            self.evaluation.dataset,
+            pred_id,
+            {**payload, "blob": blob},
+            id=pred_id,
+        )
+        self.report.predictions_computed += 1
+        return values
+
+
+def _score(
+    ledger: Ledger,
+    session: Session,
+    folds: list[Fold],
+    pipeline: Pipeline,
+    evaluation: Evaluation,
+    predictions: dict[str, str],
+    report: RunReport,
+    start: Callable[[], str],
+    log: Callable[[str], None],
+):
+    name = pipeline.name or pipeline.id
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
