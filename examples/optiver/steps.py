@@ -7,7 +7,7 @@ import dataclasses
 import numpy as np
 
 from forestry import formats
-from forestry.declare import scorer, step
+from forestry.experiment import scorer, step
 from forestry.session import Range, Session, add_months
 
 try:

@@ -14,7 +14,8 @@ import sys
 import pyarrow.parquet as pq
 import pytest
 
-from forestry import cli, data, hashing, runs
+from forestry import cli, identity, runs
+from forestry.dataset import load
 from forestry.ledger import Event, Ledger, Refused
 from tests import synthetic
 
@@ -49,11 +50,11 @@ def _types(ledger) -> dict[str, int]:
 
 def _latest(ledger, evaluation) -> dict[str, str]:
     rows = ledger.sql(
-        "SELECT p.name, l.entry FROM latest_entry l JOIN pipeline p ON p.id = l.pipeline "
+        "SELECT p.name, l.score FROM latest_score l JOIN pipeline p ON p.id = l.pipeline "
         "WHERE l.evaluation = ?",
         (evaluation.id,),
     )
-    return {r["name"]: r["entry"] for r in rows}
+    return {r["name"]: r["score"] for r in rows}
 
 
 # Dataset ==========================================================================================
@@ -93,8 +94,8 @@ def test_any_evaluation_field_change_is_a_new_evaluation_id(dataset, evaluation)
 def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     ledger, dataset, evaluation
 ):
-    session = data.session(ledger, dataset)
-    folds = runs.expand(evaluation, session)
+    session = load(ledger, dataset)
+    folds = runs.folds(evaluation, session)
     assert len(folds) >= evaluation.min_folds
     for fold in folds:
         gap = session.ts[fold.evals[1][0]] - session.ts[fold.train[1] - 1]
@@ -107,18 +108,18 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
 # Run ==============================================================================================
 
 
-def test_a_run_posts_fits_predictions_and_one_entry_and_a_rerun_writes_nothing(
+def test_a_run_posts_fits_predictions_and_one_score_and_a_rerun_writes_nothing(
     ledger, dataset, evaluation
 ):
-    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    folds = runs.folds(evaluation, load(ledger, dataset))
     first = _run(ledger, evaluation, synthetic.ridge(3))
     assert first.fits_computed == len(folds)
     assert first.predictions_computed == len(folds) * len(evaluation.ages)
-    assert first.entries_scored == 1
+    assert first.scores_recorded == 1
     before = len(ledger.events())
     second = _run(ledger, evaluation, synthetic.ridge(3))
-    assert (second.fits_computed, second.predictions_computed, second.entries_scored) == (0, 0, 0)
-    assert (second.fits_reused, second.predictions_reused, second.entries_existing) == (
+    assert (second.fits_computed, second.predictions_computed, second.scores_recorded) == (0, 0, 0)
+    assert (second.fits_reused, second.predictions_reused, second.scores_reused) == (
         len(folds),
         len(folds) * len(evaluation.ages),
         1,
@@ -127,28 +128,28 @@ def test_a_run_posts_fits_predictions_and_one_entry_and_a_rerun_writes_nothing(
 
 
 def test_adding_a_pipeline_costs_only_its_own_fits(ledger, dataset, evaluation):
-    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    folds = runs.folds(evaluation, load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(3))
     report = _run(ledger, evaluation, synthetic.ridge(3), synthetic.ridge(6))
-    assert report.fits_computed == len(folds) and report.entries_scored == 1
-    assert report.fits_reused == len(folds) and report.entries_existing == 1
+    assert report.fits_computed == len(folds) and report.scores_recorded == 1
+    assert report.fits_reused == len(folds) and report.scores_reused == 1
     assert len(ledger.events(Event.RUN)) == 2
 
 
-def test_fits_land_on_the_dataset_stream_and_entries_on_the_evaluation_stream(
+def test_fits_land_on_the_dataset_stream_and_scores_on_the_evaluation_stream(
     ledger, dataset, evaluation
 ):
     _run(ledger, evaluation, synthetic.ridge(3))
     assert {e["stream"] for e in ledger.events(Event.FIT)} == {dataset}
     assert {e["stream"] for e in ledger.events(Event.PREDICTIONS)} == {dataset}
-    assert {e["stream"] for e in ledger.events(Event.ENTRY)} == {evaluation.id}
+    assert {e["stream"] for e in ledger.events(Event.SCORE)} == {evaluation.id}
 
 
-def test_a_scoring_change_refits_nothing_and_writes_a_new_entry(ledger, dataset, evaluation):
+def test_a_scoring_change_refits_nothing_and_writes_a_new_score(ledger, dataset, evaluation):
     _run(ledger, evaluation, synthetic.ridge(3))
     report = _run(ledger, synthetic.evaluation(dataset, cost=0.01), synthetic.ridge(3))
-    assert report.fits_computed == 0 and report.entries_scored == 1
-    assert len(ledger.events(Event.ENTRY)) == 2
+    assert report.fits_computed == 0 and report.scores_recorded == 1
+    assert len(ledger.events(Event.SCORE)) == 2
 
 
 def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(ledger, evaluation):
@@ -169,7 +170,7 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(ledger
     assert model.weights.shape == (3,)
 
 
-def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledger, tmp_path):
+def test_a_changed_source_file_is_a_new_fit_and_score_but_the_same_pipeline(ledger, tmp_path):
     code = tmp_path / "steps_v.py"
     code.write_text((REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNV"))
     module = cli._load(str(code))
@@ -177,38 +178,38 @@ def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledg
     evaluation = module.evaluation(dataset)
     pipeline = module.ridge(3)
     runs.run(ledger, [pipeline], evaluation, code_root=tmp_path)
-    first_entry = _latest(ledger, evaluation)["ridge_3m"]
+    first_score = _latest(ledger, evaluation)["ridge_3m"]
     code.write_text(code.read_text().replace("0.01 * np.sum", "0.02 * np.sum"))
     module = cli._load(str(code))
     report = runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
     assert module.ridge(3).id == pipeline.id
-    assert report.fits_computed > 0 and report.entries_scored == 1
-    assert _latest(ledger, evaluation)["ridge_3m"] != first_entry
-    assert ledger.get(first_entry) is not None
+    assert report.fits_computed > 0 and report.scores_recorded == 1
+    assert _latest(ledger, evaluation)["ridge_3m"] != first_score
+    assert ledger.get(first_score) is not None
 
 
 def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resumes(
     ledger, dataset, evaluation
 ):
-    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    folds = runs.folds(evaluation, load(ledger, dataset))
     synthetic.FLAKY_CALLS.clear()
     flaky = synthetic.flaky()
     report = _run(ledger, evaluation, flaky, synthetic.ridge(1))
     assert list(report.failed) == [flaky.id] and "boom" in report.failed[flaky.id]
-    assert report.fits_computed == 2 + len(folds) and report.entries_scored == 1
+    assert report.fits_computed == 2 + len(folds) and report.scores_recorded == 1
     failure = ledger.sql("SELECT pipeline, error FROM failure")[0]
     assert failure["pipeline"] == flaky.id and "boom" in failure["error"]
     event = ledger.events(Event.FAILED, key=flaky.id)[-1]
     assert "RuntimeError" in ledger.get_blob(event["payload"]["traceback"]["sha"]).decode()
     again = _run(ledger, evaluation, flaky)
-    assert again.fits_computed == len(folds) - 2 and again.entries_scored == 1
+    assert again.fits_computed == len(folds) - 2 and again.scores_recorded == 1
     assert set(_latest(ledger, evaluation)) == {"flaky", "ridge_1m"}
 
 
 def test_a_fit_that_imports_a_distribution_lazily_is_refused():
     pipeline = synthetic.ridge(3)
-    shas = hashing.import_shas(pipeline.steps, REPO)
-    dists = hashing.imported_dists(pipeline.steps, REPO)
+    shas = identity.import_shas(pipeline.steps, REPO)
+    dists = identity.imported_dists(pipeline.steps, REPO)
     before_pytest = {name for name in sys.modules if not name.startswith("pytest")}
     with pytest.raises(Refused, match="distributions \\['pytest'\\]"):
         runs._refuse_lazy_imports(pipeline, REPO, shas, dists, before_pytest)
@@ -232,13 +233,13 @@ def test_fy_run_merges_pipelines_from_several_modules_and_defaults_the_dataset(
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     by_path = str(REPO / "tests" / "synthetic.py")
     assert cli.main(["--root", str(ledger.root), "run", by_path, str(extra)]) == 0
-    assert "entries 4" in capsys.readouterr().out
+    assert "scores 4" in capsys.readouterr().out
     assert set(_latest(ledger, evaluation)) == {"ridge_1m", "ridge_3m", "ridge_6m", "ridge_12m"}
     assert cli.main(["--root", str(ledger.root), "run", by_path, "--dataset", dataset[:6]]) == 0
     assert "up to date" in capsys.readouterr().out
 
 
-def test_fy_run_refuses_bad_declarations(ledger, dataset, tmp_path, capsys):
+def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
     extra = tmp_path / "bare.py"
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     root = ["--root", str(ledger.root)]
@@ -259,7 +260,7 @@ def test_fy_run_refuses_without_a_dataset(tmp_path, capsys):
 
 
 def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path):
-    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    folds = runs.folds(evaluation, load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     db = sqlite3.connect(tmp_path / "forestry" / "forestry.sqlite")
     metrics = len(evaluation.directions)
@@ -269,7 +270,7 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     assert db.execute("SELECT COUNT(*) FROM aggregate_score").fetchone()[0] == (
         2 * len(evaluation.ages) * metrics
     )
-    assert db.execute("SELECT COUNT(*) FROM latest_entry").fetchone()[0] == 2
+    assert db.execute("SELECT COUNT(*) FROM latest_score").fetchone()[0] == 2
     assert db.execute("SELECT COUNT(*) FROM fit").fetchone()[0] == 2 * len(folds)
 
 
@@ -277,24 +278,24 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(6))
     before = ledger.events()[-1]["seq"]
     _run(ledger, evaluation, synthetic.ridge(1))
-    assert len(ledger.events(Event.ENTRY, upto=before)) == 1
-    assert len(ledger.events(Event.ENTRY)) == 2
+    assert len(ledger.events(Event.SCORE, upto=before)) == 1
+    assert len(ledger.events(Event.SCORE)) == 2
 
 
 # Storage ==========================================================================================
 
 
 def test_ulids_sort_and_do_not_collide():
-    ids = [hashing.ulid() for _ in range(1000)]
+    ids = [identity.ulid() for _ in range(1000)]
     assert all(len(i) == 26 for i in ids) and len(set(ids)) == 1000 and ids == sorted(ids)
 
 
 def test_blobs_are_written_atomically_under_their_sha(ledger):
     sha = ledger.put_blob(b"hello")
     assert (ledger.blobs / sha).exists() and ledger.get_blob(sha) == b"hello"
-    assert sha == hashing.bytes_hash(b"hello")
+    assert sha == identity.bytes_hash(b"hello")
     assert not list(ledger.blobs.glob(".tmp-*"))
 
 
 def test_git_blob_sha_matches_git():
-    assert hashing.git_blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
+    assert identity.git_blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"

@@ -19,10 +19,10 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "examples"))
 
 from forestry.ledger import Ledger  # noqa: E402
-from optiver import capture, declarations  # noqa: E402
+from optiver import capture, experiment  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not capture.available(), reason="Optiver train.csv not downloaded")
-DECL = "optiver.declarations"
+DECL = "optiver.experiment"
 
 
 @pytest.fixture(scope="module")
@@ -61,8 +61,8 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
 def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
     fy(root, "run", DECL)
     rows = Ledger(root).sql(
-        "SELECT p.name, s.metric, s.value FROM latest_entry l "
-        "JOIN aggregate_score s ON s.entry = l.entry JOIN pipeline p ON p.id = l.pipeline "
+        "SELECT p.name, s.metric, s.value FROM latest_score l "
+        "JOIN aggregate_score s ON s.score = l.score JOIN pipeline p ON p.id = l.pipeline "
         "WHERE s.age = 1"
     )
     names = {r["name"] for r in rows}
@@ -79,7 +79,7 @@ def test_a_rerun_writes_nothing(root, dataset):
     assert ledger.events()[before:] == []
 
 
-@pytest.mark.skipif(not declarations.bonsai_available, reason="bonsai not installed")
+@pytest.mark.skipif(not experiment.bonsai_available, reason="bonsai not installed")
 def test_a_bonsai_model_blob_opens_with_bonsai_alone(root, dataset, tmp_path):
     import bonsai
 

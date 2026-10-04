@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from forestry.declare import Evaluation, Pipeline, scorer, step
+from forestry.experiment import Evaluation, Pipeline, scorer, step
 from forestry.ledger import Ledger
 
 __version__ = "0.0.1"

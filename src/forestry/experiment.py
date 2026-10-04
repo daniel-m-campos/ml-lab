@@ -1,5 +1,6 @@
-"""Typed declarations: steps, scorers, pipelines and evaluations.
+"""What an experiment is made of: steps, scorers, pipelines and the evaluation.
 
+An experiment module exposes ``pipelines`` and ``evaluation``; ``fy run`` reads both by name.
 Declarations are frozen dataclasses hashed by canonical serialization; see docs/spec.md. A
 pipeline's name is a label and does not enter its hash. Identity is declaration only: code
 changes are caught by the fit memo, not by hashing files.
@@ -18,7 +19,7 @@ import dataclasses
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from forestry import hashing
+from forestry import identity
 
 
 def step(func: Callable | None = None, *, format: str | None = None) -> Callable:
@@ -31,7 +32,7 @@ def step(func: Callable | None = None, *, format: str | None = None) -> Callable
     """
 
     def decorate(f: Callable) -> Callable:
-        return hashing.register(f, format=format)
+        return identity.register(f, format=format)
 
     return decorate(func) if func is not None else decorate
 
@@ -48,7 +49,7 @@ def scorer(metrics: Callable, directions: Mapping[str, str]) -> Callable:
     """
 
     def decorate(func: Callable) -> Callable:
-        return hashing.register(func, metrics=metrics, directions=dict(directions))
+        return identity.register(func, metrics=metrics, directions=dict(directions))
 
     return decorate
 
@@ -69,7 +70,7 @@ class Pipeline:
 
     @property
     def id(self) -> str:
-        return hashing.content_hash(self)
+        return identity.content_hash(self)
 
     @property
     def format(self) -> str | None:
@@ -103,7 +104,7 @@ class Evaluation:
 
     @property
     def id(self) -> str:
-        return hashing.content_hash(self)
+        return identity.content_hash(self)
 
     @property
     def directions(self) -> dict[str, str]:

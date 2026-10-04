@@ -21,9 +21,9 @@ import sqlite3
 import time
 from typing import Any, Final
 
-from forestry import hashing
+from forestry import identity
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 ACTOR_ENV = "FORESTRY_ACTOR"
 
 
@@ -40,7 +40,7 @@ class Event:
     RUN: Final = "run_started"
     FIT: Final = "fit_computed"
     PREDICTIONS: Final = "predictions_computed"
-    ENTRY: Final = "entry_scored"
+    SCORE: Final = "score_recorded"
     FAILED: Final = "pipeline_failed"
 
 
@@ -93,25 +93,25 @@ CREATE VIEW IF NOT EXISTS prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.age') AS age, json_extract(payload,'$.blob.sha') AS blob
 FROM event WHERE type='predictions_computed';
 
-CREATE VIEW IF NOT EXISTS entry AS SELECT seq, id, at, actor, stream AS evaluation,
+CREATE VIEW IF NOT EXISTS score AS SELECT seq, id, at, actor, stream AS evaluation,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run
-FROM event WHERE type='entry_scored';
+FROM event WHERE type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS entry, e.stream AS evaluation,
+CREATE VIEW IF NOT EXISTS fold_score AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, json_extract(f.value,'$.fold') AS fold,
   json_extract(f.value,'$.age') AS age, m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
-WHERE e.type='entry_scored';
+WHERE e.type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS entry, e.stream AS evaluation,
+CREATE VIEW IF NOT EXISTS aggregate_score AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, CAST(a.key AS INTEGER) AS age,
   m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
-WHERE e.type='entry_scored';
+WHERE e.type='score_recorded';
 
-CREATE VIEW IF NOT EXISTS latest_entry AS SELECT evaluation, pipeline, id AS entry, run, seq
+CREATE VIEW IF NOT EXISTS latest_score AS SELECT evaluation, pipeline, id AS score, run, seq
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
-      FROM entry) WHERE rn = 1;
+      FROM score) WHERE rn = 1;
 
 CREATE VIEW IF NOT EXISTS failure AS SELECT seq, id, at, actor, host, stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run, json_extract(payload,'$.error') AS error
@@ -143,7 +143,7 @@ class Ledger:
         self, type: str, stream: str, key: str, payload: dict[str, Any], *, id: str | None = None
     ) -> str:
         """Insert one event; an id that already exists writes nothing. Returns the id."""
-        event_id = id or hashing.ulid()
+        event_id = id or identity.ulid()
         self._db.execute(
             "INSERT OR IGNORE INTO event (id, type, stream, key, at, actor, host, payload) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -155,7 +155,7 @@ class Ledger:
                 time.time(),
                 actor(),
                 platform.node(),
-                json.dumps(payload, default=hashing.canonical),
+                json.dumps(payload, default=identity.canonical),
             ),
         )
         self._db.commit()
@@ -196,11 +196,11 @@ class Ledger:
 
     def put_blob(self, payload: bytes) -> str:
         """Store bytes under their sha256 atomically; returns the sha."""
-        sha = hashing.bytes_hash(payload)
+        sha = identity.bytes_hash(payload)
         path = self.blobs / sha
         if path.exists():
             return sha
-        tmp = self.blobs / f".tmp-{hashing.ulid()}"
+        tmp = self.blobs / f".tmp-{identity.ulid()}"
         with open(tmp, "wb") as handle:
             handle.write(payload)
             handle.flush()

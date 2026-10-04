@@ -1,8 +1,9 @@
-"""Identities: canonical serialization of declarations, content hashes, ULIDs, code identity.
+"""Identity: content hashes of declarations, ULIDs, and the code and environment a fit depends on.
 
 A declaration is hashed by its canonical form: dataclass fields minus labels, registered steps by
 dotted path. Code identity is separate: ``import_shas`` gives the git blob sha of every repo
-module a set of steps imports, computed the way ``git hash-object`` does, so dirty files count.
+module a set of steps imports, computed the way ``git hash-object`` does, so dirty files count;
+``imported_dists`` gives the installed distributions the same closure reaches.
 
 Examples
 --------
@@ -132,7 +133,7 @@ def repo_root(start: pathlib.Path) -> pathlib.Path:
         return directory.resolve()
 
 
-def closure(funcs: Iterable[Callable], code_root: pathlib.Path) -> list[types.ModuleType]:
+def imports(funcs: Iterable[Callable], code_root: pathlib.Path) -> list[types.ModuleType]:
     """Every module reachable from the steps' modules through module-level names.
 
     Modules outside ``code_root`` are reached but not expanded, so a third-party package appears
@@ -162,7 +163,7 @@ def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str,
     """Git blob shas of every module under ``code_root`` reachable from the steps' modules."""
     root = code_root.resolve()
     seen: dict[str, str] = {}
-    for module in closure(funcs, root):
+    for module in imports(funcs, root):
         path = _module_path(module, root)
         if path is not None:
             seen[path.relative_to(root).as_posix()] = git_blob_sha(path.read_bytes())
@@ -176,7 +177,7 @@ def imported_dists(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[s
     move when the files do.
     """
     owners = distribution_owners()
-    tops = {m.__name__.partition(".")[0] for m in closure(funcs, code_root)}
+    tops = {m.__name__.partition(".")[0] for m in imports(funcs, code_root)}
     todo = {d for top in tops for d in owners.get(top, (top,))}
     found: dict[str, str] = {}
     while todo:

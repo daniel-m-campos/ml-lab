@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from forestry.declare import Evaluation, Pipeline
+from forestry.experiment import Evaluation, Pipeline
 from optiver import steps
 
 ridge = Pipeline(

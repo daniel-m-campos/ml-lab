@@ -10,8 +10,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv
 
-from forestry import data, formats
-from forestry.declare import step
+from forestry import formats
+from forestry.dataset import record
+from forestry.experiment import step
 from forestry.ledger import Ledger
 from forestry.session import Session
 
@@ -59,7 +60,7 @@ def drop_null_target(session: Session) -> Session:
 def dataset(ledger: Ledger, stocks: str = "all") -> str:
     """Ingest a stock subset with null targets dropped; ``stocks`` is "all", "20" or "0,1,2"."""
     selected = parse_stocks(stocks)
-    return data.ingest(
+    return record(
         ledger,
         load(selected),
         process=PROCESS,

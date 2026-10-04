@@ -1,4 +1,4 @@
-"""Runs: expand a schedule, memoize fits and predictions, score each pipeline into an entry.
+"""Runs: expand a schedule, memoize fits and predictions, score each pipeline into a score.
 
 A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``, ``save``
 and ``load``. Reading is SQL over the views in ``forestry.ledger``.
@@ -6,7 +6,7 @@ and ``load``. Reading is SQL over the views in ``forestry.ledger``.
 Examples
 --------
 >>> report = run(ledger, [pipeline], evaluation)  # doctest: +SKIP
->>> report.fits_computed, report.entries_scored  # doctest: +SKIP
+>>> report.fits_computed, report.scores_recorded  # doctest: +SKIP
 (9, 1)
 """
 
@@ -26,8 +26,8 @@ from typing import Any
 
 import numpy as np
 
-from forestry import data, formats, hashing
-from forestry.declare import Evaluation, Pipeline
+from forestry import dataset, formats, identity
+from forestry.experiment import Evaluation, Pipeline
 from forestry.ledger import Event, Ledger, Refused
 from forestry.session import Range, Session, add_months, as_date
 
@@ -42,22 +42,22 @@ class Fold:
 
 @dataclasses.dataclass
 class RunReport:
-    """What a run wrote; ``run`` is empty when every fit, prediction and entry already existed."""
+    """What a run wrote; ``run`` is empty when every fit, prediction and score already existed."""
 
     run: str = ""
     fits_computed: int = 0
     predictions_computed: int = 0
-    entries_scored: int = 0
+    scores_recorded: int = 0
     fits_reused: int = 0
     predictions_reused: int = 0
-    entries_existing: int = 0
+    scores_reused: int = 0
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 # Public Functions =================================================================================
 
 
-def expand(evaluation: Evaluation, session: Session) -> list[Fold]:
+def folds(evaluation: Evaluation, session: Session) -> list[Fold]:
     """Folds from the schedule: every cutoff whose oldest eval window still fits the data."""
     span = max(evaluation.ages) * evaluation.eval_months
     folds: list[Fold] = []
@@ -89,7 +89,7 @@ def run(
 
     ``run_started`` is appended only when something is computed, right before the first write,
     so a rerun of an unchanged tree writes nothing and adding one pipeline costs only its own
-    fits, predictions and entry. A pipeline that raises is recorded as ``pipeline_failed`` and
+    fits, predictions and score. A pipeline that raises is recorded as ``pipeline_failed`` and
     the others continue; what it had written stays and a rerun resumes from there.
     """
     if not pipelines:
@@ -97,17 +97,17 @@ def run(
     for pipeline in pipelines:
         if pipeline.format is None:
             raise Refused(f"pipeline {pipeline.name or pipeline.id}: save step declares no format")
-    session = data.session(ledger, evaluation.dataset)
-    folds = expand(evaluation, session)
-    _declare_evaluation(ledger, evaluation, folds)
-    root = code_root or hashing.repo_root(
+    session = dataset.load(ledger, evaluation.dataset)
+    schedule = folds(evaluation, session)
+    _declare_evaluation(ledger, evaluation, schedule)
+    root = code_root or identity.repo_root(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
     )
     report = RunReport()
 
     def start() -> str:
         if not report.run:
-            report.run = hashing.ulid()
+            report.run = identity.ulid()
             ledger.append(
                 Event.RUN,
                 evaluation.id,
@@ -125,7 +125,7 @@ def run(
     for pipeline in pipelines:
         _declare_pipeline(ledger, pipeline)
         try:
-            _run_pipeline(ledger, session, folds, pipeline, evaluation, root, report, start)
+            _run_pipeline(ledger, session, schedule, pipeline, evaluation, root, report, start)
         except Exception as error:  # noqa: BLE001
             report.failed[pipeline.id] = f"{type(error).__name__}: {error}"
             ledger.append(
@@ -155,8 +155,8 @@ def _run_pipeline(
     report: RunReport,
     start: Callable[[], str],
 ):
-    shas = hashing.import_shas(pipeline.steps, root)
-    dists = hashing.imported_dists(pipeline.steps, root)
+    shas = identity.import_shas(pipeline.steps, root)
+    dists = identity.imported_dists(pipeline.steps, root)
     env_lock = _text_blob(ledger, _lock_text(dists))
     loaded: set[str] | None = set(sys.modules)
     models: dict[str, Any] = {}
@@ -173,15 +173,15 @@ def _run_pipeline(
             predictions[f"{fold.index}:{age}"] = _ensure_predictions(
                 ledger, session, pipeline, fit_id, rng, fold, age, models, report, start
             )
-    entry_id = hashing.content_hash(
+    score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
             "pipeline": pipeline.id,
             "predictions": sorted(predictions.values()),
         }
     )
-    if ledger.latest(Event.ENTRY, entry_id) is not None:
-        report.entries_existing += 1
+    if ledger.latest(Event.SCORE, score_id) is not None:
+        report.scores_reused += 1
         return
     per_fold, series = [], {}
     for fold in folds:
@@ -198,9 +198,9 @@ def _run_pipeline(
                 }
             )
     ledger.append(
-        Event.ENTRY,
+        Event.SCORE,
         evaluation.id,
-        entry_id,
+        score_id,
         {
             "pipeline": pipeline.id,
             "run": start(),
@@ -210,9 +210,9 @@ def _run_pipeline(
                 str(age): evaluation.metrics(np.concatenate(parts)) for age, parts in series.items()
             },
         },
-        id=entry_id,
+        id=score_id,
     )
-    report.entries_scored += 1
+    report.scores_recorded += 1
 
 
 def _ensure_fit(
@@ -227,7 +227,7 @@ def _ensure_fit(
     report: RunReport,
     start: Callable[[], str],
 ) -> str:
-    fit_id = hashing.content_hash(
+    fit_id = identity.content_hash(
         {
             "dataset": evaluation.dataset,
             "pipeline": pipeline.id,
@@ -276,7 +276,7 @@ def _ensure_predictions(
     report: RunReport,
     start: Callable[[], str],
 ) -> str:
-    pred_id = hashing.content_hash({"fit": fit_id, "range": list(rng)})
+    pred_id = identity.content_hash({"fit": fit_id, "range": list(rng)})
     if ledger.latest(Event.PREDICTIONS, pred_id) is not None:
         report.predictions_reused += 1
         return pred_id
@@ -320,8 +320,8 @@ def _declare_pipeline(ledger: Ledger, pipeline: Pipeline):
         pipeline.id,
         {
             "name": pipeline.name,
-            "declaration": hashing.canonical(pipeline),
-            "config": hashing.canonical(pipeline.config),
+            "declaration": identity.canonical(pipeline),
+            "config": identity.canonical(pipeline.config),
         },
         id=pipeline.id,
     )
@@ -334,7 +334,7 @@ def _declare_evaluation(ledger: Ledger, evaluation: Evaluation, folds: list[Fold
         evaluation.id,
         {
             "dataset": evaluation.dataset,
-            "declaration": hashing.canonical(evaluation),
+            "declaration": identity.canonical(evaluation),
             "metrics": evaluation.directions,
             "folds": [
                 {
@@ -374,8 +374,8 @@ def _refuse_lazy_imports(
     pipeline: Pipeline, root: pathlib.Path, shas: dict[str, str], dists: dict[str, str], loaded: set
 ):
     """A fit that imports inside the function hides code from the memo; refuse and name it."""
-    grown = sorted(set(hashing.import_shas(pipeline.steps, root)) - set(shas))
-    owners = hashing.distribution_owners()
+    grown = sorted(set(identity.import_shas(pipeline.steps, root)) - set(shas))
+    owners = identity.distribution_owners()
     tops = {name.partition(".")[0] for name in set(sys.modules) - loaded}
     lazy = sorted({d for top in tops for d in owners.get(top, ()) if d not in dists})
     if grown or lazy:

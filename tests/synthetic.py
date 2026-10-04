@@ -6,8 +6,9 @@ import dataclasses
 
 import numpy as np
 
-from forestry import data, formats
-from forestry.declare import Evaluation, Pipeline, scorer, step
+from forestry import formats
+from forestry.dataset import record
+from forestry.experiment import Evaluation, Pipeline, scorer, step
 from forestry.ledger import Ledger
 from forestry.session import Range, Session, add_months, as_date
 
@@ -43,7 +44,7 @@ def dataset(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
     rows = generate(
         start="2025-01-01", months=months, rows_per_day=20, seed=seed, drift_at="2025-07-01"
     )
-    return data.ingest(
+    return record(
         ledger,
         rows,
         process="synthetic",

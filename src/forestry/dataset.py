@@ -1,11 +1,11 @@
-"""Ingesting a dataset and loading it back.
+"""Recording a dataset and loading it back.
 
 A dataset is the rows of one (process, instrument, window) passed through filter steps, with
 named target columns. Its id covers the whole recipe; the event records the bytes as Parquet.
 
 Examples
 --------
->>> dataset = ingest(ledger, session, process="toy", params={}, instrument="X",
+>>> dataset = record(ledger, session, process="toy", params={}, instrument="X",
 ...                  filters=(), targets=("ret_1",))  # doctest: +SKIP
 """
 
@@ -14,12 +14,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from forestry import formats, hashing
+from forestry import formats, identity
 from forestry.ledger import Event, Ledger
 from forestry.session import Session
 
 
-def ingest(
+def record(
     ledger: Ledger,
     session: Session,
     *,
@@ -39,7 +39,7 @@ def ingest(
         "filters": list(filters),
         "targets": list(targets),
     }
-    dataset_id = hashing.content_hash(recipe)
+    dataset_id = identity.content_hash(recipe)
     if ledger.latest(Event.DATASET, dataset_id) is not None:
         return dataset_id
     for filt in filters:
@@ -52,7 +52,7 @@ def ingest(
         "process": process,
         "instrument": instrument,
         "window": window,
-        "recipe": hashing.canonical(recipe),
+        "recipe": identity.canonical(recipe),
         "rows": session.rows,
         "blob": {"sha": sha, "format": formats.Format.PARQUET},
     }
@@ -60,7 +60,7 @@ def ingest(
     return dataset_id
 
 
-def session(ledger: Ledger, dataset_id: str) -> Session:
+def load(ledger: Ledger, dataset_id: str) -> Session:
     """Load a dataset's rows into a resident session."""
     event = ledger.latest(Event.DATASET, dataset_id)
     if event is None:
