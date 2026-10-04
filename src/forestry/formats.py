@@ -32,6 +32,7 @@ class Format:
     PARQUET = "parquet"
     ARROW_ARRAYS = "arrow-arrays"
     DIFF = "text/x-diff"
+    TEXT = "text/plain"
 
 
 # Sessions =========================================================================================

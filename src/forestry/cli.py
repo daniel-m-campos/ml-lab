@@ -57,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("board", help="every pipeline against the baseline; one name for detail")
     _declarations_arguments(p)
     p.add_argument("pipeline", nargs="?", help="one pipeline's detail as JSON")
+    p.add_argument("--all", action="store_true", help="also pipelines no longer declared")
     p.set_defaults(handler=_board)
 
     p = sub.add_parser("decide", help="record promote or reject on a pipeline")
@@ -105,16 +106,20 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
         f"run {report.run}: fits {report.fits_computed}, predictions "
         f"{report.predictions_computed}, entries {report.entries_scored}"
     )
-    return 0
+    names = {p.id: p.name or p.id for p in pipelines}
+    for pipeline_id, error in report.failed.items():
+        print(f"fy run: {names[pipeline_id]} failed: {error}", file=sys.stderr)
+    return 1 if report.failed else 0
 
 
 def _board(args: argparse.Namespace, ledger: Ledger) -> int:
-    _, evaluation = _declarations(args)
+    pipelines, evaluation = _declarations(args)
     if args.pipeline:
         pipeline = _resolve(ledger, evaluation, args.pipeline)
         print(json.dumps(review.detail(ledger, evaluation, pipeline), indent=2, default=str))
     else:
-        print(_table(BOARD_COLUMNS, review.board(ledger, evaluation)))
+        declared = None if args.all else {p.id for p in pipelines}
+        print(_table(BOARD_COLUMNS, review.board(ledger, evaluation, declared)))
     return 0
 
 
@@ -137,7 +142,8 @@ def _history(args: argparse.Namespace, ledger: Ledger) -> int:
 def _resolve(ledger: Ledger, evaluation: Evaluation, name: str) -> str:
     """A pipeline id from its name or an id prefix, among those with an entry here."""
     entries = ledger.events(Event.ENTRY, stream=evaluation.id)
-    scored = sorted({e["payload"]["pipeline"] for e in entries})
+    failures = ledger.events(Event.FAILED, stream=evaluation.id)
+    scored = sorted({e["payload"]["pipeline"] for e in entries} | {f["key"] for f in failures})
     matches = [p for p in scored if p.startswith(name)]
     if not matches:
         matches = [p for p in scored if ledger.get(p)["payload"]["name"] == name]

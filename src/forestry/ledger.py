@@ -23,7 +23,7 @@ from typing import Any, Final
 
 from forestry import hashing
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 ACTOR_ENV = "FORESTRY_ACTOR"
 
 
@@ -42,6 +42,7 @@ class Event:
     PREDICTIONS: Final = "predictions_computed"
     ENTRY: Final = "entry_scored"
     DECISION: Final = "decision_recorded"
+    FAILED: Final = "pipeline_failed"
 
 
 DDL = """
@@ -134,7 +135,7 @@ LEFT JOIN baseline b ON b.evaluation = e.evaluation
 LEFT JOIN decision last ON last.entry = e.id
   AND last.seq = (SELECT MAX(seq) FROM decision WHERE entry = e.id);
 
-CREATE VIEW IF NOT EXISTS board AS SELECT l.evaluation, l.pipeline, p.name, l.entry, l.run,
+CREATE VIEW IF NOT EXISTS board AS SELECT l.evaluation, l.pipeline, p.name, l.entry, l.run, l.seq,
   s.status, b.entry AS baseline, json_extract(le.payload,'$.aggregate') AS aggregate,
   json_extract(be.payload,'$.aggregate') AS baseline_aggregate
 FROM latest_entry l
@@ -147,6 +148,10 @@ LEFT JOIN event be ON be.id = b.entry;
 CREATE VIEW IF NOT EXISTS history AS SELECT d.seq, d.id, d.at, d.actor, d.evaluation, d.entry,
   d.pipeline, p.name, d.why, d.against_entry, d.verdict
 FROM decision d JOIN pipeline p ON p.id = d.pipeline WHERE d.kind='promote';
+
+CREATE VIEW IF NOT EXISTS failure AS SELECT seq, id, at, actor, host, stream AS evaluation,
+  key AS pipeline, json_extract(payload,'$.run') AS run, json_extract(payload,'$.error') AS error
+FROM event WHERE type='pipeline_failed';
 """
 
 

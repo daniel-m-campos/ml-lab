@@ -47,11 +47,12 @@ CREATE TABLE event (
 | dataset_recorded | dataset | dataset id = hash(recipe) | process, instrument, window, recipe (params, filter paths, targets), rows, blob sha |
 | pipeline_declared | pipeline | pipeline id = hash(declaration) | name, fit path, predict path, config |
 | evaluation_declared | evaluation | evaluation id = hash(declaration) | dataset id, scorer path, config, metric directions, cadence, the expanded folds and eval windows |
-| run_started | evaluation | run id (ULID) | commit, dirty, diff sha, env lock, host facts |
-| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock) | run id, cutoff, model sha and format, import shas, env lock, duration |
+| run_started | evaluation | run id (ULID) | commit, dirty, diff sha, resolution file sha (`uv.lock` or `requirements*.txt` if present), host facts |
+| fit_computed | dataset | fit id = hash(dataset, pipeline, train range, import shas, env lock sha) | run id, cutoff, model sha and format, import shas, env lock sha, duration |
 | predictions_computed | dataset | hash(fit id, range) | blob sha and format |
 | entry_scored | evaluation | entry id = hash(evaluation, pipeline, prediction ids) | per-fold metrics, aggregate per age |
 | decision_recorded | evaluation | entry id | kind (promote, reject), why, against (baseline entry at the time, verdict, deltas) |
+| pipeline_failed | evaluation | pipeline id | run id, error, traceback sha |
 
 Fits and predictions live on the dataset stream because a scoring change reuses them across evaluations. An entry is "this pipeline, under this evaluation, from exactly these predictions"; a rerun that reproduces the same predictions writes no entry, and a code change that changes them writes a new one with no decisions.
 
@@ -68,18 +69,23 @@ Shipped as SQL in the same file so `sqlite3` shows them as tables. The per-type 
 | status | per entry: baseline if head, superseded if promoted earlier, rejected if its last decision is reject, else scored |
 | board | latest_entry beside baseline with both aggregates; verdict and relative deltas from the metric directions |
 | history | promote decisions in order |
+| failure | `pipeline_failed` with run and error |
 
 The payload is JSON so a shape change is a new payload version and an edited view, not a migration. Materialize a view only when a read is measured past a second; a `reproject` command then rebuilds it and nothing else writes it.
 
 ## Rules
 
-Memo: a fit is reused when one exists for (dataset, pipeline, train range) whose recorded import shas and environment lock all match the current tree. Dirty files hash like any other; the run records the diff. A dependency bump changes the lock and refits. Predictions are reused per (fit, range).
+Memo: a fit is reused when one exists for (dataset, pipeline, train range) whose recorded import shas and environment lock all match the current tree. Dirty files hash like any other; the run records the diff. Predictions are reused per (fit, range).
 
-The import closure is every module under the repo root reachable from the step modules' top-level imports, with `.venv` excluded. `declarations.py` is in it only if a step imports it, so editing a config there changes the pipeline id, not the fit shas. A repo module imported lazily inside a step grows the closure after the first fit; the run refuses it and names the module, because the memo would otherwise have missed its edits.
+The environment lock is a text blob, one `name==version` line per installed distribution the pipeline's import closure reaches, with their requirements, plus the Python version. Installing an unrelated package changes nothing; bumping a dependency refits the pipelines that import it and `fy board <pipeline>` shows the version diff against the baseline. An editable install's version carries a hash of its source files. Platform is recorded on the run, not in the lock, so a GPU box reuses a laptop's fits.
+
+The import closure is every module under the repo root reachable from the step modules' top-level imports, with `.venv` excluded. `declarations.py` is in it only if a step imports it, so editing a config there changes the pipeline id, not the fit shas. A repo module or a distribution imported lazily inside a step is invisible to the closure; after the first fit the run sees it loaded, refuses, and names it, because the memo would otherwise have missed its edits or its version bumps.
 
 Review: a decision is made on one entry and carries the baseline entry, verdict and deltas it saw. The baseline is the last promote. New content for a pipeline is a new entry with no decisions, so the board asks for review again. Nothing is deleted; a refutation is a new decision.
 
 Comparability: an entry compares only against the baseline of its own evaluation. A scorer or schedule change is a new evaluation.
+
+Faults: every blob is written before the event that names it, and each fit is its own event, so a killed process loses at most the fit in flight and a rerun resumes from the last recorded one with the same ids. A pipeline that raises is recorded as `pipeline_failed` with its traceback, the other pipelines continue, and `fy run` exits 1 naming it. Failures are not memoized: a rerun retries. The board shows the pipeline as `failed` with the error until a newer entry exists.
 
 Embargo: no fit's train range ends after its fold's eval start minus the embargo. The folds are in the evaluation payload, written once.
 
@@ -122,13 +128,14 @@ C="project.declarations --dataset $DS"
 fy run $C
 fy decide $C <pipeline> --kind promote --why "incumbent"
 fy board $C
+fy board $C --all
 fy board $C <pipeline>
 fy decide $C <pipeline> --kind promote|reject --why "..."
 fy run project.declarations ideas/agent7.py --dataset $DS
 fy history $C
 ```
 
-Five verbs. The four after `ingest` take one or more modules: pipelines are concatenated, the evaluation comes from the one module that declares it. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
+Five verbs. The four after `ingest` take one or more modules: pipelines are concatenated, the evaluation comes from the one module that declares it. The board shows the pipelines currently declared plus the baseline; `--all` adds the ones no longer declared. Pipelines are named by name or id prefix. The ledger root is `FORESTRY_ROOT` or `--root`. Every write carries the actor.
 
 ## Later
 

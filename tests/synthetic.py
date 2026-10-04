@@ -83,6 +83,18 @@ def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray
     return session.matrix(rng, FEATURES) @ model.weights + model.bias
 
 
+FLAKY_CALLS: list[int] = []
+
+
+@step
+def flaky_fit(session: Session, train: Range, config: RidgeConfig) -> RidgeModel:
+    """Raises on its third call ever; the test clears ``FLAKY_CALLS`` to arm it."""
+    FLAKY_CALLS.append(train[1])
+    if len(FLAKY_CALLS) == 3:
+        raise RuntimeError("boom at the third fit")
+    return ridge_fit(session, train, config)
+
+
 @step(format=formats.Format.ARROW_ARRAYS)
 def ridge_save(model: RidgeModel) -> bytes:
     return formats.arrays_save({"weights": model.weights, "bias": np.array([model.bias])})
@@ -132,6 +144,10 @@ def evaluation(dataset: str, cost: float = 0.001) -> Evaluation:
         embargo_seconds=60,
         min_folds=3,
     )
+
+
+def flaky(window_months: int = 3) -> Pipeline:
+    return dataclasses.replace(ridge(window_months), fit=flaky_fit, name="flaky")
 
 
 pipelines = [ridge(1), ridge(3), ridge(6)]

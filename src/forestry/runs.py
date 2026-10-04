@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-import importlib.metadata
 import os
 import pathlib
 import platform
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Callable
 from typing import Any
 
@@ -52,6 +52,7 @@ class RunReport:
     predictions_reused: int = 0
     entries_existing: int = 0
     pipelines: list[str] = dataclasses.field(default_factory=list)
+    failed: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 # Public Functions =================================================================================
@@ -89,7 +90,8 @@ def run(
 
     ``run_started`` is appended only when something is computed, right before the first write,
     so a rerun of an unchanged tree writes nothing and adding one pipeline costs only its own
-    fits, predictions and entry.
+    fits, predictions and entry. A pipeline that raises is recorded as ``pipeline_failed`` and
+    the others continue; what it had written stays and a rerun resumes from there.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -102,7 +104,6 @@ def run(
     root = code_root or hashing.repo_root(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
     )
-    env_lock = _env_lock()
     report = RunReport()
 
     def start() -> str:
@@ -114,7 +115,7 @@ def run(
                 report.run,
                 {
                     "git": _git(ledger, root),
-                    "env_lock": env_lock,
+                    "resolution": _resolution(ledger, root),
                     "host": _host(),
                     "pipelines": [{"id": p.id, "name": p.name} for p in pipelines],
                 },
@@ -125,7 +126,21 @@ def run(
     for pipeline in pipelines:
         _declare_pipeline(ledger, pipeline)
         report.pipelines.append(pipeline.id)
-        _run_pipeline(ledger, session, folds, pipeline, evaluation, root, env_lock, report, start)
+        try:
+            _run_pipeline(ledger, session, folds, pipeline, evaluation, root, report, start)
+        except Exception as error:  # noqa: BLE001
+            report.failed[pipeline.id] = f"{type(error).__name__}: {error}"
+            ledger.append(
+                Event.FAILED,
+                evaluation.id,
+                pipeline.id,
+                {
+                    "run": start(),
+                    "pipeline": pipeline.id,
+                    "error": report.failed[pipeline.id],
+                    "traceback": _text_blob(ledger, traceback.format_exc()),
+                },
+            )
     return report
 
 
@@ -139,20 +154,23 @@ def _run_pipeline(
     pipeline: Pipeline,
     evaluation: Evaluation,
     root: pathlib.Path,
-    env_lock: str,
     report: RunReport,
     start: Callable[[], str],
 ):
     shas = hashing.import_shas(pipeline.steps, root)
+    dists = hashing.imported_dists(pipeline.steps, root)
+    env_lock = _text_blob(ledger, _lock_text(dists))
+    loaded: set[str] | None = set(sys.modules)
     models: dict[str, Any] = {}
     predictions: dict[str, str] = {}
     for fold in folds:
+        computed_before = report.fits_computed
         fit_id = _ensure_fit(
             ledger, session, evaluation, pipeline, fold, shas, env_lock, models, report, start
         )
-        if report.fits_computed and shas != hashing.import_shas(pipeline.steps, root):
-            grown = sorted(set(hashing.import_shas(pipeline.steps, root)) - set(shas))
-            raise Refused(f"fit imported repo modules lazily: {grown}; import them at module level")
+        if report.fits_computed > computed_before and loaded is not None:
+            _refuse_lazy_imports(pipeline, root, shas, dists, loaded)
+            loaded = None
         for age, rng in fold.evals.items():
             predictions[f"{fold.index}:{age}"] = _ensure_predictions(
                 ledger, session, pipeline, fit_id, rng, fold, age, models, report, start
@@ -206,7 +224,7 @@ def _ensure_fit(
     pipeline: Pipeline,
     fold: Fold,
     shas: dict[str, str],
-    env_lock: str,
+    env_lock: dict[str, str],
     models: dict[str, Any],
     report: RunReport,
     start: Callable[[], str],
@@ -217,7 +235,7 @@ def _ensure_fit(
             "pipeline": pipeline.id,
             "train": list(fold.train),
             "import_shas": shas,
-            "env_lock": env_lock,
+            "env_lock": env_lock["sha"],
         }
     )
     if ledger.latest(Event.FIT, fit_id) is not None:
@@ -354,9 +372,34 @@ def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
     return {"commit": commit.strip(), "dirty": dirty, "diff": diff}
 
 
-def _env_lock() -> str:
-    dists = sorted({(d.metadata["Name"], d.version) for d in importlib.metadata.distributions()})
-    return hashing.content_hash({"python": sys.version, "dists": [list(d) for d in dists]})
+def _refuse_lazy_imports(
+    pipeline: Pipeline, root: pathlib.Path, shas: dict[str, str], dists: dict[str, str], loaded: set
+):
+    """A fit that imports inside the function hides code from the memo; refuse and name it."""
+    grown = sorted(set(hashing.import_shas(pipeline.steps, root)) - set(shas))
+    owners = hashing.distribution_owners()
+    tops = {name.partition(".")[0] for name in set(sys.modules) - loaded}
+    lazy = sorted({d for top in tops for d in owners.get(top, ()) if d not in dists})
+    if grown or lazy:
+        raise Refused(
+            f"fit imported lazily: modules {grown}, distributions {lazy}; import at module level"
+        )
+
+
+def _lock_text(dists: dict[str, str]) -> str:
+    lines = [f"python=={platform.python_version()}", *(f"{n}=={v}" for n, v in dists.items())]
+    return "\n".join(lines) + "\n"
+
+
+def _resolution(ledger: Ledger, root: pathlib.Path) -> dict[str, str] | None:
+    for path in [root / "uv.lock", *sorted(root.glob("requirements*.txt"))]:
+        if path.exists():
+            return {"path": path.name, **_text_blob(ledger, path.read_text())}
+    return None
+
+
+def _text_blob(ledger: Ledger, text: str) -> dict[str, str]:
+    return {"sha": ledger.put_blob(text.encode()), "format": formats.Format.TEXT}
 
 
 def _host() -> dict[str, Any]:

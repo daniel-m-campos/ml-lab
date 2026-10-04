@@ -10,6 +10,11 @@ from forestry import formats
 from forestry.declare import scorer, step
 from forestry.session import Range, Session, add_months
 
+try:
+    import bonsai
+except ImportError:
+    bonsai = None
+
 TARGET = "target"
 BPS = 1e4
 BOOK_COLUMNS = (
@@ -114,8 +119,6 @@ class BonsaiConfig:
 
 @step
 def bonsai_fit(session: Session, train: Range, config: BonsaiConfig):
-    import bonsai
-
     rng = window(session, train, config.train_window_months)
     model = bonsai.BonsaiRegressor(
         n_iters=config.n_iters,
@@ -140,8 +143,6 @@ def bonsai_save(model) -> bytes:
 
 @step
 def bonsai_load(payload: bytes):
-    import bonsai
-
     return formats.load_via_file(payload, bonsai.BonsaiRegressor.from_file, ".msgpack")
 
 

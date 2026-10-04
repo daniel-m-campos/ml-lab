@@ -155,7 +155,12 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(ledger
     fit = ledger.events(Event.FIT)[0]
     payload = fit["payload"]
     assert "tests/synthetic.py" in payload["import_shas"]
-    assert payload["model"]["format"] == "arrow-arrays" and payload["env_lock"]
+    assert payload["model"]["format"] == "arrow-arrays"
+    lock = dict(
+        line.split("==", 1) for line in ledger.get_blob(payload["env_lock"]["sha"]).decode().split()
+    )
+    assert {"python", "numpy", "pyarrow"} <= set(lock) and "pytest" not in lock
+    assert lock["forestry"].count("+") == 1
     run = ledger.get(payload["run"])
     assert run["type"] == Event.RUN and "commit" in run["payload"]["git"]
     model = pipeline.load(ledger.get_blob(payload["model"]["sha"]))
@@ -180,6 +185,48 @@ def test_a_changed_source_file_is_a_new_fit_and_entry_but_the_same_pipeline(ledg
     board = {r["pipeline"]: r for r in review.board(ledger, evaluation)}
     assert board["ridge_3m"]["status"] == "scored"
     assert decisions.baseline(ledger, evaluation) == first_entry
+
+
+def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resumes(
+    ledger, dataset, evaluation
+):
+    folds = runs.expand(evaluation, data.session(ledger, dataset))
+    synthetic.FLAKY_CALLS.clear()
+    flaky = synthetic.flaky()
+    report = _run(ledger, evaluation, flaky, synthetic.ridge(1))
+    assert list(report.failed) == [flaky.id] and "boom" in report.failed[flaky.id]
+    assert report.fits_computed == 2 + len(folds) and report.entries_scored == 1
+    failure = ledger.events(Event.FAILED, key=flaky.id)[-1]
+    assert "RuntimeError" in ledger.get_blob(failure["payload"]["traceback"]["sha"]).decode()
+    board = {r["pipeline"]: r for r in review.board(ledger, evaluation)}
+    assert board["flaky"]["status"] == "failed" and "boom" in board["flaky"]["why"]
+    assert "traceback" in review.detail(ledger, evaluation, flaky.id)
+    again = _run(ledger, evaluation, flaky)
+    assert again.fits_computed == len(folds) - 2 and again.entries_scored == 1
+    assert review.board(ledger, evaluation, {flaky.id})[0]["status"] == "scored"
+
+
+def test_a_fit_that_imports_a_distribution_lazily_is_refused():
+    pipeline = synthetic.ridge(3)
+    shas = hashing.import_shas(pipeline.steps, REPO)
+    dists = hashing.imported_dists(pipeline.steps, REPO)
+    before_pytest = {name for name in sys.modules if not name.startswith("pytest")}
+    with pytest.raises(Refused, match="distributions \\['pytest'\\]"):
+        runs._refuse_lazy_imports(pipeline, REPO, shas, dists, before_pytest)
+
+
+def test_the_board_shows_declared_pipelines_and_the_baseline(ledger, evaluation):
+    _seat(ledger, evaluation, synthetic.ridge(1))
+    _run(ledger, evaluation, synthetic.ridge(3), synthetic.ridge(6))
+    names = [r["pipeline"] for r in review.board(ledger, evaluation, {synthetic.ridge(6).id})]
+    assert names == ["ridge_1m", "ridge_6m"]
+    assert len(review.board(ledger, evaluation)) == 3
+    detail = review.detail(ledger, evaluation, synthetic.ridge(6).id)
+    assert detail["env_diff"] == {} and detail["config_diff"]
+    run = ledger.events(Event.RUN)[0]["payload"]
+    assert run["resolution"] is None or run["resolution"]["path"].startswith(
+        ("uv.lock", "requirements")
+    )
 
 
 # Decide ===========================================================================================

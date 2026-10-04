@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
-
 from forestry.declare import Evaluation, Pipeline
 from optiver import steps
 
@@ -33,7 +31,7 @@ bonsai_depthwise = Pipeline(
     ),
 )
 bonsai_leafwise = bonsai_depthwise.with_config(grower="leafwise").named("bonsai_lw")
-bonsai_available = importlib.util.find_spec("bonsai") is not None
+bonsai_available = steps.bonsai is not None
 
 pipelines = ridge_windows + ([bonsai_depthwise, bonsai_leafwise] if bonsai_available else [])
 

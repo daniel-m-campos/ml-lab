@@ -16,10 +16,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import hashlib
+import importlib.metadata
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -142,21 +145,22 @@ def repo_root(start: pathlib.Path) -> pathlib.Path:
         return directory.resolve()
 
 
-def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
-    """Git blob shas of every module under ``code_root`` reachable from the steps' modules."""
+def closure(funcs: Iterable[Callable], code_root: pathlib.Path) -> list[types.ModuleType]:
+    """Every module reachable from the steps' modules through module-level names.
+
+    Modules outside ``code_root`` are reached but not expanded, so a third-party package appears
+    once and its internals are never walked.
+    """
     root = code_root.resolve()
-    seen: dict[str, str] = {}
     queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
-    visited: set[str] = set()
+    seen: dict[str, types.ModuleType] = {}
     while queue:
         module = queue.pop()
-        if module.__name__ in visited:
+        if module.__name__ in seen:
             continue
-        visited.add(module.__name__)
-        path = _module_path(module, root)
-        if path is None:
+        seen[module.__name__] = module
+        if _module_path(module, root) is None:
             continue
-        seen[path.relative_to(root).as_posix()] = git_blob_sha(path.read_bytes())
         for value in vars(module).values():
             if isinstance(value, types.ModuleType):
                 queue.append(value)
@@ -164,7 +168,43 @@ def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str,
                 owner = sys.modules.get(value.__module__)
                 if owner is not None:
                     queue.append(owner)
+    return list(seen.values())
+
+
+def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
+    """Git blob shas of every module under ``code_root`` reachable from the steps' modules."""
+    root = code_root.resolve()
+    seen: dict[str, str] = {}
+    for module in closure(funcs, root):
+        path = _module_path(module, root)
+        if path is not None:
+            seen[path.relative_to(root).as_posix()] = git_blob_sha(path.read_bytes())
     return dict(sorted(seen.items()))
+
+
+def imported_dists(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
+    """Installed distributions the steps' closure imports, with their requirements, name to version.
+
+    An editable install's version carries a hash of its source files, since the version does not
+    move when the files do.
+    """
+    owners = distribution_owners()
+    tops = {m.__name__.partition(".")[0] for m in closure(funcs, code_root)}
+    todo = {d for top in tops for d in owners.get(top, (top,))}
+    found: dict[str, str] = {}
+    while todo:
+        try:
+            dist = importlib.metadata.distribution(todo.pop())
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        name = dist.metadata["Name"]
+        if name in found:
+            continue
+        found[name] = dist.version + _editable_suffix(dist)
+        for req in dist.requires or ():
+            if "extra ==" not in req:
+                todo.add(re.match(r"[A-Za-z0-9_.-]+", req).group())
+    return dict(sorted(found.items()))
 
 
 def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path | None:
@@ -175,3 +215,20 @@ def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path |
     if root not in path.parents or ".venv" in path.parts or not path.suffix == ".py":
         return None
     return path
+
+
+@functools.cache
+def distribution_owners() -> dict[str, list[str]]:
+    return importlib.metadata.packages_distributions()
+
+
+def _editable_suffix(dist: importlib.metadata.Distribution) -> str:
+    text = dist.read_text("direct_url.json")
+    info = json.loads(text) if text else {}
+    if not info.get("dir_info", {}).get("editable"):
+        return ""
+    root = pathlib.Path(info["url"].removeprefix("file://"))
+    files = [f for f in sorted(root.rglob("*.py")) if not any(p.startswith(".") for p in f.parts)]
+    return "+" + content_hash(
+        {f.relative_to(root).as_posix(): git_blob_sha(f.read_bytes()) for f in files}
+    )

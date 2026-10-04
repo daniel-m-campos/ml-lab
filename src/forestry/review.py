@@ -16,33 +16,57 @@ from forestry.declare import Evaluation
 from forestry.ledger import Event, Ledger
 
 
-def board(ledger: Ledger, evaluation: Evaluation) -> list[dict[str, Any]]:
-    """One row per pipeline's latest entry: status, verdict and deltas against the baseline."""
+def board(
+    ledger: Ledger, evaluation: Evaluation, declared: set[str] | None = None
+) -> list[dict[str, Any]]:
+    """One row per pipeline: its latest entry against the baseline, or its latest failure.
+
+    ``declared`` keeps only those pipeline ids plus the baseline; None keeps every pipeline.
+    """
     rows = ledger.sql("SELECT * FROM board WHERE evaluation = ?", (evaluation.id,))
     age = str(evaluation.ages[0])
-    out = []
+    out = {}
     for row in rows:
         metrics = json.loads(row["aggregate"])[age]
         against = json.loads(row["baseline_aggregate"])[age] if row["baseline_aggregate"] else None
         compared = against is not None and row["entry"] != row["baseline"]
-        out.append(
-            {
-                "entry": row["entry"],
-                "id": row["pipeline"],
-                "pipeline": row["name"],
-                "status": row["status"],
-                "verdict": decisions.dominance(metrics, against, evaluation.directions)
-                if compared
-                else None,
-                "deltas": decisions.relative_deltas(metrics, against, evaluation.directions)
-                if compared
-                else {},
-                "metrics": metrics,
-                "why": _last_why(ledger, row["entry"]),
-            }
-        )
-    out.sort(key=lambda r: r["status"] != "baseline")
-    return out
+        out[row["pipeline"]] = {
+            "entry": row["entry"],
+            "id": row["pipeline"],
+            "pipeline": row["name"],
+            "status": row["status"],
+            "verdict": decisions.dominance(metrics, against, evaluation.directions)
+            if compared
+            else None,
+            "deltas": decisions.relative_deltas(metrics, against, evaluation.directions)
+            if compared
+            else {},
+            "metrics": metrics,
+            "why": _last_why(ledger, row["entry"]),
+            "seq": row["seq"],
+        }
+    for failure in ledger.events(Event.FAILED, stream=evaluation.id):
+        pipeline_id = failure["key"]
+        if pipeline_id in out and out[pipeline_id]["seq"] > failure["seq"]:
+            continue
+        out[pipeline_id] = {
+            "entry": None,
+            "id": pipeline_id,
+            "pipeline": ledger.get(pipeline_id)["payload"]["name"],
+            "status": "failed",
+            "verdict": None,
+            "deltas": {},
+            "metrics": {},
+            "why": failure["payload"]["error"],
+            "seq": failure["seq"],
+        }
+    kept = [
+        r
+        for r in out.values()
+        if declared is None or r["id"] in declared or r["status"] == "baseline"
+    ]
+    kept.sort(key=lambda r: r["status"] != "baseline")
+    return kept
 
 
 def detail(ledger: Ledger, evaluation: Evaluation, pipeline_id: str) -> dict[str, Any]:
@@ -51,6 +75,12 @@ def detail(ledger: Ledger, evaluation: Evaluation, pipeline_id: str) -> dict[str
     if not rows:
         raise KeyError(f"pipeline {pipeline_id} has no entry under this evaluation")
     row = rows[0]
+    if row["entry"] is None:
+        failure = ledger.events(Event.FAILED, stream=evaluation.id, key=pipeline_id)[-1]
+        return {
+            **row,
+            "traceback": ledger.get_blob(failure["payload"]["traceback"]["sha"]).decode(),
+        }
     config = ledger.get(pipeline_id)["payload"]["config"]
     head = decisions.baseline(ledger, evaluation)
     base_config = (
@@ -65,6 +95,7 @@ def detail(ledger: Ledger, evaluation: Evaluation, pipeline_id: str) -> dict[str
         **row,
         "config": config,
         "config_diff": _diff(config, base_config) if base_config else {},
+        "env_diff": _diff(_lock(ledger, row["entry"]), _lock(ledger, head)) if base_config else {},
         "entries": [
             {"entry": e["id"], "run": e["payload"]["run"], "at": e["at"], "actor": e["actor"]}
             for e in entries
@@ -107,6 +138,14 @@ def _name(ledger: Ledger, decision: dict[str, Any]) -> str:
 def _last_why(ledger: Ledger, entry_id: str) -> str | None:
     decisions = ledger.events(Event.DECISION, key=entry_id)
     return decisions[-1]["payload"]["why"] if decisions else None
+
+
+def _lock(ledger: Ledger, entry_id: str) -> dict[str, str]:
+    entry = ledger.get(entry_id)["payload"]
+    prediction = ledger.get(next(iter(entry["predictions"].values())))
+    fit = ledger.get(prediction["payload"]["fit"])
+    text = ledger.get_blob(fit["payload"]["env_lock"]["sha"]).decode()
+    return dict(line.split("==", 1) for line in text.split())
 
 
 def _diff(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:

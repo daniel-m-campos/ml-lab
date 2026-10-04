@@ -44,6 +44,15 @@ Context: the cost assumption in the simulator changes.
 
 Done when: both boards read and nothing was overwritten.
 
+## S7: a pipeline fails
+
+Context: a new pipeline raises at its third fit.
+
+1. `fy run $C` records the two fits it finished, appends `pipeline_failed` with the traceback, runs every other pipeline, and exits 1 naming the failure. `fy board $C` shows it as `failed` with the error in the why column; `fy board $C <pipeline>` prints the traceback.
+2. Fix the code, `fy run $C`: the two recorded fits are reused, the rest are computed, the entry is scored.
+
+Done when: the second run's fit count is the fold count minus two.
+
 ## S5: code evolves
 
 Context: a feature in `steps.py` changes.
