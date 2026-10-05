@@ -1,16 +1,16 @@
-"""Splits: how a session becomes folds. Row-based splits need no clock; with one,
+"""Splits: how a dataset becomes folds. Row-based splits need no clock; with one,
 every cut lands on the first row of its timestamp. The calendar walk-forward reads the
-session's ``ts``.
+dataset's ``ts``.
 
 A fold trains on contiguous segments and scores one or more named windows. A splitter is
 a frozen dataclass, so it hashes into the evaluation id like any declaration, and a
-project can declare its own next to its steps.
+project can declare its own next to its functions.
 
 Examples
 --------
 >>> WalkForward(first_cutoff_rows=1000, step_rows=500, window_rows=500).horizons
 ()
->>> BlockedKFold(k=5, embargo_rows=600).folds(session)[2].label  # doctest: +SKIP
+>>> BlockedKFold(k=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
 'block 2'
 """
 
@@ -22,10 +22,8 @@ import datetime
 import numpy as np
 
 from ml_lab import dates
+from ml_lab.dataset import Dataset, Range, Segments
 from ml_lab.identity import Refused
-from ml_lab.session import Range, Session
-
-Segments = tuple[Range, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,7 +48,7 @@ class WalkForward:
     embargo_rows: int = 0
     min_folds: int = 3
 
-    def folds(self, session: Session) -> list[Fold]:
+    def folds(self, dataset: Dataset) -> list[Fold]:
         names = self.horizons or (1,)
         _require(
             step_rows=(self.step_rows, 1),
@@ -60,12 +58,12 @@ class WalkForward:
         )
         out: list[Fold] = []
         cutoff = self.first_cutoff_rows
-        while cutoff + max(names) * self.window_rows <= session.rows:
-            train = ((0, _snap(session, max(cutoff - self.embargo_rows, 0))),)
+        while cutoff + max(names) * self.window_rows <= dataset.rows:
+            train = ((0, _snap(dataset, max(cutoff - self.embargo_rows, 0))),)
             windows = {
                 str(h) if self.horizons else "test": (
-                    _snap(session, cutoff + (h - 1) * self.window_rows),
-                    _snap(session, cutoff + h * self.window_rows),
+                    _snap(dataset, cutoff + (h - 1) * self.window_rows),
+                    _snap(dataset, cutoff + h * self.window_rows),
                 )
                 for h in names
             }
@@ -76,7 +74,7 @@ class WalkForward:
 
 @dataclasses.dataclass(frozen=True)
 class CalendarWalkForward:
-    """Cutoffs on the session clock every ``every`` units, a unit being a calendar
+    """Cutoffs on the dataset clock every ``every`` units, a unit being a calendar
     month or a day the clock has rows on; train on everything before each cutoff
     minus ``embargo_timestamps`` distinct timestamps, score the ``window`` units after
     it. Horizon ``h`` is the ``h``-th window after the cutoff, named ``str(h)``. A
@@ -95,26 +93,26 @@ class CalendarWalkForward:
     end: str | None = None
     min_folds: int = 3
 
-    def folds(self, session: Session) -> list[Fold]:
+    def folds(self, dataset: Dataset) -> list[Fold]:
         _require(
             every=(self.every, 1),
             window=(self.window, 1),
             embargo_timestamps=(self.embargo_timestamps, 0),
             **{f"horizon {h}": (h, 1) for h in self.horizons},
         )
-        stop = dates.as_date(self.end) if self.end else dates.span(session)[1]
-        at = self._boundaries(session, stop)
+        stop = dates.as_date(self.end) if self.end else dates.span(dataset)[1]
+        at = self._boundaries(dataset, stop)
         reach = max(self.horizons) * self.window
         out: list[Fold] = []
         for c in range(0, len(at) - reach, self.every):
-            cut = session.index_of(at[c])
+            cut = dataset.index_of(at[c])
             for _ in range(self.embargo_timestamps):
                 if cut:
-                    cut = int(np.searchsorted(session.ts, session.ts[cut - 1], "left"))
+                    cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
             windows = {
                 str(h): (
-                    session.index_of(at[c + (h - 1) * self.window]),
-                    session.index_of(at[c + h * self.window]),
+                    dataset.index_of(at[c + (h - 1) * self.window]),
+                    dataset.index_of(at[c + h * self.window]),
                 )
                 for h in self.horizons
             }
@@ -131,7 +129,7 @@ class CalendarWalkForward:
             )
         return _at_least(out, self.min_folds, why)
 
-    def _boundaries(self, session: Session, stop: datetime.date) -> list[datetime.date]:
+    def _boundaries(self, dataset: Dataset, stop: datetime.date) -> list[datetime.date]:
         """Unit boundaries from the first cutoff to ``stop`` inclusive."""
         first = dates.as_date(self.first_cutoff)
         if self.unit == "month":
@@ -141,7 +139,7 @@ class CalendarWalkForward:
             return out
         if self.unit != "day":
             raise Refused(f"CalendarWalkForward unit {self.unit!r}: month or day")
-        days = np.unique(session._clock().astype("datetime64[D]")).astype(datetime.date)
+        days = np.unique(dataset._clock().astype("datetime64[D]")).astype(datetime.date)
         return [d for d in days if first <= d < stop] + [stop]
 
 
@@ -156,10 +154,10 @@ class BlockedKFold:
     embargo_rows: int = 0
     train_fraction: float = 1.0
 
-    def folds(self, session: Session) -> list[Fold]:
+    def folds(self, dataset: Dataset) -> list[Fold]:
         _require(k=(self.k, 2), embargo_rows=(self.embargo_rows, 0))
-        n = _snap(session, round(session.rows * self.train_fraction))
-        bounds = [_snap(session, round(i * n / self.k)) for i in range(self.k + 1)]
+        n = _snap(dataset, round(dataset.rows * self.train_fraction))
+        bounds = [_snap(dataset, round(i * n / self.k)) for i in range(self.k + 1)]
         out = []
         for i in range(self.k):
             lo, hi = bounds[i], bounds[i + 1]
@@ -181,19 +179,19 @@ class Holdout:
     train_fraction: float = 0.7
     embargo_rows: int = 0
 
-    def folds(self, session: Session) -> list[Fold]:
+    def folds(self, dataset: Dataset) -> list[Fold]:
         _require(embargo_rows=(self.embargo_rows, 0))
-        n = session.rows
-        cut = _snap(session, round(n * self.train_fraction))
+        n = dataset.rows
+        cut = _snap(dataset, round(n * self.train_fraction))
         test = (min(cut + self.embargo_rows, n), n)
         return _at_least([Fold("holdout", ((0, cut),), {"test": test})], 1)
 
 
-def _snap(session: Session, row: int) -> int:
+def _snap(dataset: Dataset, row: int) -> int:
     """The first row of ``row``'s timestamp, so a cut never splits a cross-section."""
-    if session.ts is None or not 0 < row < session.rows:
+    if dataset.ts is None or not 0 < row < dataset.rows:
         return row
-    return int(np.searchsorted(session.ts, session.ts[row], "left"))
+    return int(np.searchsorted(dataset.ts, dataset.ts[row], "left"))
 
 
 def _require(**fields: tuple[int, int]):

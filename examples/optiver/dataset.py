@@ -8,10 +8,8 @@ import pathlib
 import numpy as np
 import polars as pl
 
-from ml_lab.dataset import record
-from ml_lab.experiment import step
+from ml_lab.dataset import Dataset, record
 from ml_lab.ledger import Ledger
-from ml_lab.session import Session
 
 TRAIN_CSV = pathlib.Path("data/optiver/optiver-trading-at-the-close/train.csv")
 BASE_DATE = datetime.date(2021, 1, 4)
@@ -26,7 +24,7 @@ def available() -> bool:
     return TRAIN_CSV.is_file()
 
 
-def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Session:
+def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Dataset:
     """Read the competition CSV onto a synthetic calendar axis."""
     frame = pl.read_csv(path)
     if stocks is not None:
@@ -39,13 +37,12 @@ def load(stocks: tuple[int, ...] | None, path: pathlib.Path = TRAIN_CSV) -> Sess
     order = np.lexsort((frame["stock_id"].to_numpy(), seconds))
     ts = np.datetime64(BASE_DATE, "s") + seconds.astype("timedelta64[s]")
     floats = frame.drop(DROPPED).cast(pl.Float64)
-    return Session({c: floats[c].to_numpy()[order] for c in floats.columns}, ts[order])
+    return Dataset({c: floats[c].to_numpy()[order] for c in floats.columns}, ts[order])
 
 
-@step
-def drop_null_target(session: Session) -> Session:
-    keep = ~np.isnan(session.columns[TARGET])
-    return Session({k: v[keep] for k, v in session.columns.items()}, session.ts[keep])
+def drop_null_target(dataset: Dataset) -> Dataset:
+    keep = ~np.isnan(dataset.columns[TARGET])
+    return Dataset({k: v[keep] for k, v in dataset.columns.items()}, dataset.ts[keep])
 
 
 def dataset(ledger: Ledger, stocks: str = "all") -> str:

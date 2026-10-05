@@ -1,9 +1,10 @@
 """Every byte conversion the ledger writes, in formats that open without this
 environment.
 
-Datasets and predictions are Parquet. A dict of arrays is one Arrow IPC file. Both are
-written and read by polars, the library a researcher already has open for the data
-itself. Libraries with a path-only API round-trip through a temp file.
+Datasets (through ``ml_lab.dataset``) and predictions are Parquet. A dict of arrays is
+one Arrow IPC file. Both are written and read by polars, the library a researcher
+already has open for the data itself. Libraries with a path-only API round-trip through
+a temp file.
 
 Examples
 --------
@@ -24,8 +25,6 @@ from typing import Any
 
 import numpy as np
 import polars as pl
-
-from ml_lab.session import Session
 
 TS = "ts"
 PREDICTION = "prediction"
@@ -50,9 +49,9 @@ KNOWN: dict[str, bool] = {
     Format.PICKLE: False,
     Format.ZIP: True,
 }
-"""Format name to whether it opens without this Python environment. A save step must
-declare one of these; add an entry to admit a new format. A ``zip`` model is portable
-iff every member is; see ``zip_save``."""
+"""Format name to whether it opens without this Python environment. A pipeline's
+``format`` must be one of these; add an entry to admit a new format. A ``zip`` model is
+portable iff every member is; see ``zip_save``."""
 
 MANIFEST = "formats.json"
 
@@ -92,40 +91,6 @@ def zip_formats(payload: bytes) -> dict[str, str]:
         return json.loads(archive.read(MANIFEST))
 
 
-# Sessions =============================================================================
-
-
-def session_save(session: Session) -> bytes:
-    """A session as one Parquet file: ``ts`` as a nanosecond timestamp plus one column
-    per array.
-    """
-    if TS in session.columns:
-        raise ValueError(
-            f"a session column cannot be named {TS!r}: ts is the clock's name"
-        )
-    stamps = {} if session.ts is None else {TS: session.ts}
-    return _parquet_bytes(pl.DataFrame({**stamps, **session.columns}))
-
-
-def session_load(source: pathlib.Path | bytes) -> Session:
-    """A stored session, read one column at a time so loading peaks near its size."""
-    if isinstance(source, bytes):
-        source = io.BytesIO(source)
-    names = list(pl.read_parquet_schema(source))
-    columns = {
-        n: pl.read_parquet(source, columns=[n])[n].to_numpy() for n in names if n != TS
-    }
-    ts = pl.read_parquet(source, columns=[TS])[TS].to_numpy() if TS in names else None
-    return Session(columns, ts)
-
-
-def session_from_frame(frame: pl.DataFrame, ts: str = TS) -> Session:
-    """A session from a frame; a ``ts`` timestamp column is optional."""
-    stamps = frame[ts].to_numpy() if ts in frame.columns else None
-    columns = {name: frame[name].to_numpy() for name in frame.columns if name != ts}
-    return Session(columns, stamps)
-
-
 # Series ===============================================================================
 
 
@@ -137,7 +102,7 @@ def series_save(values: np.ndarray) -> bytes:
         if values.ndim == 1
         else {f"{PREDICTION}_{i}": c for i, c in enumerate(values.T)}
     )
-    return _parquet_bytes(pl.DataFrame(columns))
+    return parquet_bytes(pl.DataFrame(columns))
 
 
 def series_load(payload: bytes) -> np.ndarray:
@@ -198,7 +163,7 @@ def load_via_file[T](payload: bytes, read: Callable[[str], T], suffix: str) -> T
         return read(handle.name)
 
 
-def _parquet_bytes(frame: pl.DataFrame) -> bytes:
+def parquet_bytes(frame: pl.DataFrame) -> bytes:
     sink = io.BytesIO()
     frame.write_parquet(sink)
     return sink.getvalue()

@@ -1,4 +1,4 @@
-"""Calendar arithmetic for sessions with a clock: the calendar split, month lookbacks.
+"""Calendar arithmetic for datasets with a clock: the calendar split, month lookbacks.
 
 Examples
 --------
@@ -13,7 +13,7 @@ import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ml_lab.session import Session
+    from ml_lab.dataset import Dataset
 
 
 def as_date(when: str | datetime.date | datetime.datetime) -> datetime.date:
@@ -35,6 +35,6 @@ def add_months(date: datetime.date, months: int) -> datetime.date:
     )
 
 
-def span(session: Session) -> tuple[datetime.date, datetime.date]:
-    """The session's first date and the day after its last."""
-    return session.date_at(0), session.date_at(-1) + datetime.timedelta(days=1)
+def span(dataset: Dataset) -> tuple[datetime.date, datetime.date]:
+    """The dataset's first date and the day after its last."""
+    return dataset.date_at(0), dataset.date_at(-1) + datetime.timedelta(days=1)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ml_lab import formats
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.splits import CalendarWalkForward
 from optiver import steps
@@ -13,6 +14,7 @@ ridge = Pipeline(
     save=steps.ridge_save,
     load=steps.ridge_load,
     config=steps.RidgeConfig(train_window_months=3, alpha=1.0),
+    format=formats.Format.ARROW_ARRAYS,
 )
 ridge_windows = [
     ridge.with_config(train_window_months=m).named(f"ridge_{m}m") for m in (1, 3, 6)
@@ -32,6 +34,7 @@ bonsai_depthwise = Pipeline(
         learning_rate=0.05,
         max_bin=255,
     ),
+    format=formats.Format.BONSAI_MSGPACK,
 )
 bonsai_leafwise = bonsai_depthwise.with_config(grower="leafwise").named("bonsai_lw")
 bonsai_available = steps.bonsai is not None
@@ -53,7 +56,7 @@ def evaluations(dataset: str) -> list[Evaluation]:
                 embargo_timestamps=0,
                 min_folds=3,
             ),
-            scorer=steps.taker_sim,
+            scorer=steps.taker,
             config=steps.SimConfig(cost_bps=0.5, threshold_bps=0.0),
         )
     ]

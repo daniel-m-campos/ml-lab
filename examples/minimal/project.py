@@ -15,11 +15,10 @@ import dataclasses
 import numpy as np
 
 from ml_lab import formats
-from ml_lab.dataset import record
-from ml_lab.experiment import Evaluation, Pipeline, scorer, step
+from ml_lab.dataset import Dataset, Range, Segments, record
+from ml_lab.experiment import Evaluation, Pipeline, Scorer
 from ml_lab.ledger import Ledger
-from ml_lab.session import Range, Session
-from ml_lab.splits import Segments, WalkForward
+from ml_lab.splits import WalkForward
 
 
 def dataset(ledger: Ledger, rows: str = "5000") -> str:
@@ -27,9 +26,13 @@ def dataset(ledger: Ledger, rows: str = "5000") -> str:
     random = np.random.default_rng(0)
     x = random.normal(size=int(rows))
     y = 0.5 * x + random.normal(size=int(rows))
-    session = Session({"x": x, "y": y})
     return record(
-        ledger, session, source="toy", params={"rows": rows}, filters=(), targets=("y",)
+        ledger,
+        Dataset({"x": x, "y": y}),
+        source="toy",
+        params={"rows": rows},
+        filters=(),
+        targets=("y",),
     )
 
 
@@ -38,31 +41,33 @@ class RidgeConfig:
     alpha: float = 1.0
 
 
-@step
-def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> np.ndarray:
-    x = session.column("x", train)
-    y = session.column("y", train)
+def ridge_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> np.ndarray:
+    x = dataset.column("x", train)
+    y = dataset.column("y", train)
     return np.array([x @ y / (x @ x + config.alpha)])
 
 
-@step
-def ridge_predict(model: np.ndarray, session: Session, rng: Range) -> np.ndarray:
-    return model[0] * session.column("x", rng)
+def ridge_predict(model: np.ndarray, dataset: Dataset, rng: Range) -> np.ndarray:
+    return model[0] * dataset.column("x", rng)
 
 
-@step(format=formats.Format.ARROW_ARRAYS)
 def ridge_save(model: np.ndarray) -> bytes:
     return formats.arrays_save({"slope": model})
 
 
-@step
 def ridge_load(payload: bytes) -> np.ndarray:
     return formats.arrays_load(payload)["slope"]
 
 
-@scorer(metrics=lambda series: {"mse": float(series.mean())}, directions={"mse": "min"})
-def squared_error(pred: np.ndarray, session: Session, rng: Range, config) -> np.ndarray:
-    return (pred - session.column("y", rng)) ** 2
+def squared_error(pred: np.ndarray, dataset: Dataset, rng: Range, config) -> np.ndarray:
+    return (pred - dataset.column("y", rng)) ** 2
+
+
+mse = Scorer(
+    squared_error,
+    metrics=lambda series: {"mse": float(series.mean())},
+    directions={"mse": "min"},
+)
 
 
 ridge = Pipeline(
@@ -72,6 +77,7 @@ ridge = Pipeline(
     save=ridge_save,
     load=ridge_load,
     config=RidgeConfig(),
+    format=formats.Format.ARROW_ARRAYS,
 )
 pipelines = [ridge, ridge.with_config(alpha=100.0).named("ridge_shrunk")]
 
@@ -82,6 +88,6 @@ def evaluations(dataset: str) -> list[Evaluation]:
             name="validation",
             dataset=dataset,
             split=WalkForward(first_cutoff_rows=2000, step_rows=1000, window_rows=1000),
-            scorer=squared_error,
+            scorer=mse,
         )
     ]

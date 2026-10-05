@@ -7,10 +7,9 @@ import dataclasses
 import numpy as np
 
 from ml_lab import formats
+from ml_lab.dataset import Dataset, Range, Segments
 from ml_lab.dates import add_months
-from ml_lab.experiment import scorer, step
-from ml_lab.session import Range, Session
-from ml_lab.splits import Segments
+from ml_lab.experiment import Scorer
 
 try:
     import bonsai
@@ -38,9 +37,9 @@ BOOK_COLUMNS = (
 # Features =============================================================================
 
 
-def features(session: Session, rng: Range) -> np.ndarray:
+def features(dataset: Dataset, rng: Range) -> np.ndarray:
     """Public-notebook style features over a range; NaN becomes 0."""
-    col = {name: session.column(name, rng) for name in BOOK_COLUMNS}
+    col = {name: dataset.column(name, rng) for name in BOOK_COLUMNS}
     wap = col["wap"]
     X = np.column_stack(
         [
@@ -59,11 +58,11 @@ def features(session: Session, rng: Range) -> np.ndarray:
     return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def window(session: Session, train: Segments, months: int) -> Range:
+def window(dataset: Dataset, train: Segments, months: int) -> Range:
     """The last ``months`` of the train segments as one range."""
     start, end = train[0][0], train[-1][1]
     return (
-        max(start, session.index_of(add_months(session.date_at(end - 1), -months))),
+        max(start, dataset.index_of(add_months(dataset.date_at(end - 1), -months))),
         end,
     )
 
@@ -83,11 +82,10 @@ class RidgeModel:
     bias: float
 
 
-@step
-def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
-    rng = window(session, train, config.train_window_months)
-    X = features(session, rng)
-    y = session.column(TARGET, rng)
+def ridge_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+    rng = window(dataset, train, config.train_window_months)
+    X = features(dataset, rng)
+    y = dataset.column(TARGET, rng)
     x_mean, y_mean = X.mean(axis=0), y.mean()
     Xc = X - x_mean
     weights = np.linalg.solve(
@@ -96,19 +94,16 @@ def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeMo
     return RidgeModel(weights, float(y_mean - x_mean @ weights))
 
 
-@step
-def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
-    return features(session, rng) @ model.weights + model.bias
+def ridge_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
+    return features(dataset, rng) @ model.weights + model.bias
 
 
-@step(format=formats.Format.ARROW_ARRAYS)
 def ridge_save(model: RidgeModel) -> bytes:
     return formats.arrays_save(
         {"weights": model.weights, "bias": np.array([model.bias])}
     )
 
 
-@step
 def ridge_load(payload: bytes) -> RidgeModel:
     arrays = formats.arrays_load(payload)
     return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
@@ -128,9 +123,8 @@ class BonsaiConfig:
     n_threads: int = 0
 
 
-@step
-def bonsai_fit(session: Session, train: Segments, config: BonsaiConfig):
-    rng = window(session, train, config.train_window_months)
+def bonsai_fit(dataset: Dataset, train: Segments, config: BonsaiConfig):
+    rng = window(dataset, train, config.train_window_months)
     model = bonsai.BonsaiRegressor(
         n_iters=config.n_iters,
         learning_rate=config.learning_rate,
@@ -139,25 +133,22 @@ def bonsai_fit(session: Session, train: Segments, config: BonsaiConfig):
         max_bin=config.max_bin,
         n_threads=config.n_threads,
     )
-    return model.fit(features(session, rng), session.column(TARGET, rng))
+    return model.fit(features(dataset, rng), dataset.column(TARGET, rng))
 
 
-@step
-def bonsai_predict(model, session: Session, rng: Range) -> np.ndarray:
-    return model.predict(features(session, rng))
+def bonsai_predict(model, dataset: Dataset, rng: Range) -> np.ndarray:
+    return model.predict(features(dataset, rng))
 
 
-@step(format="bonsai-msgpack")
 def bonsai_save(model) -> bytes:
     return formats.bytes_via_file(model.save, ".msgpack")
 
 
-@step
 def bonsai_load(payload: bytes):
     return formats.load_via_file(payload, bonsai.BonsaiRegressor.from_file, ".msgpack")
 
 
-# Scorers ==============================================================================
+# Scorer ===============================================================================
 
 
 @dataclasses.dataclass(frozen=True)
@@ -190,20 +181,23 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
     }
 
 
-@scorer(
-    metrics=sim_metrics,
-    directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
-    columns=("pnl", "flips"),
-)
 def taker_sim(
-    pred: np.ndarray, session: Session, rng: Range, config: SimConfig
+    pred: np.ndarray, dataset: Dataset, rng: Range, config: SimConfig
 ) -> np.ndarray:
     """Per-stock taker simulation in bps: a (pnl, flips) series."""
-    truth = session.column(TARGET, rng)
-    stock = session.column("stock_id", rng)
+    truth = dataset.column(TARGET, rng)
+    stock = dataset.column("stock_id", rng)
     position = np.sign(pred) * (np.abs(pred) > config.threshold_bps)
     flips = np.zeros_like(position)
     for sid in np.unique(stock):
         rows = np.flatnonzero(stock == sid)
         flips[rows] = np.abs(np.diff(position[rows], prepend=0.0))
     return np.column_stack([position * truth - config.cost_bps * flips, flips])
+
+
+taker = Scorer(
+    taker_sim,
+    metrics=sim_metrics,
+    directions={"pnl": "max", "sharpe": "max", "max_dd": "min", "turnover": "min"},
+    columns=("pnl", "flips"),
+)

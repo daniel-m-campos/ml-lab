@@ -10,12 +10,11 @@ from typing import Any
 import numpy as np
 
 from ml_lab import formats
-from ml_lab.dataset import record
+from ml_lab.dataset import Dataset, Range, Segments, record
 from ml_lab.dates import add_months, as_date
-from ml_lab.experiment import Evaluation, Pipeline, scorer, step
+from ml_lab.experiment import Evaluation, Pipeline, Scorer
 from ml_lab.ledger import Ledger
-from ml_lab.session import Range, Session
-from ml_lab.splits import CalendarWalkForward, Segments
+from ml_lab.splits import CalendarWalkForward
 
 FEATURES = ("f0", "f1", "f2")
 TARGET = "ret_1"
@@ -24,7 +23,7 @@ SECONDS_PER_DAY = 86_400
 
 def generate(
     *, start: str, months: int, rows_per_day: int, seed: int, drift_at: str
-) -> Session:
+) -> Dataset:
     """Three features and a linear target whose weights flip at ``drift_at``."""
     first = as_date(start)
     days = (add_months(first, months) - first).days
@@ -45,12 +44,11 @@ def generate(
     )
     columns = {name: features[:, i] for i, name in enumerate(FEATURES)}
     columns[TARGET] = target
-    return Session(columns, ts)
+    return Dataset(columns, ts)
 
 
-@step
-def keep_all(session: Session) -> Session:
-    return session
+def keep_all(dataset: Dataset) -> Dataset:
+    return dataset
 
 
 def dataset(ledger: Ledger, months: int = 12, seed: int = 7) -> str:
@@ -84,17 +82,16 @@ class RidgeModel:
     bias: float
 
 
-@step
-def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
+def ridge_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
     rows = train
-    if session.ts is not None and config.train_window_months:
+    if dataset.ts is not None and config.train_window_months:
         start, end = train[0][0], train[-1][1]
-        since = session.index_of(
-            add_months(session.date_at(end - 1), -config.train_window_months)
+        since = dataset.index_of(
+            add_months(dataset.date_at(end - 1), -config.train_window_months)
         )
         rows = ((max(start, since), end),)
-    X = session.matrix(rows, config.columns)
-    y = session.column(TARGET, rows)
+    X = dataset.matrix(rows, config.columns)
+    y = dataset.column(TARGET, rows)
     x_mean, y_mean = X.mean(axis=0), y.mean()
     Xc = X - x_mean
     weights = np.linalg.solve(
@@ -103,31 +100,27 @@ def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeMo
     return RidgeModel(weights, float(y_mean - x_mean @ weights))
 
 
-@step
-def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
-    columns = FEATURES + session.feature_columns
-    return session.matrix(rng, columns) @ model.weights + model.bias
+def ridge_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
+    columns = FEATURES + dataset.feature_columns
+    return dataset.matrix(rng, columns) @ model.weights + model.bias
 
 
 FEATURE_CALLS: list[int] = []
 
 
-@step
-def lagged_f0(session: Session) -> dict[str, np.ndarray]:
+def lagged_f0(dataset: Dataset) -> dict[str, np.ndarray]:
     """Yesterday's f0: row-causal, so the probe passes."""
-    FEATURE_CALLS.append(session.rows)
-    return {"f0_lag": np.concatenate([[np.nan], session.columns["f0"][:-1]])}
+    FEATURE_CALLS.append(dataset.rows)
+    return {"f0_lag": np.concatenate([[np.nan], dataset.columns["f0"][:-1]])}
 
 
-@step
-def next_f0(session: Session) -> dict[str, np.ndarray]:
+def next_f0(dataset: Dataset) -> dict[str, np.ndarray]:
     """Tomorrow's f0: reads past the row, so the probe refuses it."""
-    return {"f0_lag": np.roll(session.columns["f0"], -1)}
+    return {"f0_lag": np.roll(dataset.columns["f0"], -1)}
 
 
-@step
-def target_copy(session: Session) -> dict[str, np.ndarray]:
-    return {"f0_lag": session.columns[TARGET]}
+def target_copy(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": dataset.columns[TARGET]}
 
 
 def featured(pipeline: Pipeline, features: Any = lagged_f0, name: str = "") -> Pipeline:
@@ -141,46 +134,39 @@ FLAKY_CALLS: list[int] = []
 SEEN_ROWS: list[int] = []
 
 
-@step
-def peeking_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
+def peeking_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Records how many rows it could see; the guard test reads it."""
-    SEEN_ROWS.append(session.rows)
-    return ridge_fit(session, train, config)
+    SEEN_ROWS.append(dataset.rows)
+    return ridge_fit(dataset, train, config)
 
 
-@step
-def flaky_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
+def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Raises on its third call ever; the test clears ``FLAKY_CALLS`` to arm it."""
     FLAKY_CALLS.append(train[-1][1])
     if len(FLAKY_CALLS) == 3:
         raise RuntimeError("boom at the third fit")
-    return ridge_fit(session, train, config)
+    return ridge_fit(dataset, train, config)
 
 
-@step(format=formats.Format.ARROW_ARRAYS)
 def ridge_save(model: RidgeModel) -> bytes:
     return formats.arrays_save(
         {"weights": model.weights, "bias": np.array([model.bias])}
     )
 
 
-@step
 def ridge_load(payload: bytes) -> RidgeModel:
     arrays = formats.arrays_load(payload)
     return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
 
 
-@step
-def scale(pred: np.ndarray, session: Session, rng: Range, factor: float) -> np.ndarray:
+def scale(pred: np.ndarray, dataset: Dataset, rng: Range, factor: float) -> np.ndarray:
     return pred * factor
 
 
-@step(format=formats.Format.PICKLE)
 def pickle_save(model: RidgeModel) -> bytes:
     return pickle.dumps(model)
 
 
-@step
 def pickle_load(payload: bytes) -> RidgeModel:
     return pickle.loads(payload)
 
@@ -195,37 +181,32 @@ class BlendModel:
     weights: np.ndarray
 
 
-@step
 def blend_fit(
-    session: Session, train: Segments, config: BlendConfig, members: list[np.ndarray]
+    dataset: Dataset, train: Segments, config: BlendConfig, members: list[np.ndarray]
 ) -> BlendModel:
     """Least squares on the members' in-sample predictions, shrunk toward equal."""
     x = np.column_stack(members)
-    y = session.column(TARGET, train)
+    y = dataset.column(TARGET, train)
     fitted = np.linalg.lstsq(x, y, rcond=None)[0]
     equal = np.full(len(members), 1.0 / len(members))
     return BlendModel((1 - config.shrink) * fitted + config.shrink * equal)
 
 
-@step
 def blend_predict(
-    model: BlendModel, session: Session, rng: Range, members: list[np.ndarray]
+    model: BlendModel, dataset: Dataset, rng: Range, members: list[np.ndarray]
 ) -> np.ndarray:
     return np.column_stack(members) @ model.weights
 
 
-@step(format=formats.Format.ARROW_ARRAYS)
 def blend_save(model: BlendModel) -> bytes:
     return formats.arrays_save({"weights": model.weights})
 
 
-@step
 def blend_load(payload: bytes) -> BlendModel:
     return BlendModel(formats.arrays_load(payload)["weights"])
 
 
-@step
-def equal_fit(session: Session, train: Segments, config: BlendConfig) -> BlendModel:
+def equal_fit(dataset: Dataset, train: Segments, config: BlendConfig) -> BlendModel:
     """Fixed equal weights: three arguments, so no in-sample member predictions."""
     return BlendModel(np.full(2, 0.5))
 
@@ -238,37 +219,29 @@ def blend(*members: Pipeline, shrink: float = 1.0) -> Pipeline:
         save=blend_save,
         load=blend_load,
         config=BlendConfig(shrink),
+        format=formats.Format.ARROW_ARRAYS,
         members=members,
         in_sample=True,
     )
 
 
-@step
-def cheating_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+def cheating_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
     """Returns the target itself; the run hides it inside the window."""
-    return session.column(TARGET, rng)
+    return dataset.column(TARGET, rng)
 
 
-@step
-def peeking_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+def peeking_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
     """Adds the window's mean feature to every row: reads the future inside it."""
-    return ridge_predict(model, session, rng) + session.column("f0", rng).mean()
+    return ridge_predict(model, dataset, rng) + dataset.column("f0", rng).mean()
 
 
-@step
-def self_editing_fit(session: Session, train: Segments, config: RidgeConfig):
+def self_editing_fit(dataset: Dataset, train: Segments, config: RidgeConfig):
     """Appends a comment to its own module while fitting."""
     path = pathlib.Path(__file__)
     path.write_text(path.read_text() + "\n# edited during the run\n")
-    return ridge_fit(session, train, config)
+    return ridge_fit(dataset, train, config)
 
 
-@step(format="tar")
-def tar_save(model: RidgeModel) -> bytes:
-    return b""
-
-
-@step(format=formats.Format.ZIP)
 def zip_save(model: RidgeModel) -> bytes:
     """A portable zip: the arrow-arrays model plus a text note."""
     return formats.zip_save(
@@ -279,17 +252,14 @@ def zip_save(model: RidgeModel) -> bytes:
     )
 
 
-@step(format=formats.Format.ZIP)
 def zip_pickle_save(model: RidgeModel) -> bytes:
     return formats.zip_save({"model.pkl": (formats.Format.PICKLE, pickle_save(model))})
 
 
-@step
 def zip_load(payload: bytes) -> RidgeModel:
     return ridge_load(formats.zip_load(payload)["model.arrow"])
 
 
-@step
 def zip_pickle_load(payload: bytes) -> RidgeModel:
     return pickle_load(formats.zip_load(payload)["model.pkl"])
 
@@ -303,18 +273,21 @@ def sim_metrics(series: np.ndarray) -> dict[str, float]:
     return {"pnl": float(series[:, 0].sum()), "turnover": float(series[:, 1].sum())}
 
 
-@scorer(
+def sign_sim(
+    pred: np.ndarray, dataset: Dataset, rng: Range, config: SimConfig
+) -> np.ndarray:
+    truth = dataset.column(TARGET, rng)
+    position = np.sign(pred)
+    flips = np.abs(np.diff(position, prepend=0.0))
+    return np.column_stack([position * truth - config.cost * flips, flips])
+
+
+sign_scorer = Scorer(
+    sign_sim,
     metrics=sim_metrics,
     directions={"pnl": "max", "turnover": "min"},
     columns=("pnl", "flips"),
 )
-def sign_sim(
-    pred: np.ndarray, session: Session, rng: Range, config: SimConfig
-) -> np.ndarray:
-    truth = session.column(TARGET, rng)
-    position = np.sign(pred)
-    flips = np.abs(np.diff(position, prepend=0.0))
-    return np.column_stack([position * truth - config.cost * flips, flips])
 
 
 def ridge(window_months: int, alpha: float = 1.0) -> Pipeline:
@@ -325,6 +298,7 @@ def ridge(window_months: int, alpha: float = 1.0) -> Pipeline:
         save=ridge_save,
         load=ridge_load,
         config=RidgeConfig(window_months, alpha),
+        format=formats.Format.ARROW_ARRAYS,
     )
 
 
@@ -338,7 +312,7 @@ def evaluation(dataset: str, cost: float = 0.001, split: Any = None) -> Evaluati
             embargo_timestamps=1,
             min_folds=3,
         ),
-        scorer=sign_sim,
+        scorer=sign_scorer,
         config=SimConfig(cost=cost),
     )
 
@@ -354,31 +328,27 @@ def evaluations(dataset: str) -> list[Evaluation]:
     return [evaluation(dataset)]
 
 
-@step
-def centre_window(pred: np.ndarray, session: Session, rng: Range) -> np.ndarray:
+def centre_window(pred: np.ndarray, dataset: Dataset, rng: Range, config) -> np.ndarray:
     """Subtracts the window's mean prediction: reads later predictions."""
     return pred - pred.mean()
 
 
-@step(format=formats.Format.ARROW_ARRAYS)
 def biasless_save(model: RidgeModel) -> bytes:
     """Drops the bias, as a writer that loses state would."""
     return formats.arrays_save({"weights": model.weights, "bias": np.zeros(1)})
 
 
-@step
-def demean_at_timestamp(model: Any, session: Session, rng: Range) -> np.ndarray:
+def demean_at_timestamp(model: Any, dataset: Dataset, rng: Range) -> np.ndarray:
     """Each row's f0 minus its timestamp's mean: a same-time cross-section."""
-    _, t = np.unique(session.ts[rng[0] : rng[1]], return_inverse=True)
-    x = session.column("f0", rng)
+    _, t = np.unique(dataset.ts[rng[0] : rng[1]], return_inverse=True)
+    x = dataset.column("f0", rng)
     return x - (np.bincount(t, x) / np.bincount(t))[t]
 
 
-@step
-def day_mean(session: Session) -> dict[str, np.ndarray]:
+def day_mean(dataset: Dataset) -> dict[str, np.ndarray]:
     """Each row's f0 minus its day's mean: reads later rows of the same day."""
-    days, d = np.unique(session.ts.astype("datetime64[D]"), return_inverse=True)
-    x = session.columns["f0"]
+    days, d = np.unique(dataset.ts.astype("datetime64[D]"), return_inverse=True)
+    x = dataset.columns["f0"]
     return {"f0_lag": x - (np.bincount(d, x) / np.bincount(d))[d]}
 
 
@@ -391,7 +361,7 @@ def panel(ledger: Ledger, reveal: Any = None) -> str:
     columns = {"f0": f0, "f1": f1, "f2": f2, TARGET: np.r_[f0[4:], np.zeros(4)]}
     return record(
         ledger,
-        Session(columns, ts),
+        Dataset(columns, ts),
         source="panel",
         params={},
         filters=(),
@@ -400,56 +370,47 @@ def panel(ledger: Ledger, reveal: Any = None) -> str:
     )
 
 
-@step
-def label_two_minutes_back(session: Session) -> dict[str, np.ndarray]:
-    return {"f0_lag": np.r_[np.full(4, np.nan), session.columns[TARGET][:-4]]}
+def label_two_minutes_back(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.r_[np.full(4, np.nan), dataset.columns[TARGET][:-4]]}
 
 
-@step
-def label_one_minute_back(session: Session) -> dict[str, np.ndarray]:
-    return {"f0_lag": np.r_[np.full(2, np.nan), session.columns[TARGET][:-2]]}
+def label_one_minute_back(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.r_[np.full(2, np.nan), dataset.columns[TARGET][:-2]]}
 
 
-@step
-def lagged_f1(session: Session) -> dict[str, np.ndarray]:
-    return {"f1_lag": np.concatenate([[np.nan], session.columns["f1"][:-1]])}
+def lagged_f1(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f1_lag": np.concatenate([[np.nan], dataset.columns["f1"][:-1]])}
 
 
-@step
-def jittery_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+def jittery_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
     """Ridge plus a rounding-sized wobble that depends on how many rows it sees."""
-    p = ridge_predict(model, session, rng)
-    return p + 1e-12 * np.abs(p).max() * (session.rows % 3)
+    p = ridge_predict(model, dataset, rng)
+    return p + 1e-12 * np.abs(p).max() * (dataset.rows % 3)
 
 
-@step
-def add_f0_lag(pred: np.ndarray, session: Session, rng: Range) -> np.ndarray:
+def add_f0_lag(pred: np.ndarray, dataset: Dataset, rng: Range, config) -> np.ndarray:
     """Reads a feature column from the postprocess: inherited from the members."""
-    return pred + np.nan_to_num(session.column("f0_lag", rng))
+    return pred + np.nan_to_num(dataset.column("f0_lag", rng))
 
 
-@step
-def label_one_date_back(session: Session) -> dict[str, np.ndarray]:
+def label_one_date_back(dataset: Dataset) -> dict[str, np.ndarray]:
     """The previous trading date's label at the same slot: known from the next date."""
-    return {"f0_lag": np.r_[np.full(20, np.nan), session.columns[TARGET][:-20]]}
+    return {"f0_lag": np.r_[np.full(20, np.nan), dataset.columns[TARGET][:-20]]}
 
 
-@step
-def label_one_row_back(session: Session) -> dict[str, np.ndarray]:
+def label_one_row_back(dataset: Dataset) -> dict[str, np.ndarray]:
     """The previous row's label: same date, so not yet known under a one-date lag."""
-    return {"f0_lag": np.r_[np.nan, session.columns[TARGET][:-1]]}
+    return {"f0_lag": np.r_[np.nan, dataset.columns[TARGET][:-1]]}
 
 
-@step
 def label_memory_fit(
-    session: Session, train: Segments, config: RidgeConfig
+    dataset: Dataset, train: Segments, config: RidgeConfig
 ) -> RidgeModel:
     """Memorizes every label it can see, inside its train segments or not."""
-    return RidgeModel(session.column(TARGET, (0, session.rows)), 0.0)
+    return RidgeModel(dataset.column(TARGET, (0, dataset.rows)), 0.0)
 
 
-@step
-def label_replay_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+def label_replay_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
     """Replays the memorized labels over ``rng``, zero past them."""
     seen = np.zeros(rng[1] - rng[0])
     known = model.weights[rng[0] : rng[1]]

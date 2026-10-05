@@ -1,9 +1,9 @@
 """Identity: content hashes of declarations, ULIDs, and the code and environment a fit
 depends on.
 
-A declaration is hashed by its canonical form: dataclass fields minus labels, registered
-steps by dotted path. Code identity is separate: ``import_shas`` gives the git blob sha
-of every repo module a set of steps imports, computed the way ``git hash-object`` does,
+A declaration is hashed by its canonical form: dataclass fields minus labels, functions
+by dotted path. Code identity is separate: ``import_shas`` gives the git blob sha of
+every repo module a set of functions imports, computed the way ``git hash-object`` does,
 so dirty files count; ``imported_dists`` gives the installed distributions the same
 closure reaches.
 
@@ -41,7 +41,6 @@ class Refused(Exception):
     """The ledger refuses an operation that would break an invariant."""
 
 
-STEP_ATTR = "__ml_lab_step__"
 HASH_LEN = 16
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
@@ -49,36 +48,18 @@ CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # Declarations =========================================================================
 
 
-def register(func: Callable, **meta: Any) -> Callable:
-    """Mark a function as a hashable step by its ``module:qualname`` and return it
-    unchanged.
-    """
-    setattr(func, STEP_ATTR, f"{func.__module__}:{func.__qualname__}")
-    func.__ml_lab_meta__ = meta  # type: ignore[attr-defined]
-    func.configured = functools.partial(configured, func)  # type: ignore[attr-defined]
-    return func
-
-
-def configured(func: Callable, **kwargs: Any) -> Callable:
-    """A step bound to keyword arguments that enter its identity, so two settings of
-    one function are two steps without two definitions.
-    """
-    bound = functools.partial(func, **kwargs)
-    setattr(bound, STEP_ATTR, step_ref(func))
-    bound.__ml_lab_meta__ = {**func.__ml_lab_meta__, "kwargs": kwargs}
-    bound.__module__ = func.__module__
-    return bound
-
-
 def step_ref(func: Callable) -> str:
-    """The ``module:qualname`` of a step; refused for an unregistered callable."""
-    ref = getattr(func, STEP_ATTR, None)
-    if ref is None:
-        name = getattr(func, "__name__", repr(func))
+    """The ``module:qualname`` of a module-level function; refused for a callable its
+    module does not hold under that name: a lambda, a closure, a method, a partial.
+    """
+    module = getattr(func, "__module__", None)
+    name = getattr(func, "__qualname__", repr(func))
+    if getattr(sys.modules.get(module), name, None) is not func:
         raise Refused(
-            f"{name!r} is not a registered step; decorate it with @step at module level"
+            f"{name!r} is not a module-level function of {module}; a declaration "
+            "names functions by their dotted path"
         )
-    return ref
+    return f"{module}:{name}"
 
 
 def canonical(obj: Any) -> Any:
@@ -88,11 +69,7 @@ def canonical(obj: Any) -> Any:
     if isinstance(obj, (np.integer, np.floating, np.bool_)):
         return obj.item()
     if callable(obj):
-        kwargs = getattr(obj, "__ml_lab_meta__", {}).get("kwargs")
-        return {
-            "__step__": step_ref(obj),
-            **({"kwargs": canonical(kwargs)} if kwargs else {}),
-        }
+        return {"__function__": step_ref(obj)}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         fields = {
             f.name: canonical(getattr(obj, f.name))
@@ -194,7 +171,7 @@ def repo_root(start: pathlib.Path) -> pathlib.Path:
 def imports(
     funcs: Iterable[Callable], code_root: pathlib.Path
 ) -> list[types.ModuleType]:
-    """Every module reachable from the steps' modules through module-level names.
+    """Every module reachable from the functions' modules through module-level names.
 
     Modules outside ``code_root`` are reached but not expanded, so a third-party package
     appears once and its internals are never walked, except an editable install's
@@ -227,15 +204,16 @@ def imports(
 
 
 def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
-    """Git blob shas of every module under ``code_root`` reachable from the steps'
-    modules: what ran, as the log records it.
+    """Git blob shas of every module under ``code_root`` reachable from the
+    functions' modules: what ran, as the log records it.
     """
     return {p: git_blob_sha(b) for p, b in _sources(funcs, code_root).items()}
 
 
 def code_keys(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
-    """Per module in the steps' closure, a hash of its syntax tree without positions,
-    comments or layout: what the memo keys on, so a formatter pass keeps every id.
+    """Per module in the functions' closure, a hash of its syntax tree without
+    positions, comments or layout: what the memo keys on, so a formatter pass keeps
+    every id.
     """
     return {p: code_key(b) for p, b in _sources(funcs, code_root).items()}
 
@@ -244,7 +222,7 @@ def code_keys(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, s
 def code_key(source: bytes) -> str:
     """The code as compiled: ``ast.dump`` of the parsed source with every docstring
     removed. Comments, layout, quote style, line numbers and docstrings are out, so a
-    step whose output reads its own source text, ``__doc__`` or line numbers is
+    function whose output reads its own source text, ``__doc__`` or line numbers is
     outside the memo, as under ``python -OO``.
     """
     tree = ast.parse(source)
@@ -272,8 +250,8 @@ def _sources(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, by
 def imported_dists(
     funcs: Iterable[Callable], code_root: pathlib.Path
 ) -> dict[str, str]:
-    """Installed distributions the steps' closure imports, with their requirements, name
-    to version.
+    """Installed distributions the functions' closure imports, with their
+    requirements, name to version.
 
     An editable install's version carries a hash of the code keys of its modules the
     closure reaches, since the version does not move when the files do; see
@@ -302,8 +280,8 @@ def imported_dists(
 def editable_roots(
     funcs: Iterable[Callable], code_root: pathlib.Path
 ) -> dict[str, pathlib.Path]:
-    """Each editable install the steps' closure reaches, name to the git root of the
-    files its modules were imported from.
+    """Each editable install the functions' closure reaches, name to the git root of
+    the files its modules were imported from.
     """
     roots: dict[str, pathlib.Path] = {}
     for module in imports(funcs, code_root):
@@ -391,9 +369,9 @@ def _editable_suffix(
     dist: importlib.metadata.Distribution, modules: Iterable[types.ModuleType]
 ) -> str:
     """``+`` and a hash of the code keys of an editable install's modules among
-    ``modules``, so an edit to a module no step reaches keeps the lock; every module
-    of the install when none is among them, as for one reached only as a requirement.
-    Empty for an install that is not editable.
+    ``modules``, so an edit to a module no function reaches keeps the lock; every
+    module of the install when none is among them, as for one reached only as a
+    requirement. Empty for an install that is not editable.
     """
     if not _is_editable(dist):
         return ""

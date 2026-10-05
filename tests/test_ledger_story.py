@@ -1,6 +1,6 @@
 """The ledger story on synthetic data: ingest, declare, run, read back with SQL.
 
-Every event type in docs/spec.md is written and read back; what each step refuses is
+Every event type in docs/spec.md is written and read back; what each function refuses is
 pinned here.
 """
 
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import importlib
 import io
 import json
@@ -26,12 +27,20 @@ import polars as pl
 import pytest
 
 from ml_lab import cli, formats, identity, runs, splits
-from ml_lab.dataset import data_id, load, record
-from ml_lab.experiment import Evaluation, Pipeline, scorer, step
+from ml_lab.dataset import (
+    Dataset,
+    Range,
+    Segments,
+    data_id,
+    load,
+    record,
+    rows_load,
+    rows_save,
+)
+from ml_lab.experiment import Evaluation, Pipeline, Scorer
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.panel import Panel
 from ml_lab.runs import _load_predictions
-from ml_lab.session import Range, Session
 from tests import synthetic
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -127,11 +136,9 @@ def _editable(
     imported = f"import {name} as a" if single else f"from {name} import a"
     (study / f"{name}_steps.py").write_text(
         f"{imported}\n"
-        "from ml_lab.experiment import step\n"
         "from tests import synthetic\n"
-        "@step\n"
-        "def fit(session, train, config):\n"
-        "    model = synthetic.ridge_fit(session, train, config)\n"
+        "def fit(dataset, train, config):\n"
+        "    model = synthetic.ridge_fit(dataset, train, config)\n"
         "    return synthetic.RidgeModel(model.weights * a.SCALE, model.bias)\n"
     )
     for path in (site, repo, study):
@@ -146,17 +153,17 @@ def _module(name: str, source: str) -> types.ModuleType:
     return module
 
 
-def _session(n: int = 48, **extra: np.ndarray) -> Session:
+def _dataset(n: int = 48, **extra: np.ndarray) -> Dataset:
     rng = np.random.default_rng(0)
     columns = {"x": rng.standard_normal(n), "y": rng.standard_normal(n), **extra}
     clock = np.datetime64("2025-01-01", "ns") + np.arange(n).astype("timedelta64[h]")
-    return Session(columns, clock)
+    return Dataset(columns, clock)
 
 
-def _record(ledger: Ledger, session: Session, **reveal) -> str:
+def _record(ledger: Ledger, dataset: Dataset, **reveal) -> str:
     return record(
         ledger,
-        session,
+        dataset,
         source="s",
         params={},
         filters=(),
@@ -169,10 +176,9 @@ def _strings(*values: str | None) -> np.ndarray:
     return np.array([None if v is None else "".join(list(v)) for v in values], object)
 
 
-@step
-def nan_safe_blend_fit(session: Session, train, config, members) -> object:
+def nan_safe_blend_fit(dataset: Dataset, train, config, members) -> object:
     x = np.nan_to_num(np.column_stack(members))
-    y = session.column(synthetic.TARGET, train)
+    y = dataset.column(synthetic.TARGET, train)
     return synthetic.BlendModel(np.linalg.lstsq(x, y, rcond=None)[0])
 
 
@@ -186,20 +192,17 @@ def _nested(member):
 
 
 LAZY_STEPS = """
-from ml_lab.experiment import step
 from tests import synthetic
 
 
-@step
-def lazy_fit(session, train, config):
+def lazy_fit(dataset, train, config):
     import {helper}
-    return synthetic.ridge_fit(session, train, config)
+    return synthetic.ridge_fit(dataset, train, config)
 
 
-@step
-def lazy_predict(model, session, rng):
+def lazy_predict(model, dataset, rng):
     import {helper}
-    return synthetic.ridge_predict(model, session, rng)
+    return synthetic.ridge_predict(model, dataset, rng)
 """
 
 
@@ -253,48 +256,48 @@ def test_the_dataset_blob_opens_with_polars_alone(ledger, dataset):
 
 
 def test_a_target_that_is_not_numeric_is_refused_at_ingest(ledger):
-    rows = Session({"x": np.arange(4.0), "class": _strings("1", "2", "1", "2")})
+    rows = Dataset({"x": np.arange(4.0), "class": _strings("1", "2", "1", "2")})
     with pytest.raises(TypeError, match="encode labels as numbers"):
         record(ledger, rows, source="toy", params={}, filters=(), targets=("class",))
-    flags = Session({"x": np.arange(4.0), "up": np.array([True, False, True, False])})
+    flags = Dataset({"x": np.arange(4.0), "up": np.array([True, False, True, False])})
     assert record(ledger, flags, source="toy", params={}, filters=(), targets=("up",))
 
 
 def test_a_string_column_hashes_by_its_values_not_its_objects():
-    def session(*values):
-        return Session({"c": _strings(*values), "x": np.arange(3.0)})
+    def dataset(*values):
+        return Dataset({"c": _strings(*values), "x": np.arange(3.0)})
 
-    a = session("ab", None, "c")
-    assert data_id(a) == data_id(session("ab", None, "c"))
-    assert data_id(a) != data_id(session("ab", "", "c"))
-    assert data_id(a) != data_id(session("ab", None, "d"))
-    assert data_id(formats.session_load(formats.session_save(a))) == data_id(a)
+    a = dataset("ab", None, "c")
+    assert data_id(a) == data_id(dataset("ab", None, "c"))
+    assert data_id(a) != data_id(dataset("ab", "", "c"))
+    assert data_id(a) != data_id(dataset("ab", None, "d"))
+    assert data_id(rows_load(rows_save(a))) == data_id(a)
     with pytest.raises(Refused, match="not a str, number or None"):
-        data_id(Session({"c": np.array([b"raw", "s"], object)}))
+        data_id(Dataset({"c": np.array([b"raw", "s"], object)}))
 
 
 def test_a_column_named_ts_is_refused(ledger):
-    session = Session({"ts": np.arange(5.0), "y": np.ones(5)})
+    dataset = Dataset({"ts": np.arange(5.0), "y": np.ones(5)})
     with pytest.raises(ValueError, match="clock's name"):
-        formats.session_save(session)
+        rows_save(dataset)
     with pytest.raises(ValueError, match="clock's name"):
-        _record(ledger, session)
+        _record(ledger, dataset)
 
 
 def test_record_refuses_zero_rows(ledger):
     with pytest.raises(ValueError, match="at least one row"):
-        _record(ledger, _session(0))
+        _record(ledger, _dataset(0))
 
 
 def test_a_reveal_lag_is_a_timedelta_or_a_non_negative_int(ledger):
-    dataset_id = _record(ledger, _session(), y=np.timedelta64(3600 * 10**9, "ns"))
+    dataset_id = _record(ledger, _dataset(), y=np.timedelta64(3600 * 10**9, "ns"))
     payload = ledger.latest(Event.DATASET, dataset_id)["payload"]
     assert payload["recipe"]["targets"]["y"] == 3600.0
     with pytest.raises(TypeError, match="float"):
-        _record(ledger, _session(), y=1.5)
+        _record(ledger, _dataset(), y=1.5)
     for lag in (-1, datetime.timedelta(hours=-1), np.timedelta64(-1, "h")):
         with pytest.raises(ValueError, match="negative"):
-            _record(ledger, _session(), y=lag)
+            _record(ledger, _dataset(), y=lag)
 
 
 def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
@@ -316,11 +319,11 @@ def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
     report = _run(ledger, evaluation, known, early)
     assert set(report.failed) == {"early"}
     assert "before its reveal lag" in report.failed["early"]
-    session = load(ledger, by_date)
-    at = session.index_of("2025-03-03")
-    masked = session.masked({synthetic.TARGET: 1}, at).columns[synthetic.TARGET]
+    dataset = load(ledger, by_date)
+    at = dataset.index_of("2025-03-03")
+    masked = dataset.masked({synthetic.TARGET: 1}, at).columns[synthetic.TARGET]
     assert np.isnan(masked[at:]).all() and not np.isnan(masked[:at]).any()
-    masked = session.masked({synthetic.TARGET: 2}, at).columns[synthetic.TARGET]
+    masked = dataset.masked({synthetic.TARGET: 2}, at).columns[synthetic.TARGET]
     assert np.isnan(masked[at - 20]) and not np.isnan(masked[at - 21])
 
 
@@ -355,17 +358,22 @@ def test_adding_a_defaulted_field_keeps_the_id_and_a_rename_reaches_the_views(
     assert len(ledger.events(Event.PIPELINE)) == 2
 
 
-def test_a_config_class_the_step_does_not_import_is_refused(ledger, evaluation):
+def test_a_config_class_its_function_does_not_import_is_refused(ledger, evaluation):
     @dataclasses.dataclass(frozen=True)
     class Far:
         train_window_months: int = 3
         alpha: float = 1.0
 
     far = dataclasses.replace(synthetic.ridge(3), config=Far())
-    with pytest.raises(Refused, match="define it beside the fit step"):
+    with pytest.raises(Refused, match="define it beside the fit function"):
         _run(ledger, evaluation, synthetic.ridge(1), far)
-    with pytest.raises(Refused, match="define it beside the scorer step"):
+    with pytest.raises(Refused, match="define it beside the scorer function"):
         _run(ledger, dataclasses.replace(evaluation, config=Far()), synthetic.ridge(1))
+    scaled = dataclasses.replace(
+        synthetic.ridge(3), postprocess=synthetic.scale, postprocess_config=Far()
+    )
+    with pytest.raises(Refused, match="define it beside the postprocess function"):
+        _run(ledger, evaluation, scaled)
     assert _types(ledger) == {Event.DATASET: 1}
 
 
@@ -377,11 +385,30 @@ def test_a_config_class_the_step_does_not_import_is_refused(ledger, evaluation):
     ],
     ids=["features", "member of a member's predict"],
 )
-def test_a_slot_that_is_not_a_step_is_refused_before_anything_is_written(
+def test_a_slot_that_is_not_a_function_is_refused_before_anything_is_written(
     ledger, evaluation, broken
 ):
-    with pytest.raises(Refused, match="holds a str, not a step"):
+    with pytest.raises(Refused, match="holds a str, not a function"):
         _run(ledger, evaluation, broken)
+    assert _types(ledger) == {Event.DATASET: 1}
+
+
+def test_a_lambda_a_closure_or_a_partial_in_a_slot_is_refused(ledger, evaluation):
+    def local_fit(dataset, train, config):
+        return synthetic.ridge_fit(dataset, train, config)
+
+    for slot, held in [
+        ("features", lambda dataset: {}),
+        ("fit", local_fit),
+        ("predict", functools.partial(synthetic.ridge_predict)),
+    ]:
+        p = dataclasses.replace(synthetic.ridge(1), **{slot: held})
+        with pytest.raises(Refused, match="is not a module-level function of"):
+            _run(ledger, evaluation, p)
+    message = "<lambda>' is not a module-level function of tests.test_ledger_story"
+    with pytest.raises(Refused, match=message):
+        identity.step_ref(lambda: None)
+    assert identity.step_ref(synthetic.ridge_fit) == "tests.synthetic:ridge_fit"
     assert _types(ledger) == {Event.DATASET: 1}
 
 
@@ -433,8 +460,8 @@ def test_a_dry_run_counts_shared_work_once_as_the_run_does(
     shared.write_text(
         "import dataclasses\nfrom tests import synthetic\n"
         "one, three = synthetic.ridge(1), synthetic.ridge(3)\n"
-        "scaled = dataclasses.replace(one, postprocess=synthetic.scale.configured("
-        "factor=2.0), name='scaled')\n"
+        "scaled = dataclasses.replace(one, postprocess=synthetic.scale, "
+        "postprocess_config=2.0, name='scaled')\n"
         "pipelines = [one, three, scaled, synthetic.blend(one, three)]\n"
         "def evaluations(d):\n"
         "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
@@ -449,11 +476,11 @@ def test_a_dry_run_counts_shared_work_once_as_the_run_does(
     assert dry == real and dry[1] == ("0", "0", "4")
 
 
-def test_lab_run_refuses_an_unregistered_step_once(ledger, dataset, tmp_path, capsys):
+def test_lab_run_refuses_a_lambda_once(ledger, dataset, tmp_path, capsys):
     probe = tmp_path / "probe.py"
     probe.write_text(
         "import dataclasses\nfrom tests import synthetic\n"
-        "def bare(session):\n    return {}\n"
+        "bare = lambda dataset: {}\n"
         "pipelines = [dataclasses.replace(synthetic.ridge(3), features=bare)]\n"
         "def evaluations(d):\n"
         "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
@@ -461,7 +488,8 @@ def test_lab_run_refuses_an_unregistered_step_once(ledger, dataset, tmp_path, ca
     )
     assert cli.main(["--root", str(ledger.root), "run", str(probe)]) == 1
     err = capsys.readouterr().err
-    assert err.count("lab run:") == 1 and "'bare' is not a registered step" in err
+    assert err.count("lab run:") == 1
+    assert "'<lambda>' is not a module-level function of probe" in err
     assert _types(ledger) == {Event.DATASET: 1}
 
 
@@ -499,11 +527,11 @@ def test_any_evaluation_field_change_is_a_new_evaluation_id(dataset, evaluation)
 def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     ledger, dataset, evaluation
 ):
-    session = load(ledger, dataset)
-    folds = evaluation.split.folds(session)
+    data = load(ledger, dataset)
+    folds = evaluation.split.folds(data)
     assert len(folds) >= evaluation.split.min_folds
     for fold in folds:
-        skipped = session.ts[fold.train[-1][1] : fold.windows["1"][0]]
+        skipped = data.ts[fold.train[-1][1] : fold.windows["1"][0]]
         assert len(np.unique(skipped)) == evaluation.split.embargo_timestamps
     _run(ledger, evaluation, synthetic.ridge(3))
     stored = ledger.latest(Event.EVALUATION, evaluation.id)["payload"]
@@ -519,17 +547,17 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
 
 
 def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
-    session = load(ledger, dataset)
-    n = session.rows
-    folds = splits.BlockedKFold(k=4, embargo_rows=10).folds(session)
+    data = load(ledger, dataset)
+    n = data.rows
+    folds = splits.BlockedKFold(k=4, embargo_rows=10).folds(data)
     assert [f.label for f in folds] == [f"block {i}" for i in range(4)]
     assert folds[0].train == ((folds[0].windows["test"][1] + 10, n),)
     middle = folds[1]
     lo, hi = middle.windows["test"]
     assert middle.train == ((0, lo - 10), (hi + 10, n))
     assert sum(hi - lo for f in folds for lo, hi in f.windows.values()) == n
-    (hold,) = splits.Holdout(train_fraction=0.8, embargo_rows=5).folds(session)
-    cut = session.boundary(round(0.8 * n))
+    (hold,) = splits.Holdout(train_fraction=0.8, embargo_rows=5).folds(data)
+    cut = data.boundary(round(0.8 * n))
     assert hold.train == ((0, cut),) and hold.windows["test"][0] == cut + 5
 
 
@@ -537,21 +565,21 @@ def test_row_splits_cut_on_timestamp_boundaries():
     stamps = np.datetime64("2000-01-01T00:00:00", "s") + np.arange(10).astype(
         "timedelta64[s]"
     )
-    session = Session({"x": np.zeros(70)}, np.repeat(stamps, 7))
-    folds = splits.BlockedKFold(k=3).folds(session)
+    dataset = Dataset({"x": np.zeros(70)}, np.repeat(stamps, 7))
+    folds = splits.BlockedKFold(k=3).folds(dataset)
     assert [f.windows["test"] for f in folds] == [(0, 21), (21, 42), (42, 70)]
-    (hold,) = splits.Holdout(0.75).folds(session)
+    (hold,) = splits.Holdout(0.75).folds(dataset)
     assert hold.train == ((0, 49),) and hold.windows["test"] == (49, 70)
-    (walk,) = splits.WalkForward(45, 70, 20, min_folds=1).folds(session)
+    (walk,) = splits.WalkForward(45, 70, 20, min_folds=1).folds(dataset)
     assert walk.train == ((0, 42),) and walk.windows["test"] == (42, 63)
-    bare = Session({"x": np.zeros(70)})
+    bare = Dataset({"x": np.zeros(70)})
     assert splits.Holdout(0.75).folds(bare)[0].train == ((0, 52),)
 
 
 def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
-    session = load(ledger, dataset)
-    folds = splits.BlockedKFold(k=5, train_fraction=0.8).folds(session)
-    (hold,) = splits.Holdout(train_fraction=0.8).folds(session)
+    data = load(ledger, dataset)
+    folds = splits.BlockedKFold(k=5, train_fraction=0.8).folds(data)
+    (hold,) = splits.Holdout(train_fraction=0.8).folds(data)
     ends = [hi for f in folds for _, hi in [*f.train, *f.windows.values()]]
     assert max(ends) == hold.train[0][1]
     assert identity.content_hash(splits.BlockedKFold(k=5)) == identity.content_hash(
@@ -559,8 +587,8 @@ def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
     )
 
 
-def test_a_clockless_session_fits_on_segments_and_refuses_walk_forward(ledger):
-    bare = Session(
+def test_a_clockless_dataset_fits_on_segments_and_refuses_walk_forward(ledger):
+    bare = Dataset(
         {
             "f0": np.arange(100.0),
             "f1": np.ones(100),
@@ -579,15 +607,15 @@ def test_a_clockless_session_fits_on_segments_and_refuses_walk_forward(ledger):
 def test_row_walk_forward_steps_by_rows_and_names_windows_only_when_asked(
     ledger, dataset
 ):
-    session = load(ledger, dataset)
+    data = load(ledger, dataset)
     plain = splits.WalkForward(
         first_cutoff_rows=1000, step_rows=500, window_rows=500, embargo_rows=10
     )
-    folds = plain.folds(session)
-    assert len(folds) == (session.rows - 1000) // 500
+    folds = plain.folds(data)
+    assert len(folds) == (data.rows - 1000) // 500
     assert folds[0].train == ((0, 990),) and folds[0].windows == {"test": (1000, 1500)}
     assert folds[1].label == "row 1500"
-    named = dataclasses.replace(plain, horizons=(1, 2)).folds(session)
+    named = dataclasses.replace(plain, horizons=(1, 2)).folds(data)
     assert named[0].windows == {"1": (1000, 1500), "2": (1500, 2000)}
     evaluation = synthetic.evaluation(dataset, split=plain)
     report = _run(ledger, evaluation, synthetic.ridge(0))
@@ -621,25 +649,25 @@ def test_a_day_walk_forward_steps_over_dates_with_rows():
         "datetime64[D]",
     )
     hours = np.array([9, 15], "timedelta64[h]")
-    session = Session({"x": np.arange(12.0)}, (days[:, None] + hours).ravel())
+    dataset = Dataset({"x": np.arange(12.0)}, (days[:, None] + hours).ravel())
     folds = splits.CalendarWalkForward(
         "2019-06-08", unit="day", horizons=(1,), min_folds=1
-    ).folds(session)
+    ).folds(dataset)
     assert [f.label for f in folds] == [f"2019-06-1{d}" for d in range(5)]
     assert folds[0].windows == {"1": (2, 4)} and folds[0].train == ((0, 2),)
     assert folds[-1].windows == {"1": (10, 12)}
     with pytest.raises(Refused, match=r"no train rows: \['2019-06-07'\]"):
         splits.CalendarWalkForward(
             "2019-06-07", unit="day", horizons=(1,), min_folds=1
-        ).folds(session)
+        ).folds(dataset)
     with pytest.raises(Refused, match="0 months from the first cutoff"):
-        splits.CalendarWalkForward("2019-06-12", horizons=(1,)).folds(session)
+        splits.CalendarWalkForward("2019-06-12", horizons=(1,)).folds(dataset)
 
 
 def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
     d = np.arange(np.datetime64("2021-01-04"), np.datetime64("2022-06-25"))
     d = d[np.is_busday(d)]
-    session = Session({"x": np.arange(d.size, dtype=float)}, d)
+    dataset = Dataset({"x": np.arange(d.size, dtype=float)}, d)
     folds = splits.CalendarWalkForward(
         "2021-03-01",
         every=2,
@@ -648,29 +676,29 @@ def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
         embargo_timestamps=2,
         end="2021-12-06",
         min_folds=1,
-    ).folds(session)
-    last = max(session.ts[hi - 1] for f in folds for _, hi in f.windows.values())
+    ).folds(dataset)
+    last = max(dataset.ts[hi - 1] for f in folds for _, hi in f.windows.values())
     assert last < np.datetime64("2021-12-06")
     gaps = [
-        len(np.unique(session.ts[f.train[0][1] : f.windows["1"][0]])) for f in folds
+        len(np.unique(dataset.ts[f.train[0][1] : f.windows["1"][0]])) for f in folds
     ]
     assert gaps == [2] * len(folds) and len(folds) == 4
 
 
 def test_a_month_split_that_drops_the_tail_says_how_to_score_it(ledger, dataset):
-    session = load(ledger, dataset)
+    data = load(ledger, dataset)
     split = splits.CalendarWalkForward(first_cutoff="2025-11-01", horizons=(1, 2))
     with pytest.raises(Refused, match="set end=2026-01-01 or later") as info:
-        split.folds(session)
+        split.folds(data)
     assert "use unit='day'" in str(info.value)
 
 
 def test_the_clock_keeps_nanoseconds_and_the_dataset_id_sees_them():
     t0 = np.datetime64("2019-06-10T09:00:00", "ns")
-    a = Session({"x": np.zeros(2)}, t0 + np.array([1, 2], "timedelta64[ns]"))
-    b = Session({"x": np.zeros(2)}, t0 + np.array([1, 3], "timedelta64[ns]"))
+    a = Dataset({"x": np.zeros(2)}, t0 + np.array([1, 2], "timedelta64[ns]"))
+    b = Dataset({"x": np.zeros(2)}, t0 + np.array([1, 3], "timedelta64[ns]"))
     assert data_id(a) != data_id(b)
-    assert np.array_equal(formats.session_load(formats.session_save(a)).ts, a.ts)
+    assert np.array_equal(rows_load(rows_save(a)).ts, a.ts)
 
 
 # Identity =============================================================================
@@ -718,11 +746,7 @@ def test_a_module_imported_for_a_constant_is_in_the_closure(tmp_path, monkeypatc
     (package / "__init__.py").write_text("")
     (package / "knobs.py").write_text("SCALE = 2.0\n")
     (package / "model.py").write_text(
-        "from ml_lab.experiment import step\n"
-        "from .knobs import SCALE\n"
-        "@step\n"
-        "def fit(session, train, config):\n"
-        "    return SCALE\n"
+        "from .knobs import SCALE\ndef fit(dataset, train, config):\n    return SCALE\n"
     )
     (package / "other.py").write_text("from .knobs import SCALE\n")
     monkeypatch.syspath_prepend(tmp_path)
@@ -737,9 +761,7 @@ def test_a_namespace_package_submodule_is_in_the_closure(tmp_path, monkeypatch):
     (tmp_path / "ns_pkg" / "helpers.py").write_text("def two():\n    return 2\n")
     (tmp_path / "ns_pkg_model.py").write_text(
         "import ns_pkg.helpers\n"
-        "from ml_lab.experiment import step\n"
-        "@step\n"
-        "def fit(session, train, config):\n"
+        "def fit(dataset, train, config):\n"
         "    return ns_pkg.helpers.two()\n"
     )
     monkeypatch.syspath_prepend(tmp_path)
@@ -801,7 +823,7 @@ def test_one_process_fits_under_one_lock_and_records_the_tool_commit(
     assert json.loads(editable)[package.name]["commit"] == head
 
 
-# Session ==============================================================================
+# Dataset ==============================================================================
 
 
 def test_feature_columns_are_read_from_their_store_not_memory(tmp_path):
@@ -811,25 +833,25 @@ def test_feature_columns_are_read_from_their_store_not_memory(tmp_path):
     store = tmp_path / "f.parquet"
     lag = np.arange(rows.rows, dtype=np.int32)
     pl.DataFrame({"f0_lag": lag}).write_parquet(store)
-    session = Session(rows.columns, rows.ts, ("f0_lag",), {"f0_lag": store})
-    assert "f0_lag" not in session.columns
-    assert session.column("f0_lag", (3, 7)).tolist() == [3, 4, 5, 6]
-    assert session.column("f0_lag", ((0, 2), (5, 6))).tolist() == [0, 1, 5]
-    matrix = session.matrix((2, 5), ("f0", "f0_lag"))
+    dataset = Dataset(rows.columns, rows.ts, ("f0_lag",), {"f0_lag": store})
+    assert "f0_lag" not in dataset.columns
+    assert dataset.column("f0_lag", (3, 7)).tolist() == [3, 4, 5, 6]
+    assert dataset.column("f0_lag", ((0, 2), (5, 6))).tolist() == [0, 1, 5]
+    matrix = dataset.matrix((2, 5), ("f0", "f0_lag"))
     assert matrix.dtype == np.float64 and matrix[:, 1].tolist() == [2.0, 3.0, 4.0]
-    view = session.upto(10)
+    view = dataset.upto(10)
     assert view.rows == 10 and view.column("f0_lag", (8, 10)).tolist() == [8, 9]
     with pytest.raises(ValueError, match="visible before the cutoff"):
         view.column("f0_lag", (8, 11))
     with pytest.raises(KeyError, match=r"feature columns \['f0_lag'\]"):
-        session.column("f9", (0, 1))
+        dataset.column("f9", (0, 1))
 
 
 @pytest.mark.parametrize("segment", [(-1, 0), (-3, 10), (5, 4)])
 def test_a_segment_below_row_zero_or_reversed_is_refused(tmp_path, segment):
     store = tmp_path / "f.parquet"
     pl.DataFrame({"f": np.arange(100.0)}).write_parquet(store)
-    view = Session({"x": np.zeros(100)}, None, ("f",), {"f": store}).upto(10)
+    view = Dataset({"x": np.zeros(100)}, None, ("f",), {"f": store}).upto(10)
     for name in ("x", "f"):
         with pytest.raises(ValueError, match=rf"segment \({segment[0]}, "):
             view.column(name, segment)
@@ -838,7 +860,7 @@ def test_a_segment_below_row_zero_or_reversed_is_refused(tmp_path, segment):
 def test_timestamps_with_a_nat_are_refused():
     ts = np.array(["2025-01-01", "NaT"], dtype="datetime64[s]")
     with pytest.raises(ValueError, match="NaT"):
-        Session({"x": np.zeros(2)}, ts)
+        Dataset({"x": np.zeros(2)}, ts)
 
 
 # Run ==================================================================================
@@ -927,7 +949,7 @@ def test_a_fold_training_on_an_unrevealed_label_is_refused(ledger):
 
 @dataclasses.dataclass(frozen=True)
 class OverlapSplit:
-    def folds(self, session):
+    def folds(self, dataset):
         return [splits.Fold("f0", ((0, 3000),), {"test": (2500, 3500)})]
 
 
@@ -969,39 +991,38 @@ def test_rounding_passes_the_probe_and_a_leak_is_sized(ledger, evaluation):
     assert not report.failed and "ridge_1m" in _latest(ledger, evaluation)
 
 
-@step
-def scalar_predict(model, session: Session, rng) -> float:
+def scalar_predict(model, dataset: Dataset, rng) -> float:
     return 0.0
 
 
-@step
-def first_row_postprocess(pred: np.ndarray, session: Session, rng) -> np.ndarray:
+def first_row_postprocess(pred: np.ndarray, dataset: Dataset, rng, config):
     return pred[:1]
 
 
-@step
-def two_column_predict(model, session: Session, rng) -> np.ndarray:
-    one = synthetic.ridge_predict(model, session, rng)
+def two_column_predict(model, dataset: Dataset, rng) -> np.ndarray:
+    one = synthetic.ridge_predict(model, dataset, rng)
     return np.column_stack([one, -one])
 
 
-@step
-def widening_predict(model, session: Session, rng) -> np.ndarray:
-    one = synthetic.ridge_predict(model, session, rng)
+def widening_predict(model, dataset: Dataset, rng) -> np.ndarray:
+    one = synthetic.ridge_predict(model, dataset, rng)
     return one if rng[0] < 3000 else np.column_stack([one, one])
 
 
-@step
-def member_sum_predict(model, session: Session, rng, members: list) -> np.ndarray:
+def member_sum_predict(model, dataset: Dataset, rng, members: list) -> np.ndarray:
     (only,) = members
     assert only.shape == (rng[1] - rng[0], 2)
     return only
 
 
-@scorer(metrics=lambda s: {"gap": float(np.mean(s))}, directions={"gap": "max"})
-def column_gap(pred: np.ndarray, session: Session, rng, config) -> np.ndarray:
+def column_gap(pred: np.ndarray, dataset: Dataset, rng, config) -> np.ndarray:
     assert pred.shape == (rng[1] - rng[0], 2)
     return pred[:, 0] - pred[:, 1]
+
+
+gap_scorer = Scorer(
+    column_gap, metrics=lambda s: {"gap": float(np.mean(s))}, directions={"gap": "max"}
+)
 
 
 def test_a_predict_of_k_columns_is_stored_scored_and_blended_as_such(ledger, dataset):
@@ -1009,7 +1030,7 @@ def test_a_predict_of_k_columns_is_stored_scored_and_blended_as_such(ledger, dat
     blend = dataclasses.replace(
         synthetic.blend(wide), predict=member_sum_predict, name="column_blend"
     )
-    evaluation = dataclasses.replace(synthetic.evaluation(dataset), scorer=column_gap)
+    evaluation = dataclasses.replace(synthetic.evaluation(dataset), scorer=gap_scorer)
     report = _run(ledger, evaluation, wide, blend)
     assert report.failed == {} and report.scores_recorded == 2
     first = ledger.sql("SELECT id, range_start, range_end FROM raw_prediction")[0]
@@ -1024,7 +1045,7 @@ def test_a_predict_of_k_columns_is_stored_scored_and_blended_as_such(ledger, dat
 def test_a_predict_whose_width_changes_between_windows_is_refused(ledger, evaluation):
     p = dataclasses.replace(synthetic.ridge(1), predict=widening_predict, name="wide")
     report = _run(ledger, evaluation, p)
-    assert "the width is a property of the step" in report.failed["wide"]
+    assert "the width is a property of predict" in report.failed["wide"]
 
 
 @pytest.mark.parametrize(
@@ -1093,7 +1114,7 @@ def test_a_features_tuple_is_one_event_per_step_shared_with_single_step_pipeline
             both.config, columns=synthetic.FEATURES + ("f0_lag", "f1_lag")
         ),
     )
-    assert both.feature_steps == (synthetic.lagged_f0, synthetic.lagged_f1)
+    assert both.feature_functions == (synthetic.lagged_f0, synthetic.lagged_f1)
     report = _run(ledger, evaluation, both, synthetic.featured(synthetic.ridge(1)))
     assert not report.failed
     rows = ledger.sql("SELECT columns FROM raw_feature ORDER BY seq")
@@ -1107,9 +1128,8 @@ def test_a_features_tuple_is_one_event_per_step_shared_with_single_step_pipeline
     assert len(features) == 2
 
 
-@step
-def other_f0_lag(session: Session) -> dict[str, np.ndarray]:
-    return {"f0_lag": np.full(session.rows, 7.0)}
+def other_f0_lag(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.full(dataset.rows, 7.0)}
 
 
 @pytest.mark.parametrize("second", [other_f0_lag, synthetic.lagged_f0])
@@ -1120,11 +1140,10 @@ def test_feature_steps_naming_one_column_are_refused(ledger, evaluation, second)
     assert _count(ledger, "raw_fit") == 0
 
 
-@step
-def prefix_named_features(session: Session) -> dict[str, np.ndarray]:
+def prefix_named_features(dataset: Dataset) -> dict[str, np.ndarray]:
     """Names its column by whether it sees more than 7000 rows."""
-    name = "whole" if session.rows > 7000 else "part"
-    return {name: session.columns["f0"].copy()}
+    name = "whole" if dataset.rows > 7000 else "part"
+    return {name: dataset.columns["f0"].copy()}
 
 
 def test_a_feature_step_whose_names_change_with_the_prefix_is_refused(
@@ -1179,7 +1198,7 @@ def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     windows = sum(len(f.windows) for f in folds)
     plain = synthetic.ridge(1)
     doubled = dataclasses.replace(
-        plain, postprocess=synthetic.scale.configured(factor=2.0), name="ridge_1m_x2"
+        plain, postprocess=synthetic.scale, postprocess_config=2.0, name="ridge_1m_x2"
     )
     assert doubled.id != plain.id
     report = _run(ledger, evaluation, plain, doubled)
@@ -1188,11 +1207,35 @@ def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     assert report.predictions_reused == 0 and report.scores_recorded == 2
     post = [e for e in ledger.events(Event.PREDICTIONS) if "raw" in e["payload"]]
     assert len(post) == windows
-    assert post[0]["payload"]["postprocess"]["kwargs"] == {"factor": 2.0}
+    assert post[0]["payload"]["postprocess_config"] == 2.0
     raw = _load_predictions(ledger, post[0]["payload"]["raw"])
     assert np.allclose(_load_predictions(ledger, post[0]["id"]), 2 * raw)
     again = _run(ledger, evaluation, plain, doubled)
     assert again.run == "" and again.predictions_reused == 2 * windows
+
+
+def test_a_postprocess_config_enters_the_prediction_id_and_shares_the_fit(
+    ledger, evaluation
+):
+    doubled = dataclasses.replace(
+        synthetic.ridge(1),
+        postprocess=synthetic.scale,
+        postprocess_config=2.0,
+        name="x2",
+    )
+    tripled = dataclasses.replace(doubled, postprocess_config=3.0, name="x3")
+    assert tripled.id != doubled.id
+    first = _run(ledger, evaluation, doubled)
+    report = _run(ledger, evaluation, tripled)
+    assert report.fits_computed == 0 and report.fits_reused == first.fits_computed
+    assert report.predictions_computed == first.predictions_computed // 2
+    post = [e for e in ledger.events(Event.PREDICTIONS) if "raw" in e["payload"]]
+    by_config = {e["payload"]["postprocess_config"]: e for e in post}
+    assert len(post) == 2 * report.predictions_computed and set(by_config) == {2, 3}
+    tripled_values = _load_predictions(ledger, by_config[3.0]["id"])
+    raw = _load_predictions(ledger, by_config[3.0]["payload"]["raw"])
+    assert np.allclose(tripled_values, 3 * raw)
+    assert len({e["payload"]["raw"] for e in post}) == report.predictions_computed
 
 
 def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evaluation):
@@ -1225,7 +1268,7 @@ def test_a_member_postprocess_change_refits_an_in_sample_blend(ledger, evaluatio
     member = synthetic.ridge(1)
     first = _run(ledger, evaluation, synthetic.blend(member))
     shifted = dataclasses.replace(
-        member, postprocess=synthetic.scale.configured(factor=2.0), name="x2"
+        member, postprocess=synthetic.scale, postprocess_config=2.0, name="x2"
     )
     second = _run(ledger, evaluation, synthetic.blend(shifted))
     assert not first.failed and not second.failed
@@ -1263,7 +1306,7 @@ def test_a_blend_sees_its_members_shared_feature_columns(ledger, evaluation):
         name="shifted",
     )
     report = _run(ledger, evaluation, shifted)
-    assert not report.failed and shifted.feature_steps == ()
+    assert not report.failed and shifted.feature_functions == ()
     assert _count(ledger, "raw_feature") == 1
     mixed = dataclasses.replace(shifted, members=(a, synthetic.ridge(3)), name="mixed")
     report = _run(ledger, evaluation, mixed)
@@ -1274,17 +1317,23 @@ def test_pickle_is_marked_not_portable_and_an_unknown_format_is_refused(
     ledger, dataset, evaluation
 ):
     pickled = dataclasses.replace(
-        synthetic.ridge(1), save=synthetic.pickle_save, load=synthetic.pickle_load
+        synthetic.ridge(1),
+        save=synthetic.pickle_save,
+        load=synthetic.pickle_load,
+        format=formats.Format.PICKLE,
     )
     _run(ledger, evaluation, pickled)
     assert ledger.sql("SELECT portable FROM raw_fit")[0]["portable"] == 0
     with pytest.raises(Refused, match="'tar', not one of"):
-        _run(ledger, evaluation, dataclasses.replace(pickled, save=synthetic.tar_save))
+        _run(ledger, evaluation, dataclasses.replace(pickled, format="tar"))
 
 
 def test_a_zip_model_is_portable_only_if_every_member_is(ledger, evaluation):
     zipped = dataclasses.replace(
-        synthetic.ridge(1), save=synthetic.zip_save, load=synthetic.zip_load
+        synthetic.ridge(1),
+        save=synthetic.zip_save,
+        load=synthetic.zip_load,
+        format=formats.Format.ZIP,
     )
     pickled = dataclasses.replace(
         zipped,
@@ -1323,6 +1372,7 @@ def test_a_formatter_pass_keeps_every_fit_and_a_code_edit_refits(ledger, tmp_pat
         code.read_text().replace("Xc = (X - x_mean)", "Xc = X - 2 * x_mean")
     )
     module = importlib.reload(module)
+    evaluation = module.evaluation(evaluation.dataset)
     assert (
         runs.run(
             ledger, [module.ridge(3)], evaluation, code_root=tmp_path
@@ -1336,8 +1386,8 @@ def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
 ):
     code = tmp_path / "feat_k.py"
     code.write_text(
-        "import numpy as np\nfrom ml_lab.experiment import step\n\n\n@step\n"
-        "def lag(session):\n    f0 = session.columns['f0']\n"
+        "import numpy as np\n\n\n"
+        "def lag(dataset):\n    f0 = dataset.columns['f0']\n"
         "    return {'f0_lag': np.concatenate([[np.nan], f0[:-1]])}\n"
     )
     module = cli._load(str(code))
@@ -1436,22 +1486,23 @@ def test_a_changed_scorer_rescores_without_refitting(ledger, tmp_path):
     scoring = tmp_path / "scoring_w.py"
     scoring.write_text(
         "import numpy as np\n"
-        "from ml_lab.experiment import scorer\n"
+        "from ml_lab.experiment import Scorer\n"
         "from steps_w import TARGET, sim_metrics\n\n"
-        '@scorer(metrics=sim_metrics, directions={"pnl": "max", "turnover": "min"})\n'
-        "def sim(pred, session, rng, config):\n"
-        "    truth = session.column(TARGET, rng)\n"
+        "def sim(pred, dataset, rng, config):\n"
+        "    truth = dataset.column(TARGET, rng)\n"
         "    flips = np.abs(np.diff(np.sign(pred), prepend=0.0))\n"
         "    return np.column_stack([np.sign(pred) * truth - 0.001 * flips, flips])\n"
+        'scorer = Scorer(sim, sim_metrics, {"pnl": "max", "turnover": "min"})\n'
     )
     module = cli._load(str(steps))
     evaluation = dataclasses.replace(
-        module.evaluation(module.dataset(ledger)), scorer=cli._load(str(scoring)).sim
+        module.evaluation(module.dataset(ledger)),
+        scorer=cli._load(str(scoring)).scorer,
     )
     runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
     first = _latest(ledger, evaluation)["ridge_3m"]
     scoring.write_text(scoring.read_text().replace("0.001 * flips", "0.002 * flips"))
-    changed = dataclasses.replace(evaluation, scorer=cli._load(str(scoring)).sim)
+    changed = dataclasses.replace(evaluation, scorer=cli._load(str(scoring)).scorer)
     report = runs.run(ledger, [module.ridge(3)], changed, code_root=tmp_path)
     assert report.fits_computed == 0 and report.scores_recorded == 1
     assert _latest(ledger, evaluation)["ridge_3m"] != first
@@ -1480,7 +1531,7 @@ def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resume
 
 def test_a_fit_that_imports_a_distribution_lazily_is_refused():
     pipeline = synthetic.ridge(3)
-    dists = identity.imported_dists(pipeline.steps, REPO)
+    dists = identity.imported_dists(pipeline.functions, REPO)
     before_pytest = {name for name in sys.modules if not name.startswith("pytest")}
     with pytest.raises(Refused, match="distributions \\[.*'pytest'"):
         runs._refuse_lazy_imports(pipeline, REPO, dists, before_pytest, "fit")
@@ -1821,15 +1872,16 @@ def test_wins_follow_the_direction_recorded_with_each_score(
     )
     scoring = tmp_path / "scoring_x.py"
     scoring.write_text(
-        "from ml_lab.experiment import scorer\n"
+        "from ml_lab.experiment import Scorer\n"
         "from steps_x import sign_sim, sim_metrics\n\n"
-        '@scorer(metrics=sim_metrics, directions={"pnl": "max", "turnover": "min"})\n'
-        "def sim(pred, session, rng, config):\n"
-        "    return sign_sim(pred, session, rng, config)\n"
+        "def sim(pred, dataset, rng, config):\n"
+        "    return sign_sim(pred, dataset, rng, config)\n"
+        'scorer = Scorer(sim, sim_metrics, {"pnl": "max", "turnover": "min"})\n'
     )
     module = cli._load(str(steps))
     evaluation = dataclasses.replace(
-        module.evaluation(module.dataset(ledger)), scorer=cli._load(str(scoring)).sim
+        module.evaluation(module.dataset(ledger)),
+        scorer=cli._load(str(scoring)).scorer,
     )
     pipelines = [module.ridge(1), module.ridge(3)]
     runs.run(ledger, pipelines, evaluation, code_root=tmp_path)
@@ -1838,10 +1890,11 @@ def test_wins_follow_the_direction_recorded_with_each_score(
         "AND window = '1' AND metric = 'pnl'"
     )
     (before,) = ledger.sql(query)
+    declared = evaluation.id
     scoring.write_text(scoring.read_text().replace('"pnl": "max"', '"pnl": "min"'))
-    sim = importlib.reload(cli._load(str(scoring))).sim
-    flipped = dataclasses.replace(evaluation, scorer=sim)
-    assert flipped.id == evaluation.id
+    scorer = importlib.reload(cli._load(str(scoring))).scorer
+    flipped = dataclasses.replace(evaluation, scorer=scorer)
+    assert flipped.id == declared
     runs.run(ledger, pipelines, flipped, code_root=tmp_path)
     (after,) = ledger.sql(query)
     assert 0 < before["wins"] < before["folds"]
@@ -1887,9 +1940,11 @@ def _nan_metrics(series):
     return {"ic": float("nan")}
 
 
-@scorer(metrics=_nan_metrics, directions={"ic": "max"})
-def nan_scorer(pred, session, rng, config):
+def nan_score(pred, dataset, rng, config):
     return np.zeros(rng[1] - rng[0])
+
+
+nan_scorer = Scorer(nan_score, _nan_metrics, {"ic": "max"})
 
 
 def test_a_nan_metric_records_a_score_whose_value_is_null(ledger, evaluation):
@@ -1901,7 +1956,7 @@ def test_a_nan_metric_records_a_score_whose_value_is_null(ledger, evaluation):
 
 @dataclasses.dataclass(frozen=True)
 class DottedSplit:
-    def folds(self, session):
+    def folds(self, dataset):
         cuts = (2000, 3000, 4000)
         return [
             splits.Fold(f"f{k}", ((0, c),), {"1.5d": (c, c + 500)})
@@ -1913,9 +1968,11 @@ def _dotted_metrics(series):
     return {"hit.rate": float((series > 0).mean())}
 
 
-@scorer(metrics=_dotted_metrics, directions={"hit.rate": "max"})
-def dotted_scorer(pred, session, rng, config):
-    return np.sign(pred) * session.column(synthetic.TARGET, rng)
+def dotted_score(pred, dataset, rng, config):
+    return np.sign(pred) * dataset.column(synthetic.TARGET, rng)
+
+
+dotted_scorer = Scorer(dotted_score, _dotted_metrics, {"hit.rate": "max"})
 
 
 def test_a_dotted_window_keeps_its_series_and_a_dotted_metric_counts_wins(
@@ -1967,27 +2024,25 @@ def _auc(series: np.ndarray) -> dict[str, float]:
     return {"auc": float((ranks[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))}
 
 
-@scorer(metrics=_auc, directions={"auc": "max"}, columns=("p", "y"))
-def auc_score(pred: np.ndarray, session: Session, rng: Range, config: None):
-    return np.column_stack([pred, session.column("y", rng)])
+def auc_series(pred: np.ndarray, dataset: Dataset, rng: Range, config: None):
+    return np.column_stack([pred, dataset.column("y", rng)])
 
 
-@step
-def prior_fit(session: Session, train: splits.Segments, config: None) -> float:
-    return float(np.mean(np.concatenate([session.column("y", s) for s in train])))
+auc_score = Scorer(auc_series, _auc, {"auc": "max"}, ("p", "y"))
 
 
-@step
-def prior_predict(model: float, session: Session, rng: Range) -> np.ndarray:
+def prior_fit(dataset: Dataset, train: Segments, config: None) -> float:
+    return float(np.mean(np.concatenate([dataset.column("y", s) for s in train])))
+
+
+def prior_predict(model: float, dataset: Dataset, rng: Range) -> np.ndarray:
     return np.full(rng[1] - rng[0], model)
 
 
-@step(format=formats.Format.ARROW_ARRAYS)
 def prior_save(model: float) -> bytes:
     return formats.arrays_save({"p": np.array([model])})
 
 
-@step
 def prior_load(payload: bytes) -> float:
     return float(formats.arrays_load(payload)["p"][0])
 
@@ -1995,14 +2050,14 @@ def prior_load(payload: bytes) -> float:
 def test_a_constant_per_fold_scores_auc_one_half_by_fold_mean_not_pooled(ledger):
     rate = np.repeat([0.1, 0.3, 0.5, 0.7], 100)
     y = (np.random.default_rng(1).random(400) < rate).astype(float)
-    session = Session({"x": np.zeros(400), "y": y})
-    dataset = record(
-        ledger, session, source="auc", params={}, filters=(), targets=("y",)
-    )
+    rows = Dataset({"x": np.zeros(400), "y": y})
+    dataset = record(ledger, rows, source="auc", params={}, filters=(), targets=("y",))
     evaluation = Evaluation(
         dataset, splits.WalkForward(100, 100, 100, min_folds=3), auc_score
     )
-    prior = Pipeline(prior_fit, prior_predict, prior_save, prior_load, None, name="p")
+    prior = Pipeline(
+        prior_fit, prior_predict, prior_save, prior_load, None, "arrow-arrays", name="p"
+    )
     assert not _run(ledger, evaluation, prior).failed
     row = ledger.sql("SELECT * FROM board")[0]
     assert row["folds"] == 3 and row["fold_mean"] == 0.5 and row["value"] != 0.5
@@ -2061,32 +2116,32 @@ def test_arrays_round_trip_when_every_array_is_empty():
 
 def test_a_seconds_datetime_column_is_stored_in_nanoseconds():
     column = np.datetime64("2025-01-01", "s") + np.arange(48).astype("timedelta64[s]")
-    loaded = formats.session_load(formats.session_save(_session(z=column)))
+    loaded = rows_load(rows_save(_dataset(z=column)))
     np.testing.assert_array_equal(loaded.columns["z"], column.astype("datetime64[ns]"))
 
 
 # Panel ================================================================================
 
 
-def test_a_panel_grids_a_session_by_time_and_key_and_back():
+def test_a_panel_grids_a_dataset_by_time_and_key_and_back():
     ts = np.array(["2025-01-01"] * 2 + ["2025-01-02"], dtype="datetime64[s]")
-    session = Session(
+    dataset = Dataset(
         {"stock": np.array([1, 2, 1]), "px": np.array([10.0, 20.0, 11.0])}, ts
     )
-    panel = Panel(session, "stock")
+    panel = Panel(dataset, "stock")
     grid = panel.grid("px")
     assert panel.shape == (2, 2) and np.isnan(grid[1, 1])
     assert np.array_equal(grid[:, 0], [10.0, 11.0])
-    assert np.array_equal(panel.rows(grid), session.columns["px"])
+    assert np.array_equal(panel.rows(grid), dataset.columns["px"])
     assert panel.grid("px", dtype=np.float32).dtype == np.float32
     demeaned = grid - np.nanmean(grid, axis=1, keepdims=True)
     assert np.allclose(panel.rows(demeaned), [-5.0, 5.0, 0.0])
-    assert Panel(session.upto(2), "stock").shape == (1, 2)
-    assert Panel(session.upto(2), "stock", keys=[1, 2, 3]).shape == (1, 3)
+    assert Panel(dataset.upto(2), "stock").shape == (1, 2)
+    assert Panel(dataset.upto(2), "stock", keys=[1, 2, 3]).shape == (1, 3)
     with pytest.raises(ValueError, match="is not in keys"):
-        Panel(session, "stock", keys=[1])
+        Panel(dataset, "stock", keys=[1])
     with pytest.raises(ValueError, match="timestamps"):
-        Panel(Session({"stock": np.array([1])}), "stock")
+        Panel(Dataset({"stock": np.array([1])}), "stock")
 
 
 def test_a_refused_predict_records_nothing_and_every_rerun_refuses(ledger, dataset):
