@@ -58,14 +58,15 @@ Fits and predictions live on the dataset stream because a scoring change reuses 
 
 ### Views
 
-Shipped as SQL in the same file so `sqlite3` shows them as tables. The one-event-type views carry `seq`, so `WHERE seq <= N` reads the log as it stood; `latest_score` ranks over the whole log.
+Shipped as SQL in the same file so `sqlite3` shows them as tables. Two are for reading, `board` and `head_to_head`; the rest are the log as columns, for joins. The one-event-type views carry `seq`, so `WHERE seq <= N` reads the log as it stood; `latest_score` ranks over the whole log.
 
 | view | definition |
 |---|---|
+| board | how each pipeline did: per (evaluation, pipeline, window, metric) the latest score's `value`, `folds`, `fold_mean` and `fold_std`, with the dataset source and the evaluation and pipeline names first and the ids last; `latest_score` joined to `aggregate_score` |
+| head_to_head | is A better than B: per (evaluation, window, metric) and ordered pair of latest pipelines, with the evaluation name and dataset source: the fold count, `mean_delta` (the mean per-fold difference, the difference of the pair's `fold_mean`), its sample std, the folds the first wins, and `pooled_delta` (the difference of their pooled `value`); `fold_std` on `board` is one pipeline's spread across folds, so the noise of a comparison is `delta_std` here; with one fold it is NULL, pair the series (Analytics). `paired_score` is its old name, kept until the next round |
 | dataset, pipeline, evaluation, run, feature, fit, prediction, score | one event type each, payload fields as columns; pipeline and evaluation show the newest name per id |
 | fold_score, aggregate_score | `score_recorded` unpacked one row per (fold, window, metric) and per (window, metric); `value` is `metrics` over the folds' rows concatenated and `fold_mean` the mean of the per-fold values, which differ and can disagree in sign for a metric that does not add over rows (a correlation, a Sharpe); the aggregate row carries the series sha and its `fold_rows`, the fold count, fold mean and fold standard deviation of the metric and the series blob sha |
 | latest_score | per (evaluation, pipeline), the newest score, with the pipeline and evaluation names and the dataset's id and source joined on. A label is not an id: a declaration change under one name lists the name once per id, and the log cannot say which declaration the code holds (a rerun that reuses everything writes nothing), so a board filters on the id `lab run` prints |
-| paired_score | per (evaluation, window, metric) and ordered pair of latest pipelines, with the evaluation name and dataset source: the fold count, `mean_delta` (the mean per-fold difference, the difference of the pair's `fold_mean`), its sample std, the folds the first wins, and `pooled_delta` (the difference of their pooled `value`); `fold_std` on `aggregate_score` is one pipeline's spread across windows, shared by every pipeline, so the noise of a comparison is `delta_std` here; with one fold it is NULL, pair the series (Analytics) |
 | score_fit | one row per (score, fit): the fits a score stands on, including a blend's members, with the fit's pipeline, label and seconds |
 | failure | `pipeline_failed` with run and error |
 
@@ -130,13 +131,12 @@ Two verbs. A module is a dotted name importable from the current directory or a 
 Reads are SQL over the views. Four to start from:
 
 ```sql
--- latest aggregate scores per pipeline at the first age
-SELECT l.name, s.metric, s.value FROM latest_score l
-JOIN aggregate_score s ON s.score = l.score
-WHERE s.window = '1' ORDER BY s.metric, s.value DESC;
+-- how each pipeline did at the first age
+SELECT name, metric, value, folds, fold_std FROM board
+WHERE evaluation_name = 'validation' AND window = '1' ORDER BY metric, value DESC;
 
 -- every pipeline against one reference, fold by fold
-SELECT name, mean_delta, delta_std, wins, folds FROM paired_score
+SELECT name, mean_delta, delta_std, wins, folds FROM head_to_head
 WHERE reference_name = 'zero' AND evaluation_name = 'validation' AND window = '1' AND metric = 'pnl'
 ORDER BY mean_delta DESC;
 

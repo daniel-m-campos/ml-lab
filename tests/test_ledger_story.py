@@ -941,7 +941,30 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     assert db.execute("SELECT resolution, pipelines FROM run").fetchone()[1]
 
 
-def test_paired_score_is_the_fold_by_fold_difference_and_the_series_is_named(
+def test_board_reads_names_and_values_without_a_join(ledger, evaluation):
+    _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
+    rows = ledger.sql("SELECT * FROM board WHERE window = '1' AND metric = 'pnl'")
+    joined = ledger.sql(
+        "SELECT l.name, a.value FROM latest_score l "
+        "JOIN aggregate_score a ON a.score = l.score "
+        "WHERE a.window = '1' AND a.metric = 'pnl'"
+    )
+    assert {r["name"]: r["value"] for r in rows} == {
+        r["name"]: r["value"] for r in joined
+    }
+    assert list(rows[0])[:5] == [
+        "source",
+        "evaluation_name",
+        "name",
+        "window",
+        "metric",
+    ]
+    assert rows[0]["source"] == "synthetic" and rows[0]["folds"] > 1
+    alias = ledger.sql("SELECT * FROM paired_score")
+    assert alias and alias == ledger.sql("SELECT * FROM head_to_head")
+
+
+def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
     ledger, evaluation
 ):
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
@@ -956,7 +979,7 @@ def test_paired_score_is_the_fold_by_fold_difference_and_the_series_is_named(
         values[name] = np.array([r["value"] for r in rows])
     d = values["ridge_1m"] - values["ridge_6m"]
     row = ledger.sql(
-        "SELECT * FROM paired_score WHERE name = 'ridge_1m' AND reference_name = "
+        "SELECT * FROM head_to_head WHERE name = 'ridge_1m' AND reference_name = "
         "'ridge_6m' AND window = '1' AND metric = 'pnl'"
     )[0]
     assert row["folds"] == len(d) and row["wins"] == int((d > 0).sum())
@@ -969,12 +992,12 @@ def test_paired_score_is_the_fold_by_fold_difference_and_the_series_is_named(
     ]
 
 
-def test_paired_score_names_its_evaluation_and_reconciles_with_the_pooled_value(
+def test_head_to_head_names_its_evaluation_and_reconciles_with_the_pooled_value(
     ledger, evaluation
 ):
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     row = ledger.sql(
-        "SELECT * FROM paired_score WHERE name = 'ridge_1m' AND reference_name = "
+        "SELECT * FROM head_to_head WHERE name = 'ridge_1m' AND reference_name = "
         "'ridge_6m' AND window = '1' AND metric = 'pnl'"
     )[0]
     assert (row["evaluation_name"], row["source"]) == ("", "synthetic")
@@ -994,7 +1017,7 @@ def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
     holdout = synthetic.evaluation(dataset, split=splits.Holdout(0.7))
     _run(ledger, holdout, synthetic.ridge(1), synthetic.ridge(6))
     row = ledger.sql(
-        "SELECT * FROM paired_score WHERE name = 'ridge_1m' AND metric = 'pnl'"
+        "SELECT * FROM head_to_head WHERE name = 'ridge_1m' AND metric = 'pnl'"
     )[0]
     assert row["folds"] == 1 and row["delta_std"] is None
     series = ledger.sql(

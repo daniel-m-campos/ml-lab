@@ -189,8 +189,14 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
   json_extract(f.payload,'$.duration_s') AS duration_s
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
-DROP VIEW IF EXISTS paired_score;
-CREATE VIEW paired_score AS WITH f AS MATERIALIZED (
+DROP VIEW IF EXISTS board;
+CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, a.window, a.metric,
+  a.value, a.folds, a.fold_mean, a.fold_std,
+  l.evaluation, l.pipeline, l.score, l.run, l.seq
+FROM latest_score l JOIN aggregate_score a ON a.score = l.score;
+
+DROP VIEW IF EXISTS head_to_head;
+CREATE VIEW head_to_head AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
     s.fold, s.window, s.metric, s.value,
     json_extract(v.metrics, '$.' || s.metric) AS direction,
@@ -213,6 +219,9 @@ SELECT a.evaluation, a.evaluation_name, a.source, a.window, a.metric,
 FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
   AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric
 GROUP BY a.score, b.score, a.window, a.metric;
+
+DROP VIEW IF EXISTS paired_score;
+CREATE VIEW paired_score AS SELECT * FROM head_to_head;
 
 DROP VIEW IF EXISTS failure;
 CREATE VIEW failure AS SELECT seq, id, at, actor, host,
