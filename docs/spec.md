@@ -1,6 +1,6 @@
 # ml-lab: the log
 
-A local-first record of experimentation on frozen, time-ordered datasets. Git owns the code, a content-addressed blob store owns the bytes, an append-only event log owns what happened. People and agents write through two commands and read with SQL. Datasets, pipelines, evaluations, fits, predictions and scores are content-addressed, so the same work is never done twice and every number names the code, data and environment that produced it.
+A local-first record of experimentation on frozen datasets whose rows are in a fixed order, time series among them. Git owns the code, a content-addressed blob store owns the bytes, an append-only event log owns what happened. People and agents write through two commands and read with SQL. Datasets, pipelines, evaluations, fits, predictions and scores are content-addressed, so the same work is never done twice and every number names the code, data and environment that produced it.
 
 This file holds what the code cannot say for itself: the event and view tables, the blob formats, the designs declined with their reasons, and what is deferred. How each step behaves, what is refused and with which message, lives in the module docstrings and `tests/test_ledger_story.py`.
 

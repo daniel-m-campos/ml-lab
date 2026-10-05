@@ -1,8 +1,8 @@
 # ml-lab
 
-A local-first record of experimentation on frozen, time-ordered datasets, for one person or a team of agents working the same data. You declare pipelines and evaluations in plain Python; `lab run` fits, predicts and scores only what the log does not already hold, refuses the common leaks before they are recorded, and writes every result as an event that names the code, data and environment behind it. You read the results with SQL.
+A local-first record of experimentation on frozen datasets whose rows are in a fixed order: time series when there is a clock, any tabular data once shuffled into one. For one person or a team of agents working the same data. You declare pipelines and evaluations in plain Python; `lab run` fits, predicts and scores only what the log does not already hold, refuses the common leaks before they are recorded, and writes every result as an event that names the code, data and environment behind it. You read the results with SQL.
 
-It exists because experiment tracking tools record what you tell them, and the things that go wrong in time-series work (a feature that reads the future, a label known a day later than its row, a fit rerun under edited code, two "identical" runs with different numbers) are not things anyone tells them. Here identity is computed from content, the guards run on every write, and the reads are tables.
+It exists because experiment tracking tools record what you tell them, and the things that go wrong (a feature that reads the future, a label known a day later than its row, a k-fold fit that saw its validation labels, a fit rerun under edited code, two "identical" runs with different numbers) are not things anyone tells them. Here identity is computed from content, the guards run on every write, and the reads are tables.
 
 ## What you get
 
@@ -112,7 +112,7 @@ def evaluations(dataset: str) -> list[Evaluation]:
                        scorer=steps.taker_sim, config=steps.SimConfig(cost_bps=0.5))]
 ```
 
-Variants are `dataclasses.replace` (or `with_config` and `named`): a pipeline that differs only in `postprocess` shares every fit and raw prediction with its parent. A split is any frozen dataclass with `folds(session)`; the shipped ones are `CalendarWalkForward` (cutoffs every N months or trading days on the clock, named horizons, an embargo in whole timestamps), `WalkForward` by rows, and `Holdout(train_fraction)` with `BlockedKFold(k, train_fraction)` over the rows it trains on, so a validation and a test evaluation share one cut. Keep the test evaluation in its own module (`test.py`), so running the validation module never scores it. Every pipeline is scored under every evaluation in the run.
+Variants are `dataclasses.replace` (or `with_config` and `named`): a pipeline that differs only in `postprocess` shares every fit and raw prediction with its parent. A split is any frozen dataclass with `folds(session)`; the shipped ones are `CalendarWalkForward` (cutoffs every N months or trading days on the clock, named horizons, an embargo in whole timestamps), `WalkForward` by rows, and `Holdout(train_fraction)` with `BlockedKFold(k, train_fraction)` over the rows it trains on, so a validation and a test evaluation share one cut. Folds are contiguous ranges in the stored row order, so the order chosen at ingest is the split's design: a shuffle in a filter step makes `BlockedKFold` a random k-fold, an interleave by class makes it stratified, and a sort by group with the cut snapped to the group's boundary makes it grouped. Every step sees the rows before where it may look, with or without a clock; a clock adds reveal lags, calendar cutoffs and embargoes in whole timestamps. Keep the test evaluation in its own module (`test.py`), so running the validation module never scores it. Every pipeline is scored under every evaluation in the run.
 
 ## Run
 
