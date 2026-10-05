@@ -4,8 +4,10 @@ Both Kaggle examples are panels: Optiver is (auction second, stock), JPX is (dat
 security). Each step used to rebuild the grid by hand; this does it once per session.
 Positions on the time axis are the session's distinct timestamps in order, so the
 time axis of a prefix view's grid is a prefix of the full one; a key first seen after
-the cutoff is absent, so compare grids through ``rows``. Build a Panel inside a
-``Pipeline.features`` step to grid once per dataset rather than once per call.
+the cutoff is absent, so compare grids through ``rows``, or pass ``keys=`` (the whole
+universe, a constant in the step's code) so a prefix and the full session grid alike.
+Build a Panel inside a ``Pipeline.features`` step to grid once per dataset rather than
+once per call.
 
 Examples
 --------
@@ -33,11 +35,19 @@ from ml_lab.session import Session
 class Panel:
     """The (time, key) axes of a session, computed once; grids and their inverse."""
 
-    def __init__(self, session: Session, key: str):
+    def __init__(self, session: Session, key: str, keys: Any = None):
         if session.ts is None:
             raise ValueError("a panel needs a session with timestamps")
         self.times, self.ti = np.unique(session.ts, return_inverse=True)
-        self.keys, self.ki = np.unique(session.columns[key], return_inverse=True)
+        column = session.columns[key]
+        if keys is None:
+            self.keys, self.ki = np.unique(column, return_inverse=True)
+        else:
+            self.keys = np.unique(keys)
+            self.ki = np.searchsorted(self.keys, column)
+            unknown = column[~np.isin(column, self.keys)]
+            if unknown.size:
+                raise ValueError(f"{key} {unknown[0]!r} is not in keys")
         self.session = session
 
     def __repr__(self) -> str:

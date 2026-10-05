@@ -79,9 +79,10 @@ class Pipeline:
     ``fit`` has fold scope (the prefix up to its train end, once per train range);
     ``predict`` and ``postprocess`` have window scope (the prefix up to the window
     end with targets masked, once per fit and range). A step belongs in the broadest
-    scope of what it reads, so a per-fold standardiser or a lagged target lives in
-    ``fit`` and ``predict``, and composition within a scope is the object ``fit``
-    returns, an sklearn pipeline included.
+    scope of what it reads, so a per-fold standardiser, or a lagged target whose
+    reveal lag the dataset does not declare, lives in ``fit`` and ``predict``, and
+    composition within a scope is the object ``fit`` returns, an sklearn pipeline
+    included.
 
     ``save(model) -> bytes`` and ``load(bytes) -> model`` declare a format from
     ``formats.KNOWN``. ``features(session) -> {name: array}`` adds one column per

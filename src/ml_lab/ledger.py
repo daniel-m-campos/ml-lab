@@ -24,13 +24,10 @@ import time
 from typing import Any, Final
 
 from ml_lab import identity
+from ml_lab.identity import Refused
 
 SCHEMA_VERSION = 15
 ACTOR_ENV = "ML_LAB_ACTOR"
-
-
-class Refused(Exception):
-    """The ledger refuses an operation that would break an invariant."""
 
 
 class Event:
@@ -101,7 +98,7 @@ CREATE VIEW feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.columns_id') AS columns_id,
   json_extract(payload,'$.import_shas') AS import_shas,
   json_extract(payload,'$.code_keys') AS code_keys,
-  json_extract(payload,'$.probe_at') AS probe_at,
+  json_extract(payload,'$.probe_rows') AS probe_rows,
   json_extract(payload,'$.blob.sha') AS blob,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='features_computed';
@@ -153,7 +150,8 @@ CREATE VIEW aggregate_score AS SELECT e.id AS score,
   CASE WHEN f.folds > 1
        THEN sqrt(max(f.sq - f.fold_mean * f.fold_mean, 0) * f.folds / (f.folds - 1))
   END AS fold_std,
-  json_extract(e.payload,'$.series.' || a.key || '.sha') AS series
+  json_extract(e.payload,'$.series.' || a.key || '.sha') AS series,
+  json_extract(e.payload,'$.series.' || a.key || '.fold_rows') AS fold_rows
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
 JOIN (SELECT score, window, metric, COUNT(*) AS folds, AVG(value) AS fold_mean,
              AVG(value * value) AS sq
@@ -192,24 +190,29 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
 DROP VIEW IF EXISTS paired_score;
-CREATE VIEW paired_score AS SELECT la.evaluation, a.window, a.metric,
-  la.pipeline, la.name, la.score,
-  lb.pipeline AS reference, lb.name AS reference_name, lb.score AS reference_score,
+CREATE VIEW paired_score AS WITH f AS MATERIALIZED (
+  SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
+    s.fold, s.window, s.metric, s.value,
+    json_extract(v.metrics, '$.' || s.metric) AS direction,
+    json_extract(e.payload, '$.aggregate."' || s.window || '"."' || s.metric || '"')
+      AS pooled
+  FROM latest_score l JOIN fold_score s ON s.score = l.score
+  JOIN evaluation v ON v.id = l.evaluation JOIN event e ON e.id = l.score)
+SELECT a.evaluation, a.evaluation_name, a.source, a.window, a.metric,
+  a.pipeline, a.name, a.score,
+  b.pipeline AS reference, b.name AS reference_name, b.score AS reference_score,
   COUNT(*) AS folds, AVG(a.value - b.value) AS mean_delta,
   CASE WHEN COUNT(*) > 1
        THEN sqrt(max(AVG((a.value - b.value) * (a.value - b.value))
                      - AVG(a.value - b.value) * AVG(a.value - b.value), 0)
                  * COUNT(*) / (COUNT(*) - 1))
   END AS delta_std,
-  SUM(CASE json_extract(v.metrics, '$.' || a.metric)
-      WHEN 'max' THEN a.value > b.value WHEN 'min' THEN a.value < b.value END) AS wins
-FROM latest_score la
-JOIN latest_score lb ON lb.evaluation = la.evaluation AND lb.pipeline <> la.pipeline
-JOIN fold_score a ON a.score = la.score
-JOIN fold_score b ON b.score = lb.score AND b.fold = a.fold
-  AND b.window = a.window AND b.metric = a.metric
-JOIN evaluation v ON v.id = la.evaluation
-GROUP BY la.score, lb.score, a.window, a.metric;
+  SUM(CASE a.direction WHEN 'max' THEN a.value > b.value
+      WHEN 'min' THEN a.value < b.value END) AS wins,
+  a.pooled - b.pooled AS pooled_delta
+FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
+  AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric
+GROUP BY a.score, b.score, a.window, a.metric;
 
 DROP VIEW IF EXISTS failure;
 CREATE VIEW failure AS SELECT seq, id, at, actor, host,

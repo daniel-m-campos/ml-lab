@@ -99,8 +99,16 @@ def session_save(session: Session) -> bytes:
     return _parquet_bytes(pl.DataFrame({**stamps, **session.columns}))
 
 
-def session_load(payload: bytes) -> Session:
-    return session_from_frame(pl.read_parquet(io.BytesIO(payload)))
+def session_load(source: pathlib.Path | bytes) -> Session:
+    """A stored session, read one column at a time so loading peaks near its size."""
+    if isinstance(source, bytes):
+        source = io.BytesIO(source)
+    names = list(pl.read_parquet_schema(source))
+    columns = {
+        n: pl.read_parquet(source, columns=[n])[n].to_numpy() for n in names if n != TS
+    }
+    ts = pl.read_parquet(source, columns=[TS])[TS].to_numpy() if TS in names else None
+    return Session(columns, ts)
 
 
 def session_from_frame(frame: pl.DataFrame, ts: str = TS) -> Session:

@@ -6,10 +6,12 @@ Mirrors docs/user-stories.md; every event type in docs/spec.md is written and re
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import importlib
 import io
 import json
 import pathlib
+import re
 import sqlite3
 import subprocess
 import sys
@@ -135,9 +137,11 @@ def test_a_config_class_the_step_does_not_import_is_refused(ledger, evaluation):
         alpha: float = 1.0
 
     far = dataclasses.replace(synthetic.ridge(3), config=Far())
-    report = _run(ledger, evaluation, far)
-    assert "define it beside the fit step" in report.failed["ridge_3m"]
-    assert Event.FIT not in _types(ledger)
+    with pytest.raises(Refused, match="define it beside the fit step"):
+        _run(ledger, evaluation, synthetic.ridge(1), far)
+    with pytest.raises(Refused, match="define it beside the scorer step"):
+        _run(ledger, dataclasses.replace(evaluation, config=Far()), synthetic.ridge(1))
+    assert _types(ledger) == {Event.DATASET: 1}
 
 
 def test_a_split_whose_folds_moved_under_one_declaration_is_refused(
@@ -165,6 +169,45 @@ def test_a_blend_whose_fit_takes_three_arguments_predicts_no_train_range(
     assert rows[0]["n"] == 0 and "equal" in _latest(ledger, evaluation)
 
 
+def test_a_dry_run_counts_shared_work_once_as_the_run_does(
+    ledger, dataset, tmp_path, capsys
+):
+    shared = tmp_path / "shared.py"
+    shared.write_text(
+        "import dataclasses\nfrom tests import synthetic\n"
+        "one, three = synthetic.ridge(1), synthetic.ridge(3)\n"
+        "scaled = dataclasses.replace(one, postprocess=synthetic.scale.configured("
+        "factor=2.0), name='scaled')\n"
+        "pipelines = [one, three, scaled, synthetic.blend(one, three)]\n"
+        "def evaluations(d):\n"
+        "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
+        " for c in (0.001, 0.01)]\n"
+    )
+    args = ["--root", str(ledger.root), "run", str(shared)]
+    counts = r"fits (\d+), predictions (\d+), scores (\d+)"
+    assert cli.main([*args, "--dry-run"]) == 0
+    dry = re.findall(counts, capsys.readouterr().out)
+    assert cli.main(args) == 0
+    real = re.findall(counts, capsys.readouterr().out)
+    assert dry == real and dry[1] == ("0", "0", "4")
+
+
+def test_lab_run_refuses_an_unregistered_step_once(ledger, dataset, tmp_path, capsys):
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import dataclasses\nfrom tests import synthetic\n"
+        "def bare(session):\n    return {}\n"
+        "pipelines = [dataclasses.replace(synthetic.ridge(3), features=bare)]\n"
+        "def evaluations(d):\n"
+        "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
+        " for c in (0.001, 0.01)]\n"
+    )
+    assert cli.main(["--root", str(ledger.root), "run", str(probe)]) == 1
+    err = capsys.readouterr().err
+    assert err.count("lab run:") == 1 and "'bare' is not a registered step" in err
+    assert _types(ledger) == {Event.DATASET: 1}
+
+
 def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
     ledger, dataset, tmp_path, capsys
 ):
@@ -178,7 +221,7 @@ def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
     )
     assert cli.main(["--root", str(ledger.root), "run", str(sweep)]) == 0
     out = capsys.readouterr().out
-    assert "evaluation c0.001" in out and "evaluation c0.01" in out
+    assert re.search(r"evaluation [0-9a-f]{16} c0\.001\n", out) and " c0.01\n" in out
     rows = ledger.sql(
         "SELECT evaluation_name AS e, COUNT(*) AS n FROM latest_score GROUP BY 1"
     )
@@ -296,10 +339,14 @@ def test_a_day_walk_forward_steps_over_dates_with_rows():
     folds = splits.CalendarWalkForward(
         "2019-06-08", unit="day", horizons=(1,), min_folds=1
     ).folds(session)
-    assert [f.label for f in folds] == [f"2019-06-1{d}" for d in range(4)]
+    assert [f.label for f in folds] == [f"2019-06-1{d}" for d in range(5)]
     assert folds[0].windows == {"1": (2, 4)} and folds[0].train == ((0, 2),)
-    assert folds[-1].windows == {"1": (8, 10)}
-    with pytest.raises(Refused, match="plus 1 months reaches"):
+    assert folds[-1].windows == {"1": (10, 12)}
+    with pytest.raises(Refused, match=r"no train rows: \['2019-06-07'\]"):
+        splits.CalendarWalkForward(
+            "2019-06-07", unit="day", horizons=(1,), min_folds=1
+        ).folds(session)
+    with pytest.raises(Refused, match="0 months from the first cutoff"):
         splits.CalendarWalkForward("2019-06-12", horizons=(1,)).folds(session)
 
 
@@ -392,7 +439,7 @@ def test_a_predict_that_reads_the_future_inside_its_window_is_refused(
 ):
     peek = dataclasses.replace(synthetic.ridge(1), predict=synthetic.peeking_predict)
     report = _run(ledger, evaluation, peek)
-    assert "reads rows after the one it predicts" in report.failed["ridge_1m"]
+    assert "predict read past row" in report.failed["ridge_1m"]
     assert ledger.events(Event.SCORE) == []
 
 
@@ -444,9 +491,11 @@ def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     a = synthetic.featured(synthetic.ridge(1))
     b = synthetic.featured(synthetic.ridge(3))
     report = _run(ledger, evaluation, a, b)
-    assert not report.failed and len(synthetic.FEATURE_CALLS) == 2
-    rows = ledger.sql("SELECT columns, probe_at FROM feature")
+    cutoff = evaluation.split.folds(load(ledger, evaluation.dataset))[0].train[-1][1]
+    assert not report.failed and synthetic.FEATURE_CALLS[1:] == [cutoff - 1, cutoff]
+    rows = ledger.sql("SELECT columns, probe_rows FROM feature")
     assert len(rows) == 1 and json.loads(rows[0]["columns"]) == ["f0_lag"]
+    assert json.loads(rows[0]["probe_rows"]) == [cutoff - 1, cutoff]
     assert ledger.sql("SELECT COUNT(*) AS n FROM fit")[0]["n"] == report.fits_computed
     assert set(_latest(ledger, evaluation)) == {"ridge_1m_lag", "ridge_3m_lag"}
     assert a.id != synthetic.ridge(1).id
@@ -557,7 +606,12 @@ def test_a_zip_model_is_portable_only_if_every_member_is(ledger, evaluation):
     zipped = dataclasses.replace(
         synthetic.ridge(1), save=synthetic.zip_save, load=synthetic.zip_load
     )
-    pickled = dataclasses.replace(zipped, save=synthetic.zip_pickle_save, name="zp")
+    pickled = dataclasses.replace(
+        zipped,
+        save=synthetic.zip_pickle_save,
+        load=synthetic.zip_pickle_load,
+        name="zp",
+    )
     _run(ledger, evaluation, zipped, pickled)
     rows = ledger.sql("SELECT pipeline, format, portable, model FROM fit")
     assert {(r["pipeline"], r["format"], r["portable"]) for r in rows} == {
@@ -846,7 +900,7 @@ def test_lab_run_flushes_each_progress_line(ledger, dataset, monkeypatch):
 
     def fake(ledger, pipelines, evaluation, *, log, **kwargs):
         log("fit ridge_1m 2025-05-01 0.1s")
-        assert out.flushed == "fit ridge_1m 2025-05-01 0.1s\n"
+        assert out.flushed.endswith("fit ridge_1m 2025-05-01 0.1s\n")
         return runs.RunReport()
 
     monkeypatch.setattr(runs, "run", fake)
@@ -915,6 +969,48 @@ def test_paired_score_is_the_fold_by_fold_difference_and_the_series_is_named(
     ]
 
 
+def test_paired_score_names_its_evaluation_and_reconciles_with_the_pooled_value(
+    ledger, evaluation
+):
+    _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
+    row = ledger.sql(
+        "SELECT * FROM paired_score WHERE name = 'ridge_1m' AND reference_name = "
+        "'ridge_6m' AND window = '1' AND metric = 'pnl'"
+    )[0]
+    assert (row["evaluation_name"], row["source"]) == ("", "synthetic")
+    agg = {
+        r["score"]: r
+        for r in ledger.sql(
+            "SELECT score, value, fold_mean FROM aggregate_score "
+            "WHERE window = '1' AND metric = 'pnl'"
+        )
+    }
+    a, b = agg[row["score"]], agg[row["reference_score"]]
+    assert np.isclose(row["pooled_delta"], a["value"] - b["value"])
+    assert np.isclose(row["mean_delta"], a["fold_mean"] - b["fold_mean"])
+
+
+def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
+    holdout = synthetic.evaluation(dataset, split=splits.Holdout(0.7))
+    _run(ledger, holdout, synthetic.ridge(1), synthetic.ridge(6))
+    row = ledger.sql(
+        "SELECT * FROM paired_score WHERE name = 'ridge_1m' AND metric = 'pnl'"
+    )[0]
+    assert row["folds"] == 1 and row["delta_std"] is None
+    series = ledger.sql(
+        "SELECT score, series, fold_rows FROM aggregate_score "
+        "WHERE window = 'test' AND metric = 'pnl' AND score IN (?, ?)",
+        (row["score"], row["reference_score"]),
+    )
+    assert series[0]["fold_rows"] == series[1]["fold_rows"]
+    pnl = {
+        r["score"]: formats.arrays_load(ledger.get_blob(r["series"]))["pnl"]
+        for r in series
+    }
+    d = pnl[row["score"]] - pnl[row["reference_score"]]
+    assert np.isclose(d.sum(), row["pooled_delta"]) and d.std(ddof=1) > 0
+
+
 def test_the_log_reads_as_it_stood(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(6))
     before = ledger.events()[-1]["seq"]
@@ -963,5 +1059,71 @@ def test_a_panel_grids_a_session_by_time_and_key_and_back():
     demeaned = grid - np.nanmean(grid, axis=1, keepdims=True)
     assert np.allclose(panel.rows(demeaned), [-5.0, 5.0, 0.0])
     assert Panel(session.upto(2), "stock").shape == (1, 2)
+    assert Panel(session.upto(2), "stock", keys=[1, 2, 3]).shape == (1, 3)
+    with pytest.raises(ValueError, match="is not in keys"):
+        Panel(session, "stock", keys=[1])
     with pytest.raises(ValueError, match="timestamps"):
         Panel(Session({"stock": np.array([1])}), "stock")
+
+
+def test_a_refused_predict_records_nothing_and_every_rerun_refuses(ledger, dataset):
+    peek = dataclasses.replace(synthetic.ridge(1), predict=synthetic.peeking_predict)
+    for cost in (0.001, 0.002, 0.003):
+        report = _run(ledger, synthetic.evaluation(dataset, cost=cost), peek)
+        assert "predict read past row" in report.failed["ridge_1m"]
+    assert Event.FAILED in _types(ledger)
+    assert not ledger.events(Event.PREDICTIONS) and not ledger.events(Event.SCORE)
+
+
+def test_a_postprocess_is_probed_with_its_predictions_cut(ledger, evaluation):
+    centred = dataclasses.replace(
+        synthetic.ridge(1), postprocess=synthetic.centre_window, name="centred"
+    )
+    report = _run(ledger, evaluation, centred)
+    assert "postprocess read past row" in report.failed["centred"]
+
+
+def test_a_save_that_drops_state_is_refused_before_its_fit_is_recorded(
+    ledger, evaluation
+):
+    lossy = dataclasses.replace(synthetic.ridge(1), save=synthetic.biasless_save)
+    report = _run(ledger, evaluation, lossy)
+    assert "loaded from its saved bytes" in report.failed["ridge_1m"]
+    assert not ledger.events(Event.FIT)
+
+
+def test_rows_sharing_a_timestamp_are_one_instant_to_the_probe(ledger):
+    split = splits.WalkForward(200, 50, 50, min_folds=2)
+    evaluation = synthetic.evaluation(synthetic.panel(ledger), split=split)
+    xs = dataclasses.replace(
+        synthetic.ridge(0), predict=synthetic.demean_at_timestamp, name="xs"
+    )
+    peek = dataclasses.replace(synthetic.ridge(0), predict=synthetic.peeking_predict)
+    report = _run(ledger, evaluation, xs, peek)
+    assert set(report.failed) == {"ridge_0m"} and report.scores_recorded == 1
+
+
+def test_a_revealed_target_is_a_feature_no_earlier_than_its_lag(ledger):
+    split = splits.WalkForward(200, 50, 50, min_folds=2)
+    two = datetime.timedelta(minutes=2)
+    dataset = synthetic.panel(ledger, reveal={synthetic.TARGET: two})
+    assert dataset != synthetic.panel(ledger)
+    evaluation = synthetic.evaluation(dataset, split=split)
+    base = synthetic.ridge(0)
+    known = synthetic.featured(base, synthetic.label_two_minutes_back, "known")
+    early = synthetic.featured(base, synthetic.label_one_minute_back, "early")
+    report = _run(ledger, evaluation, known, early)
+    assert set(report.failed) == {"early"} and "f0_lag" in report.failed["early"]
+    unrevealed = synthetic.evaluation(synthetic.panel(ledger), split=split)
+    assert synthetic.TARGET in _run(ledger, unrevealed, known).failed["known"]
+
+
+def test_the_features_probe_reruns_on_two_prefixes_and_catches_a_day_lookahead(
+    ledger, dataset
+):
+    no_embargo = splits.CalendarWalkForward(first_cutoff="2025-05-01", horizons=(1, 2))
+    evaluation = synthetic.evaluation(dataset, split=no_embargo)
+    cutoff = evaluation.split.folds(load(ledger, dataset))[0].train[-1][1]
+    day = synthetic.featured(synthetic.ridge(1), synthetic.day_mean, "day_mean")
+    report = _run(ledger, evaluation, day)
+    assert f"features read past row {cutoff - 1}: f0_lag" in report.failed["day_mean"]

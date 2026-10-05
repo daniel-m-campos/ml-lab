@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
-from collections.abc import Callable
 
 import numpy as np
 
@@ -73,9 +72,11 @@ class CalendarWalkForward:
     """Cutoffs on the session clock every ``every`` units, a unit being a calendar
     month or a day the clock has rows on; train on everything before each cutoff
     minus ``embargo_timestamps`` distinct timestamps, score the ``window`` units after
-    it. Horizon ``h`` is the ``h``-th window after the cutoff, named ``str(h)``. Folds
-    whose last window reaches past ``end`` are dropped, so a test period at the end of
-    the data stays unscored.
+    it. Horizon ``h`` is the ``h``-th window after the cutoff, named ``str(h)``. A
+    window ends on a unit boundary at or before ``end`` (the day after the data when
+    ``end`` is not given); the boundary after the last day is ``end`` itself, so the
+    last trading day is scored. Folds that reach past ``end`` are dropped, never cut,
+    so a test period at the end of the data stays unscored.
     """
 
     first_cutoff: str
@@ -88,45 +89,41 @@ class CalendarWalkForward:
     min_folds: int = 3
 
     def folds(self, session: Session) -> list[Fold]:
-        at = self._boundaries(session)
-        reach = max(self.horizons) * self.window
         stop = dates.as_date(self.end) if self.end else dates.span(session)[1]
+        at = self._boundaries(session, stop)
+        reach = max(self.horizons) * self.window
         out: list[Fold] = []
-        c = 0
-        while at(c + reach) <= stop:
-            cut = session.index_of(at(c))
+        for c in range(0, len(at) - reach, self.every):
+            cut = session.index_of(at[c])
             for _ in range(self.embargo_timestamps):
                 if cut:
                     cut = int(np.searchsorted(session.ts, session.ts[cut - 1], "left"))
             windows = {
                 str(h): (
-                    session.index_of(at(c + (h - 1) * self.window)),
-                    session.index_of(at(c + h * self.window)),
+                    session.index_of(at[c + (h - 1) * self.window]),
+                    session.index_of(at[c + h * self.window]),
                 )
                 for h in self.horizons
             }
-            out.append(Fold(str(at(c)), ((0, cut),), windows))
-            c += self.every
+            out.append(Fold(str(at[c]), ((0, cut),), windows))
         why = (
-            f"the first cutoff {at(0)} plus {reach} {self.unit}s reaches {at(reach)}, "
-            f"past {stop}"
+            f"{max(len(at) - 1, 0)} {self.unit}s from the first cutoff "
+            f"{self.first_cutoff} to {stop}, {reach} needed per fold"
         )
         return _at_least(out, self.min_folds, why)
 
-    def _boundaries(self, session: Session) -> Callable[[int], datetime.date]:
-        """The n-th boundary date after the first cutoff."""
+    def _boundaries(self, session: Session, stop: datetime.date) -> list[datetime.date]:
+        """Unit boundaries from the first cutoff to ``stop`` inclusive."""
         first = dates.as_date(self.first_cutoff)
         if self.unit == "month":
-            return lambda n: dates.add_months(first, n)
+            out: list[datetime.date] = []
+            while (boundary := dates.add_months(first, len(out))) <= stop:
+                out.append(boundary)
+            return out
         if self.unit != "day":
             raise Refused(f"CalendarWalkForward unit {self.unit!r}: month or day")
-        days = np.unique(session._clock().astype("datetime64[D]"))
-        days = days[days >= np.datetime64(first)].astype(datetime.date)
-
-        def at(n: int) -> datetime.date:
-            return days[n] if n < len(days) else datetime.date.max
-
-        return at
+        days = np.unique(session._clock().astype("datetime64[D]")).astype(datetime.date)
+        return [d for d in days if first <= d < stop] + [stop]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -177,4 +174,7 @@ def _at_least(folds: list[Fold], minimum: int, why: str = "") -> list[Fold]:
         )
     if any(lo >= hi for f in folds for lo, hi in f.windows.values()):
         raise Refused("split yields an empty window")
+    bare = [f.label for f in folds if all(lo >= hi for lo, hi in f.train)]
+    if bare:
+        raise Refused(f"split yields folds with no train rows: {bare}; start later")
     return folds

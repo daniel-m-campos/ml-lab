@@ -64,6 +64,7 @@ def run(
     code_root: pathlib.Path | None = None,
     log: Callable[[str], None] = lambda line: None,
     dry: bool = False,
+    planned: set[str] | None = None,
 ) -> RunReport:
     """Fit, predict and score each pipeline, reusing what the memo rule allows.
 
@@ -78,7 +79,10 @@ def run(
     duplicate. ``log`` receives one line per feature set, fit, prediction set and score
     as it is written. A ``dry`` run computes every id, looks each one up and writes
     nothing; it logs what it would compute and, for a fit, which repo files moved
-    against the newest earlier fit of the same pipeline and label.
+    against the newest earlier fit of the same pipeline and label. ``planned`` carries
+    the ids a dry run would write across several calls, so shared work counts once.
+    A declaration error (an unregistered step, a config class its step does not
+    import) is refused before anything is read or written.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -95,15 +99,24 @@ def run(
                 f"pipeline {name}: save step declares format {pipeline.format!r}, "
                 f"not one of {sorted(formats.KNOWN)}"
             )
-    session = dataset.load(ledger, evaluation.dataset)
-    recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
-    targets = tuple(recipe["targets"])
-    schedule = evaluation.split.folds(session)
-    if not dry:
-        _declare_evaluation(ledger, evaluation, schedule)
     root = code_root or identity.repo_root(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
     )
+    for pipeline in pipelines:
+        for p in (pipeline, *pipeline.members):
+            shas = identity.import_shas((p.fit, p.save, p.load), root)
+            _refuse_unseen_class(p.config, shas, root, "fit")
+    scorer_shas = identity.import_shas((evaluation.scorer,), root)
+    _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
+    session = dataset.load(ledger, evaluation.dataset)
+    recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
+    targets = {
+        name: None if lag is None else np.timedelta64(round(lag * 1e9), "ns")
+        for name, lag in recipe["targets"].items()
+    }
+    schedule = evaluation.split.folds(session)
+    if not dry:
+        _declare_evaluation(ledger, evaluation, schedule)
     report = RunReport()
 
     def start() -> str:
@@ -132,8 +145,9 @@ def run(
         report,
         start,
         log,
-        min(f.train[-1][1] for f in schedule),
+        session.boundary(min(f.train[-1][1] for f in schedule)) or 0,
         dry,
+        set() if planned is None else planned,
     )
     for pipeline in pipelines:
         if not dry:
@@ -169,7 +183,7 @@ class _Run:
 
     ledger: Ledger
     session: Session
-    targets: tuple[str, ...]
+    targets: dict[str, np.timedelta64 | None]
     evaluation: Evaluation
     root: pathlib.Path
     report: RunReport
@@ -177,6 +191,7 @@ class _Run:
     log: Callable[[str], None]
     probe_at: int
     dry: bool
+    planned: set[str]
 
 
 def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
@@ -202,9 +217,15 @@ class _Stage:
     member.
     """
 
-    def __init__(self, context: _Run, pipeline: Pipeline):
+    def __init__(
+        self,
+        context: _Run,
+        pipeline: Pipeline,
+        loaded: dict[str, dict[str, np.ndarray]] | None = None,
+    ):
         vars(self).update(vars(context))
         self.pipeline = pipeline
+        self.loaded = {} if loaded is None else loaded
         self.name = pipeline.name or pipeline.id
         self.shas = identity.import_shas(pipeline.steps, self.root)
         self.steps = {
@@ -222,7 +243,6 @@ class _Stage:
             for stage, steps in self.steps.items()
         }
         self.takes_members = bool(pipeline.members) and _positional(pipeline.fit) > 3
-        _refuse_unseen_class(pipeline.config, self.stage_shas["fit"], self.root, "fit")
         self.dists = identity.imported_dists(pipeline.steps, self.root)
         self.lock_text = _lock_text(self.dists)
         self.env_lock = {
@@ -242,9 +262,9 @@ class _Stage:
             )
         self.featured: Session | None = None
         self.models: dict[str, Any] = {}
+        self.pending: dict[str, tuple[Any, dict[str, Any]]] = {}
         self.fits: dict[str, str] = {}
-        self.probed = False
-        self.members = [_Stage(context, m) for m in pipeline.members]
+        self.members = [_Stage(context, m, self.loaded) for m in pipeline.members]
 
     def fit(self, fold: Fold) -> str:
         if fold.label in self.fits:
@@ -267,26 +287,26 @@ class _Stage:
                 **({"features": columns_id} if self.feature_id else {}),
             }
         )
-        if self.ledger.latest(Event.FIT, fit_id) is not None:
+        if fit_id in self.planned or self.ledger.latest(Event.FIT, fit_id) is not None:
             self.report.fits_reused += 1
             return fit_id
+        inputs = self._member_inputs(member_fits, fold) if self.takes_members else []
         if self.dry:
+            self.planned.add(fit_id)
             self.report.fits_computed += 1
             self.log(f"would fit {self.name} {fold.label}: {self._why(fold.label)}")
             return fit_id
-        inputs = self._member_inputs(member_fits, fold) if self.takes_members else []
         visible = self._visible(max(hi for _, hi in fold.train))
         run_id = self.start()
         started = time.perf_counter()
         model = self.pipeline.fit(visible, fold.train, self.pipeline.config, *inputs)
         duration = time.perf_counter() - started
         self._unchanged("fit")
-        self.models[fit_id] = model
+        blob = self._model_blob(model)
+        self.models[fit_id] = self.pipeline.load(self.ledger.get_blob(blob["sha"]))
         self.ledger.put_blob(self.lock_text.encode())
-        self.ledger.append(
-            Event.FIT,
-            self.evaluation.dataset,
-            fit_id,
+        self.pending[fit_id] = (
+            model,
             {
                 "pipeline": self.pipeline.id,
                 "run": run_id,
@@ -296,14 +316,12 @@ class _Stage:
                 "code_keys": self.stage_keys["fit"],
                 "env_lock": self.env_lock,
                 "duration_s": duration,
-                "model": self._model_blob(model),
+                "model": blob,
                 **({"members": member_fits} if self.members else {}),
                 **({"features": columns_id} if self.feature_id else {}),
             },
-            id=fit_id,
         )
         self.report.fits_computed += 1
-        self.log(f"fit {self.name} {fold.label} {duration:.1f}s")
         return fit_id
 
     def predictions(
@@ -332,11 +350,15 @@ class _Stage:
                     "code_keys": self.stage_keys["postprocess"],
                 }
             )
-        if self.ledger.latest(Event.PREDICTIONS, pred_id) is not None:
+        if pred_id in self.planned or self.ledger.latest(Event.PREDICTIONS, pred_id):
             self.report.predictions_reused += 1
             return pred_id
         if self.dry:
-            self.report.predictions_computed += 1
+            raw_missing = raw_id not in self.planned and not self.ledger.latest(
+                Event.PREDICTIONS, raw_id
+            )
+            self.report.predictions_computed += 1 + (raw_missing and raw_id != pred_id)
+            self.planned.update((raw_id, pred_id))
             return pred_id
         where: dict[str, Any] = {
             "fit": fit_id,
@@ -351,27 +373,34 @@ class _Stage:
             raw = _load_predictions(self.ledger, raw_id)
         else:
             inputs = [_load_predictions(self.ledger, p) for p in member_preds]
-            extra = [inputs] if self.members else []
+
+            def predict(model: Any, view: Session, part: Range) -> np.ndarray:
+                head = part[1] - rng[0]
+                extra = [[a[:head] for a in inputs]] if self.members else []
+                out = self.pipeline.predict(model, view, part, *extra)
+                return np.asarray(out, dtype=np.float64)
+
             model = self._model(fit_id)
             self._unchanged("predict")
-            raw = self._write(
-                raw_id, self.pipeline.predict(model, visible, rng, *extra), where
-            )
-            self.log(f"predictions {self.name} {window} rows {rng[0]}:{rng[1]}")
+            raw = predict(model, visible, rng)
+            if fit_id in self.pending:
+                self._record_fit(fit_id, fold, raw, lambda m: predict(m, visible, rng))
             self._probe(
-                "predict",
-                raw,
-                lambda view: self.pipeline.predict(model, view, rng, *extra),
-                visible,
-                rng,
+                "predict", raw, lambda v, part: predict(model, v, part), visible, rng
             )
+            self._write(raw_id, raw, where)
+            self.log(f"predictions {self.name} {window} rows {rng[0]}:{rng[1]}")
         if self.pipeline.postprocess is not None:
             self._unchanged("postprocess")
-            post = self.pipeline.postprocess(raw, visible, rng)
+            post = np.asarray(
+                self.pipeline.postprocess(raw, visible, rng), dtype=np.float64
+            )
             self._probe(
                 "postprocess",
                 post,
-                lambda view: self.pipeline.postprocess(raw, view, rng),
+                lambda view, part: self.pipeline.postprocess(
+                    raw[: part[1] - rng[0]], view, part
+                ),
                 visible,
                 rng,
             )
@@ -387,6 +416,25 @@ class _Stage:
             self.log(f"postprocess {self.name} {window} rows {rng[0]}:{rng[1]}")
         return pred_id
 
+    def _record_fit(
+        self, fit_id: str, fold: Fold, loaded: np.ndarray, predict: Callable
+    ):
+        """Append a fit once its reloaded model predicts its first window as the
+        fitted one did, so a save that drops state is refused, not recorded.
+        """
+        fitted, payload = self.pending.pop(fit_id)
+        again = np.asarray(predict(fitted), dtype=np.float64)
+        if not np.array_equal(loaded, again, equal_nan=True):
+            raise Refused(
+                f"{self.name}: fit {fold.label}: the model loaded from its saved "
+                "bytes predicts differently from the fitted one; save must keep "
+                "what predict reads, and predict must be deterministic"
+            )
+        self.ledger.append(
+            Event.FIT, self.evaluation.dataset, fit_id, payload, id=fit_id
+        )
+        self.log(f"fit {self.name} {fold.label} {payload['duration_s']:.1f}s")
+
     def _member_inputs(
         self, member_fits: list[str], fold: Fold
     ) -> list[list[np.ndarray]]:
@@ -395,13 +443,13 @@ class _Stage:
         """
         arrays = []
         for member, fit_id in zip(self.members, member_fits, strict=True):
-            parts = [
-                _load_predictions(
-                    self.ledger,
-                    member.predictions(fit_id, fold, -1, f"train:{k}", seg),
-                )
+            ids = [
+                member.predictions(fit_id, fold, -1, f"train:{k}", seg)
                 for k, seg in enumerate(fold.train)
             ]
+            if self.dry:
+                continue
+            parts = [_load_predictions(self.ledger, p) for p in ids]
             arrays.append(np.concatenate(parts))
         return [arrays]
 
@@ -463,26 +511,33 @@ class _Stage:
         """The feature step's columns, computed once per feature id over the session
         without its targets and probed at the schedule's first cutoff.
         """
+        if self.feature_id in self.loaded:
+            return self.loaded[self.feature_id]
         event = self.ledger.latest(Event.FEATURES, self.feature_id)
         if event is not None:
-            blob = self.ledger.get_blob(event["payload"]["blob"]["sha"])
-            return formats.session_load(blob).columns
+            path = self.ledger.blobs / event["payload"]["blob"]["sha"]
+            self.loaded[self.feature_id] = formats.session_load(path).columns
+            return self.loaded[self.feature_id]
+        revealed = {k: v for k, v in self.targets.items() if v is not None}
         bare = Session(
-            {k: v for k, v in self.session.columns.items() if k not in self.targets},
+            {
+                k: v
+                for k, v in self.session.columns.items()
+                if k in revealed or k not in self.targets
+            },
             self.session.ts,
         )
         started = time.perf_counter()
         columns = self._feature_columns(bare)
         duration = time.perf_counter() - started
         self._unchanged("features")
-        at = self.probe_at
-        again = self._feature_columns(bare.frozen(at))
-        for name, values in columns.items():
-            if not np.array_equal(values[:at], again[name][:at], equal_nan=True):
-                raise Refused(
-                    f"{self.name}: features read past row {at}: column {name} "
-                    f"changed before row {at} when rows from {at} were frozen"
-                )
+        before = bare.boundary(max(self.probe_at - 1, 0))
+        probe_rows = sorted({before, self.probe_at} - {0, None})
+        for row in probe_rows:
+            head = self._feature_columns(bare.upto(row).masked(revealed, row - 1))
+            for name, values in columns.items():
+                _refuse_changed(f"{self.name}: features", name, row, values, head[name])
+            del head
         run_id = self.start()
         self.ledger.append(
             Event.FEATURES,
@@ -496,7 +551,7 @@ class _Stage:
                 "code_keys": self.stage_keys["features"],
                 "columns": list(columns),
                 "columns_id": _columns_id(columns),
-                "probe_at": at,
+                "probe_rows": probe_rows,
                 "duration_s": duration,
                 "blob": {
                     "sha": self.ledger.put_blob(
@@ -508,6 +563,7 @@ class _Stage:
             id=self.feature_id,
         )
         self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
+        self.loaded[self.feature_id] = columns
         return columns
 
     def _feature_columns(self, bare: Session) -> dict[str, np.ndarray]:
@@ -518,10 +574,10 @@ class _Stage:
         columns = {}
         for name, values in out.items():
             values = np.asarray(values)
-            if values.shape != (self.session.rows,):
+            if values.shape != (bare.rows,):
                 raise Refused(
                     f"{self.name}: feature {name} has shape {values.shape}, not "
-                    f"({self.session.rows},)"
+                    f"({bare.rows},)"
                 )
             columns[name] = values
         return columns
@@ -551,24 +607,21 @@ class _Stage:
         self,
         stage: str,
         output: np.ndarray,
-        compute: Callable[[Session], Any],
+        compute: Callable[[Session, Range], Any],
         visible: Session,
         rng: Range,
     ):
-        """Once per pipeline, on its first computed window: freeze the rows after the
-        window's midpoint and require the predictions before it to stand.
+        """Rerun the step on the rows before the first row of the window's middle
+        timestamp, with its array inputs cut there, and require the predictions
+        before it to stand; every computed window, before it is written.
         """
-        if self.probed or rng[1] - rng[0] < 2:
+        at = visible.boundary((rng[0] + rng[1]) // 2, rng[0])
+        if at is None:
             return
-        self.probed = True
-        mid = (rng[0] + rng[1]) // 2
-        again = np.asarray(compute(visible.frozen(mid)), dtype=np.float64)
-        head = mid - rng[0]
-        if not np.array_equal(output[:head], again[:head], equal_nan=True):
-            raise Refused(
-                f"{self.name}: {stage} reads rows after the one it predicts: "
-                f"predictions before row {mid} changed when rows from {mid} were frozen"
-            )
+        again = np.asarray(compute(visible.upto(at), (rng[0], at)), dtype=np.float64)
+        _refuse_changed(
+            f"{self.name}: {stage}", "prediction", at, output, again, rng[0]
+        )
 
     def _model(self, fit_id: str) -> Any:
         if fit_id not in self.models:
@@ -601,7 +654,6 @@ def _score(
     ledger, evaluation, report = context.ledger, context.evaluation, context.report
     name = pipeline.name or pipeline.id
     scorer_shas = identity.import_shas((evaluation.scorer,), context.root)
-    _refuse_unseen_class(evaluation.config, scorer_shas, context.root, "scorer")
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
@@ -673,6 +725,23 @@ def _score(
         context.log(
             f"score {name} {window} "
             + " ".join(f"{k}={v:.4g}" for k, v in metrics.items())
+        )
+
+
+def _refuse_changed(
+    who: str, name: str, row: int, full: Any, head: Any, first: int = 0
+):
+    """Refuse when a step's output before ``row`` moved once the rows from ``row``
+    were gone; name the first row that moved and both values.
+    """
+    full = np.asarray(full, dtype=np.float64)[: len(head)]
+    head = np.asarray(head, dtype=np.float64)
+    moved = np.flatnonzero((full != head) & ~(np.isnan(full) & np.isnan(head)))
+    if moved.size:
+        r = moved[0]
+        raise Refused(
+            f"{who} read past row {row}: {name} at row {first + r} is {full[r]} on "
+            f"the whole input and {head[r]} on the rows before {row}"
         )
 
 

@@ -87,7 +87,7 @@ def test_a_rerun_writes_nothing(root, dataset):
     ledger = Ledger(root)
     before = len(ledger.events())
     out = lab(root, "run", DECL, "--dataset", dataset)
-    assert out.startswith("up to date:")
+    assert "\nup to date:" in out
     assert ledger.events()[before:] == []
 
 

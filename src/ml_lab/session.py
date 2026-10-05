@@ -62,27 +62,36 @@ class Session:
         view.feature_columns = self.feature_columns
         return view
 
-    def masked(self, columns: tuple[str, ...], start: int) -> Session:
-        """A view with ``columns`` set to NaN from ``start`` on: the targets inside a
-        prediction window, hidden from predict and postprocess.
+    def masked(self, reveal: dict[str, np.timedelta64 | None], at: int) -> Session:
+        """A view whose target columns are NaN for every label not known at row
+        ``at``: a label with lag ``L`` is known from ``ts + L``, one without a lag
+        only after its own timestamp; without a clock, rows from ``at`` on.
         """
         view = self.upto(self.rows)
-        for name in columns:
+        for name, lag in reveal.items():
             values = view.columns[name].astype(np.float64, copy=True)
-            values[start:] = np.nan
+            if self.ts is None:
+                values[at:] = np.nan
+            elif lag is None:
+                values[self.ts >= self.ts[at]] = np.nan
+            else:
+                values[self.ts + lag > self.ts[at]] = np.nan
             view.columns[name] = values
         return view
 
-    def frozen(self, start: int) -> Session:
-        """A view whose rows from ``start`` on repeat row ``start - 1``: a future that
-        never moves, so a step that reads it predicts differently before ``start``.
+    def boundary(self, row: int, lo: int = 0) -> int | None:
+        """The first row of ``row``'s timestamp, or of the next one when that is
+        ``lo``; None when no timestamp starts inside ``(lo, rows)``. Without a clock
+        every row is its own timestamp. A probe cuts here so it never splits a
+        cross-section.
         """
-        view = self.upto(self.rows)
-        for name, values in view.columns.items():
-            values = values.copy()
-            values[start:] = values[start - 1]
-            view.columns[name] = values
-        return view
+        if self.ts is None:
+            return row if lo < row < self.rows else None
+        first = int(np.searchsorted(self.ts, self.ts[row], "left"))
+        if first > lo:
+            return first
+        after = int(np.searchsorted(self.ts, self.ts[row], "right"))
+        return after if after < self.rows else None
 
     def matrix(self, rows: Rows, cols: tuple[str, ...]) -> np.ndarray:
         """Column-stacked features over a range or segments, shape (rows, len(cols))."""

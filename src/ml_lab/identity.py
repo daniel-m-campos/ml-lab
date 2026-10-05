@@ -36,6 +36,11 @@ from typing import Any
 
 import numpy as np
 
+
+class Refused(Exception):
+    """The ledger refuses an operation that would break an invariant."""
+
+
 STEP_ATTR = "__ml_lab_step__"
 HASH_LEN = 16
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -66,11 +71,12 @@ def configured(func: Callable, **kwargs: Any) -> Callable:
 
 
 def step_ref(func: Callable) -> str:
-    """The ``module:qualname`` of a step; TypeError for an unregistered callable."""
+    """The ``module:qualname`` of a step; refused for an unregistered callable."""
     ref = getattr(func, STEP_ATTR, None)
     if ref is None:
-        raise TypeError(
-            f"{func!r} is not a registered step; closures and lambdas cannot be hashed"
+        name = getattr(func, "__name__", repr(func))
+        raise Refused(
+            f"{name!r} is not a registered step; decorate it with @step at module level"
         )
     return ref
 
@@ -101,7 +107,7 @@ def canonical(obj: Any) -> Any:
         }
     if isinstance(obj, (list, tuple)):
         return [canonical(v) for v in obj]
-    raise TypeError(f"cannot serialize {type(obj).__name__} into a declaration")
+    raise Refused(f"cannot serialize {type(obj).__name__} into a declaration")
 
 
 def _at_default(field: dataclasses.Field, value: Any) -> bool:

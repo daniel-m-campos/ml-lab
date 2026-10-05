@@ -288,6 +288,11 @@ def zip_load(payload: bytes) -> RidgeModel:
     return ridge_load(formats.zip_load(payload)["model.arrow"])
 
 
+@step
+def zip_pickle_load(payload: bytes) -> RidgeModel:
+    return pickle_load(formats.zip_load(payload)["model.pkl"])
+
+
 @dataclasses.dataclass(frozen=True)
 class SimConfig:
     cost: float
@@ -346,3 +351,59 @@ pipelines = [ridge(1), ridge(3), ridge(6)]
 
 def evaluations(dataset: str) -> list[Evaluation]:
     return [evaluation(dataset)]
+
+
+@step
+def centre_window(pred: np.ndarray, session: Session, rng: Range) -> np.ndarray:
+    """Subtracts the window's mean prediction: reads later predictions."""
+    return pred - pred.mean()
+
+
+@step(format=formats.Format.ARROW_ARRAYS)
+def biasless_save(model: RidgeModel) -> bytes:
+    """Drops the bias, as a writer that loses state would."""
+    return formats.arrays_save({"weights": model.weights, "bias": np.zeros(1)})
+
+
+@step
+def demean_at_timestamp(model: Any, session: Session, rng: Range) -> np.ndarray:
+    """Each row's f0 minus its timestamp's mean: a same-time cross-section."""
+    _, t = np.unique(session.ts[rng[0] : rng[1]], return_inverse=True)
+    x = session.column("f0", rng)
+    return x - (np.bincount(t, x) / np.bincount(t))[t]
+
+
+@step
+def day_mean(session: Session) -> dict[str, np.ndarray]:
+    """Each row's f0 minus its day's mean: reads later rows of the same day."""
+    days, d = np.unique(session.ts.astype("datetime64[D]"), return_inverse=True)
+    x = session.columns["f0"]
+    return {"f0_lag": x - (np.bincount(d, x) / np.bincount(d))[d]}
+
+
+def panel(ledger: Ledger, reveal: Any = None) -> str:
+    """Two rows a minute; the target is f0 two minutes on."""
+    f0, f1, f2 = np.random.default_rng(3).standard_normal((3, 400))
+    ts = np.datetime64("2025-01-01", "ns") + (np.arange(400) // 2).astype(
+        "timedelta64[m]"
+    )
+    columns = {"f0": f0, "f1": f1, "f2": f2, TARGET: np.r_[f0[4:], np.zeros(4)]}
+    return record(
+        ledger,
+        Session(columns, ts),
+        source="panel",
+        params={},
+        filters=(),
+        targets=(TARGET,),
+        reveal=reveal,
+    )
+
+
+@step
+def label_two_minutes_back(session: Session) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.r_[np.full(4, np.nan), session.columns[TARGET][:-4]]}
+
+
+@step
+def label_one_minute_back(session: Session) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.r_[np.full(2, np.nan), session.columns[TARGET][:-2]]}

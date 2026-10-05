@@ -88,16 +88,16 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
 
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     pipelines, evaluations = _experiments(args, ledger)
-    failed = False
+    failed, planned = False, set()
     for evaluation in evaluations:
-        if len(evaluations) > 1:
-            print(f"evaluation {evaluation.name or evaluation.id}")
+        print(f"evaluation {evaluation.id} {evaluation.name}".rstrip())
         report = runs.run(
             ledger,
             pipelines,
             evaluation,
             log=lambda line: print(line, flush=True),
             dry=args.dry_run,
+            planned=planned,
         )
         if args.dry_run:
             print(
