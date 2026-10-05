@@ -2,7 +2,8 @@
 
 Declarations are plain module attributes, so a project may organize them freely: one
 script, or ``dataset.py`` + ``functions.py`` + ``experiment.py``, or a file per idea.
-``lab ingest`` reads ``dataset(ledger, *args)`` from a module. ``lab run`` takes one or
+``lab ingest`` calls ``dataset(ledger, *args)`` from a module, the extra arguments as
+strings, and prints the id it returns. ``lab run`` takes one or
 more modules, reads ``pipelines`` (a list of ``Pipeline``) from each and
 ``evaluations`` (a list of ``Evaluation``, or a function of the dataset id returning
 one) from exactly one of them, so a file an agent wrote holding only new pipelines
@@ -18,10 +19,11 @@ actor comes from ``ML_LAB_ACTOR``; both verbs refuse it unset.
 
 Examples
 --------
+$ export ML_LAB_ROOT=$PWD/ledger ML_LAB_ACTOR=daniel
 $ lab ingest project/dataset.py 20
 $ lab run project/experiment.py
-$ lab run project/experiment.py ideas/agent7.py
-$ sqlite3 -box .ml-lab/ml_lab.sqlite "SELECT * FROM score_latest"
+$ lab run project/experiment.py ideas/agent7.py --dry-run
+$ sqlite3 -box $ML_LAB_ROOT/ml_lab.sqlite "SELECT * FROM board"
 """
 
 from __future__ import annotations

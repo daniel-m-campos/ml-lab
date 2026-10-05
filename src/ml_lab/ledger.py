@@ -3,7 +3,10 @@ store.
 
 Every write is an insert with a global ``seq``, an actor and a host. Objects carry
 content ids, runs and failures carry ULIDs, so two ledgers merge by id. Blobs live under
-their sha256.
+their sha256. The views: ``board`` and ``head_to_head`` for reading; ``pair_fold``,
+the per-fold pairs ``head_to_head`` aggregates; ``event_dataset`` to
+``event_failure``, one per event type; ``score_fold``, ``score_aggregate``,
+``score_latest`` and ``score_fit`` as building blocks.
 
 Examples
 --------

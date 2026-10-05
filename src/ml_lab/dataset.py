@@ -1,11 +1,12 @@
 """Datasets: columns over rows in a fixed order, recorded once and loaded back.
 
-A ``Dataset`` is a table held resident, read by row ranges, with a clock lookup when
-``ts`` is given. A recorded dataset is the rows of one (source, params), cleaned by the
-caller before ``record``, with named target columns. Its id is the data: the ``ts``
-bytes, column names, dtypes and values, so a loader fix that changes rows is a new
-dataset and an edit that changes nothing is not. The recipe rides on the event as
-provenance; the bytes are Parquet.
+A ``Dataset`` is a table held resident, read by row ranges through ``column(name,
+rows)`` and ``matrix(cols, rows)``, with a clock lookup when ``ts`` is given;
+``from_frame`` builds one from a polars frame. A recorded dataset is the rows of one
+(source, params), cleaned by the caller before ``record``, with named target columns.
+Its id is the data: the ``ts`` bytes, column names, dtypes and values, so a loader fix
+that changes rows is a new dataset and an edit that changes nothing is not. The recipe
+rides on the event as provenance; the bytes are Parquet.
 
 Examples
 --------
@@ -279,7 +280,8 @@ def record(
     may read a revealed target, probed against that lag. ``sealed_from``, a row or a
     date (its first row at or after it), starts the sealed tail that only an
     ``Evaluation(sealed=True)`` validates on, each pipeline once. Targets, their lags
-    and the sealed tail's first row are part of the dataset id.
+    and the sealed tail's first row are part of the dataset id. An empty ``targets``
+    is refused.
     """
     if not targets:
         raise Refused(

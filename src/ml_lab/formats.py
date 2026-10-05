@@ -4,7 +4,8 @@ environment.
 Datasets (through ``ml_lab.dataset``) and predictions are Parquet. A dict of arrays is
 one Arrow IPC file. Both are written and read by polars, the library a researcher
 already has open for the data itself. Libraries with a path-only API round-trip through
-a temp file.
+a temp file; ``pickle_save`` and ``pickle_load`` serve an sklearn model, marked not
+portable.
 
 Examples
 --------
@@ -96,7 +97,9 @@ def zip_formats(payload: bytes) -> dict[str, str]:
 
 
 def series_save(values: np.ndarray) -> bytes:
-    """A 1-D float array as a one-column Parquet file."""
+    """Predictions, ``(rows,)`` or ``(rows, k)``, as Parquet: one column
+    ``prediction``, or ``prediction_0`` to ``prediction_{k-1}``.
+    """
     values = np.asarray(values, np.float64)
     columns = (
         {PREDICTION: values}

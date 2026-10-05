@@ -1,11 +1,13 @@
 """What an experiment is made of: pipelines, the scorer and the evaluation.
 
 An experiment module exposes ``pipelines`` and ``evaluations``; ``lab run`` reads both
-by name. Declarations are frozen dataclasses hashed by canonical serialization; see
-docs/spec.md. A function in a declaration is any module-level function, named by its
-dotted path. A name is a label and does not enter its hash; a field at its default is
-left out, so adding a defaulted field keeps every id. Identity is declaration only: code
-changes are caught by the fit memo, not by hashing files.
+by name. A pipeline's ``params``, an evaluation's ``scorer_params`` and a
+``postprocess_config`` are frozen dataclasses when given. Declarations are frozen
+dataclasses hashed by canonical serialization; see docs/spec.md. A function in a
+declaration is any module-level function, named by its dotted path. A name is a label
+and does not enter its hash; a field at its default is left out, so adding a defaulted
+field keeps every id. Identity is declaration only: code changes are caught by the fit
+memo, not by hashing files.
 
 Examples
 --------
@@ -27,13 +29,16 @@ class Scorer:
     """``series(pred, dataset, rows, scorer_params) -> series`` with the code that
     reads its series.
 
-    The series is a 1-D or 2-D array with one row per row of the test range; a series
-    of another length is refused. ``metrics`` runs per fold and over the concatenated
+    The series is ``(rows,)`` or ``(rows, c)`` with one row per scoring unit: a
+    prediction, or a day for a cross-sectional metric such as a daily Sharpe. A scalar
+    or an empty series is refused. ``metrics`` runs per fold and over the concatenated
     folds, and the pooled value equals the row-weighted fold mean only for a metric
     that adds over rows. It reruns on the stored series alone, so the series carries
     what it needs. Only ``series`` enters the evaluation id; ``metrics`` and
     ``directions`` are code under the memo, and each score records the directions it
-    was scored under.
+    was scored under. ``series`` is a module-level function; ``metrics`` may be a
+    lambda. Keep the scorer in its own module: a fit's memo covers every module its
+    functions import, so a scorer beside ``fit`` refits on a scorer edit.
 
     Parameters
     ----------
@@ -63,7 +68,8 @@ class Pipeline:
     transforms, and a function's slot says what it may read: ``features`` has dataset
     scope (the whole dataset without its target columns, computed and stored once per
     dataset, function, code and environment, however many pipelines and folds share it);
-    ``fit`` has fold scope (the prefix up to its train end, once per train range);
+    ``fit`` has fold scope (the prefix up to its train end, every column NaN outside
+    the train segments, once per train range);
     ``predict`` and ``postprocess`` have range scope (the prefix up to the end of the
     range they predict, with targets masked, once per fit and range). A function belongs
     in the broadest scope of what it reads, so a per-fold standardiser, or a lagged
@@ -81,15 +87,15 @@ class Pipeline:
     and costs only the columns it keeps. ``fit(dataset, train, params)`` receives
     ``params``, ``predict(model, dataset, rows)`` the fold's test range.
     ``postprocess(predictions, dataset, rows, postprocess_config)`` is the cheap
-    stateless stage after ``predict``: neutralise, clip, rank. Its config enters the
-    prediction's identity and not the fit's. A pipeline with ``members`` is a blend:
-    its ``predict`` takes a fourth argument, the members' predictions over the test
-    range as a list of arrays, and a ``fit`` with four positional parameters receives
-    the members' predictions over the train segments as its fourth. Those are
+    stateless stage after ``predict``: neutralise, clip, rank. ``postprocess_config``
+    enters the prediction's identity and not the fit's. A pipeline with ``members`` is a
+    blend: its ``predict`` takes a fourth argument, the members' predictions over the
+    test range as a list of arrays, and a ``fit`` with four positional parameters
+    receives the members' predictions over the train segments as its fourth. Those are
     in-sample, so a weight learned on them overfits; a blend with fixed weights takes
     three and computes no train-segment predictions. A blend without its own
-    ``features`` sees its members' computed columns when every member declares the
-    same functions. The members' fits and predictions are memoized on their own.
+    ``features`` sees its members' computed columns when every member declares the same
+    functions. The members' fits and predictions are memoized on their own.
 
     Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip,
     postprocess_config=Clip(at=3.0), name="gbt_clip")`` shares every fit and raw

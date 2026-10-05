@@ -1,7 +1,8 @@
 """Runs: split a dataset, memoize fits and predictions, record a score per pipeline.
 
-A run owns ranges, the clock and the scorer. A pipeline only sees ``fit``, ``predict``,
-``save`` and ``load``. Reading is SQL over the views in ``ml_lab.ledger``.
+A run owns the folds, the clock, the guards and the scorer. A pipeline's functions see
+the rows their slot may read, and the scorer's ``series`` sees the fold's test range
+with its predictions. Reading is SQL over the views in ``ml_lab.ledger``.
 
 Examples
 --------
@@ -79,28 +80,43 @@ def run(
 
     ``run_started`` is appended only when something is computed, right before the first
     write, so a rerun of an unchanged tree writes nothing and adding one pipeline costs
-    only its own fits, predictions and score. A pipeline that raises is recorded as
-    ``pipeline_failed`` and the others continue; what it had written stays and a rerun
-    resumes from there. Every function sees a prefix of the dataset: fit up to the end
-    of its last train segment, predict, postprocess and the scorer up to the end of the
-    fold's test range, so nothing after the cutoff can be read. Two names on one
-    declaration are refused, since the ledger keeps one name per id and would score the
-    second as a duplicate. ``log`` receives one line per feature set, fit, prediction
-    set and score as it is written. A ``dry`` run computes every id, looks each one up
-    and writes nothing; it computes features it would need without the features
-    probe, so every id is one a real run would write, and logs what it would compute
-    and, for a fit, which repo files moved against the newest earlier fit of the same
-    pipeline and label. ``planned`` carries the ids a dry run would write across several
-    calls, so shared work counts once. A declaration error (a function that is not
-    module-level, a slot holding something that is not a function, a params class at
-    any depth its function does not import), at any depth of blends inside blends, is
-    refused before anything is read or written, as is a reached module the memo cannot
-    see (``identity.refuse_unseen_code``). A ``dataset_id`` prefix that matches no
-    recorded dataset or several, and an evaluation that validates on a sealed tail
-    without ``sealed=True``, are refused before anything is written. An error a fit,
-    predict or postprocess raises is recorded with the fold's label. ``code_root`` is
-    where repo modules are hashed from, the git root of the first pipeline's fit when
-    not given.
+    only its own fits, predictions and score. Every function sees a prefix of the
+    dataset: ``fit`` up to the end of its last train segment with every column NaN
+    outside the train segments, ``predict``, ``postprocess`` and the scorer's
+    ``series`` up to the end of the fold's test range with unknown labels NaN. ``log``
+    receives one line per feature set, fit, prediction set and score as it is written.
+    A ``dry`` run computes every id, looks each one up and writes nothing; it logs what
+    it would compute and, for a fit, which repo files moved against the newest earlier
+    fit of the same pipeline and label. ``planned`` carries the ids a dry run would
+    write across several calls, so shared work counts once. ``code_root`` is where
+    repo modules are hashed from, the git root of the first pipeline's fit when not
+    given.
+
+    Refused before anything is read or written, at any depth of blends inside blends:
+    no pipelines; two names on one declaration; a slot holding a lambda, closure,
+    method or anything that is not a module-level function; a ``format`` outside
+    ``formats.KNOWN``; a params class at any depth defined in a repo module its
+    function does not import; a reached module the memo cannot see
+    (``identity.refuse_unseen_code``).
+
+    Refused before anything is written: a ``dataset_id`` prefix that matches no
+    recorded dataset or several; a split's own refusals (too few folds, an empty test
+    range, a fold label twice, a group that recurs); a fold whose test range overlaps
+    its train segments,
+    whose folds train on labels not revealed when their test range starts (the message
+    names the purge that clears them); a split whose folds moved under an unchanged
+    declaration; a sealed evaluation on a dataset without a sealed tail, and an
+    evaluation that is not sealed validating on one.
+
+    Recorded as ``pipeline_failed``, after which the others continue and a rerun resumes
+    from what was written: an error a function raises, noted with the fold's label; an
+    output that is not one row per row of the range, or whose width changes between
+    folds; a prediction or features column that changes when recomputed on a shorter
+    prefix; a model reloaded from its saved bytes that predicts differently; a scored
+    prediction or a metric that is not finite; a series that is a scalar or empty, or
+    whose column count ``Scorer.columns`` disagrees with; an import inside a function
+    body; a module edited during the run; a second score of one pipeline under a sealed
+    evaluation.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -869,10 +885,9 @@ def _score(
     for index, fold in enumerate(folds):
         pred = _load_predictions(ledger, predictions[str(index)])
         visible = context.dataset.upto(fold.test[1])
-        series = _one_per_row(
+        series = _series(
             f"{name}: the scorer's series on fold {fold.label} has",
             scorer.series(pred, visible, fold.test, evaluation.scorer_params),
-            fold.test,
         )
         parts.append(series)
         metrics = _finite(name, evaluation.metrics(series), f"fold {fold.label}")
@@ -922,6 +937,24 @@ def _one_per_row(who: str, output: Any, rows: Range) -> np.ndarray:
         raise Refused(
             f"{who} shape {values.shape}; it must have one row per row of the range, "
             f"shape ({n},) or ({n}, k)"
+        )
+    return values
+
+
+def _series(who: str, output: Any) -> np.ndarray:
+    """``output`` as a series, ``(rows,)`` or ``(rows, c)`` with at least one row, else
+    refused.
+    """
+    values = np.asarray(output)
+    if values.ndim == 0:
+        raise Refused(
+            f"{who} shape (): the series function returned a scalar; return one row "
+            "per scoring unit, a row or a day"
+        )
+    if values.ndim > 2 or not len(values):
+        raise Refused(
+            f"{who} shape {values.shape}; a series is (rows,) or (rows, c) with at "
+            "least one row, one row per scoring unit, a row or a day"
         )
     return values
 
@@ -1173,9 +1206,9 @@ def _declare_evaluation(
 
 
 def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by: str):
-    """A dataclass in a config, at any depth, defined in a repo module its consumer
-    does not import would let an edited default reuse a stale fit; refuse and say
-    where to define it.
+    """A dataclass in a params object, at any depth, defined in a repo module its
+    consumer does not import would let an edited default reuse a stale fit; refuse and
+    say where to define it.
     """
     root = root.resolve()
     for held in _held(obj):
@@ -1195,9 +1228,9 @@ def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by:
 
 
 def _held(config: Any) -> list[Any]:
-    """The dataclass instances and callables a config holds at any depth, in dataclass
-    fields, dict values, lists and tuples; their modules join the closure of the
-    function that reads the config.
+    """The dataclass instances and callables a params object holds at any depth, in
+    dataclass fields, dict values, lists and tuples; their modules join the closure of
+    the function that reads it.
     """
     if dataclasses.is_dataclass(config) and not isinstance(config, type):
         values = [getattr(config, f.name) for f in dataclasses.fields(config)]

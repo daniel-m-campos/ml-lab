@@ -4,9 +4,11 @@ the first row of its group. An embargo edge is a count of rows from a cut and do
 snap, so ``embargo_rows`` can end a train segment inside a timestamp; the calendar
 walk-forward reads the dataset's ``ts`` and embargoes whole timestamps.
 
-A fold trains on contiguous segments and scores one validation range. A splitter is a
-frozen dataclass, so it hashes into the evaluation id like any declaration, and a
-project can declare its own next to its functions.
+A fold, ``Fold(label, train, test)``, trains on the ``train`` segments and scores the
+``test`` range; each label appears once. A split is a frozen dataclass with
+``folds(dataset) -> list[Fold]``, so it hashes into the evaluation id like any
+declaration, and a project can declare its own next to its functions. A ``group``
+that recurs after another group is refused, naming the row.
 
 Examples
 --------

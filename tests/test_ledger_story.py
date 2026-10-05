@@ -2488,22 +2488,41 @@ def test_a_non_finite_metric_fails_the_pipeline_naming_the_fold(ledger, evaluati
     assert not ledger.events(Event.SCORE) and _count(ledger, "event_failure") == 1
 
 
-def short_series(pred, dataset, rows, config):
-    return np.zeros(3)
+def scalar_series(pred, dataset, rows, config):
+    return np.float64(0.0)
 
 
-short_scorer = Scorer(short_series, _nan_metrics, {"ic": "max"})
+def daily_series(pred, dataset, rows, config):
+    starts = dataset.date_starts(*rows)[:-1] - rows[0]
+    pnl = np.sign(pred) * dataset.column(synthetic.TARGET, rows)
+    return np.add.reduceat(pnl, starts)
 
 
-def test_a_scorer_series_that_is_not_one_row_per_range_row_is_refused(
+def _daily_metrics(series):
+    return {"sharpe": float(series.mean() / series.std())}
+
+
+scalar_scorer = Scorer(scalar_series, _nan_metrics, {"ic": "max"})
+daily_scorer = Scorer(daily_series, _daily_metrics, {"sharpe": "max"})
+
+
+def test_a_series_has_one_row_per_scoring_unit_and_a_scalar_is_refused(
     ledger, dataset, evaluation
 ):
-    lo, hi = evaluation.split.folds(load(ledger, dataset))[0].test
-    short = dataclasses.replace(evaluation, scorer=short_scorer)
-    error = _run(ledger, short, synthetic.ridge(1)).failed["ridge_1m"]
+    daily = dataclasses.replace(evaluation, scorer=daily_scorer, scorer_params=None)
+    assert not _run(ledger, daily, synthetic.ridge(1)).failed
+    folds = evaluation.split.folds(load(ledger, dataset))
+    days = [
+        len(np.unique(load(ledger, dataset).ts[lo:hi].astype("datetime64[D]")))
+        for lo, hi in (f.test for f in folds)
+    ]
+    (row,) = ledger.sql("SELECT fold_rows FROM score_aggregate")
+    assert json.loads(row["fold_rows"]) == days
+    scalar = dataclasses.replace(evaluation, scorer=scalar_scorer)
+    error = _run(ledger, scalar, synthetic.ridge(1)).failed["ridge_1m"]
     assert error.endswith(
-        "the scorer's series on fold 2025-05-01 has shape (3,); it must have one "
-        f"row per row of the range, shape ({hi - lo},) or ({hi - lo}, k)"
+        "the scorer's series on fold 2025-05-01 has shape (): the series function "
+        "returned a scalar; return one row per scoring unit, a row or a day"
     )
 
 
