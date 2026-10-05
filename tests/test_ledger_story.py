@@ -858,6 +858,10 @@ def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
     assert "No module named 'nope'" in capsys.readouterr().err
     assert cli.main([*root, "run", "tests.synthetic", "--dataset", "zzz"]) == 1
     assert "0 matches" in capsys.readouterr().err
+    empty = tmp_path / "none.py"
+    empty.write_text("from tests.synthetic import evaluations\npipelines = []\n")
+    assert cli.main([*root, "run", str(empty)]) == 1
+    assert "no pipelines declared" in capsys.readouterr().err
 
 
 def test_fy_run_refuses_a_shared_ledger_without_dataset_and_takes_a_source(

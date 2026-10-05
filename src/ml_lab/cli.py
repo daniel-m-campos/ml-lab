@@ -99,7 +99,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     for evaluation in evaluations:
         print(f"evaluation {evaluation.id} {evaluation.name}".rstrip())
         live = [p for p in pipelines if (p.name or p.id) not in failed]
-        if not live:
+        if pipelines and not live:
             print("skipped: every pipeline failed above")
             continue
         report = runs.run(
