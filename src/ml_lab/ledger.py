@@ -7,7 +7,7 @@ their sha256.
 
 Examples
 --------
->>> ledger = Ledger("/tmp/fy-example")  # doctest: +SKIP
+>>> ledger = Ledger("/tmp/ml-lab-example")  # doctest: +SKIP
 >>> ledger.append("pipeline_declared", "p1", "p1", {"name": "r"})  # doctest: +SKIP
 'abc'
 """
@@ -143,7 +143,7 @@ CREATE VIEW score_aggregate AS SELECT e.id AS score,
   json_extract(e.payload,'$.series."' || a.key || '".sha') AS series,
   json_extract(e.payload,'$.series."' || a.key || '".fold_rows') AS fold_rows
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
-JOIN (SELECT score, window, metric, COUNT(*) AS folds, AVG(value) AS fold_mean,
+JOIN (SELECT score, window, metric, COUNT(value) AS folds, AVG(value) AS fold_mean,
              SUM((value - mean) * (value - mean)) AS ss
       FROM (SELECT *, AVG(value) OVER (PARTITION BY score, window, metric) AS mean
             FROM score_fold)
@@ -187,7 +187,8 @@ FROM score_latest l JOIN score_aggregate a ON a.score = l.score;
 CREATE VIEW head_to_head AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
     s.fold, s.window, s.metric, s.value,
-    json_extract(v.metrics, '$."' || s.metric || '"') AS direction,
+    coalesce(json_extract(e.payload, '$.directions."' || s.metric || '"'),
+             json_extract(v.metrics, '$."' || s.metric || '"')) AS direction,
     json_extract(e.payload, '$.aggregate."' || s.window || '"."' || s.metric || '"')
       AS pooled
   FROM score_latest l JOIN score_fold s ON s.score = l.score
@@ -205,9 +206,9 @@ FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
   AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric),
 h AS (SELECT evaluation, evaluation_name, source, window, metric, pipeline, name,
   score, reference, reference_name, reference_score,
-  COUNT(*) AS folds, AVG(delta) AS mean_delta,
-  CASE WHEN COUNT(*) > 1
-       THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(*) - 1))
+  COUNT(delta) AS folds, AVG(delta) AS mean_delta,
+  CASE WHEN COUNT(delta) > 1
+       THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(delta) - 1))
   END AS delta_std,
   SUM(win) AS wins, pooled_delta
 FROM d GROUP BY score, reference_score, window, metric)

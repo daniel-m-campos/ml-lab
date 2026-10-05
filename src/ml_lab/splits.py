@@ -1,5 +1,6 @@
-"""Splits: how a session becomes folds. Row-based splits need no clock; the calendar
-walk-forward reads the session's ``ts``.
+"""Splits: how a session becomes folds. Row-based splits need no clock; with one,
+every cut lands on the first row of its timestamp. The calendar walk-forward reads the
+session's ``ts``.
 
 A fold trains on contiguous segments and scores one or more named windows. A splitter is
 a frozen dataclass, so it hashes into the evaluation id like any declaration, and a
@@ -60,11 +61,11 @@ class WalkForward:
         out: list[Fold] = []
         cutoff = self.first_cutoff_rows
         while cutoff + max(names) * self.window_rows <= session.rows:
-            train = ((0, max(cutoff - self.embargo_rows, 0)),)
+            train = ((0, _snap(session, max(cutoff - self.embargo_rows, 0))),)
             windows = {
                 str(h) if self.horizons else "test": (
-                    cutoff + (h - 1) * self.window_rows,
-                    cutoff + h * self.window_rows,
+                    _snap(session, cutoff + (h - 1) * self.window_rows),
+                    _snap(session, cutoff + h * self.window_rows),
                 )
                 for h in names
             }
@@ -157,8 +158,8 @@ class BlockedKFold:
 
     def folds(self, session: Session) -> list[Fold]:
         _require(k=(self.k, 2), embargo_rows=(self.embargo_rows, 0))
-        n = round(session.rows * self.train_fraction)
-        bounds = [round(i * n / self.k) for i in range(self.k + 1)]
+        n = _snap(session, round(session.rows * self.train_fraction))
+        bounds = [_snap(session, round(i * n / self.k)) for i in range(self.k + 1)]
         out = []
         for i in range(self.k):
             lo, hi = bounds[i], bounds[i + 1]
@@ -183,9 +184,16 @@ class Holdout:
     def folds(self, session: Session) -> list[Fold]:
         _require(embargo_rows=(self.embargo_rows, 0))
         n = session.rows
-        cut = round(n * self.train_fraction)
+        cut = _snap(session, round(n * self.train_fraction))
         test = (min(cut + self.embargo_rows, n), n)
         return _at_least([Fold("holdout", ((0, cut),), {"test": test})], 1)
+
+
+def _snap(session: Session, row: int) -> int:
+    """The first row of ``row``'s timestamp, so a cut never splits a cross-section."""
+    if session.ts is None or not 0 < row < session.rows:
+        return row
+    return int(np.searchsorted(session.ts, session.ts[row], "left"))
 
 
 def _require(**fields: tuple[int, int]):

@@ -17,7 +17,7 @@ Done when: the printed id is stable across reruns.
 
 Context: `project/experiment.py` lists the pipelines and declares the evaluation.
 
-1. `lab run $D` appends `evaluation_declared` with the metric directions and the schedule expanded into folds and windows; then `run_started` with the commit, dirty flag, resolution file and host; then, per pipeline, `fit_computed` per cutoff carrying the import shas and environment lock, `predictions_computed` per eval window, and one `score_recorded` keyed by the prediction ids.
+1. `lab run $D` appends `evaluation_declared` with the metric directions and the schedule expanded into folds and windows; then `run_started` with the commit, dirty flag, resolution file and host; then, per pipeline, one `fit_computed` per distinct train range carrying the import shas and environment lock, `predictions_computed` per eval window, and one `score_recorded` keyed by the prediction ids.
 2. `lab run $D` again writes nothing: every fit and prediction is reused and every score already exists, and the report says so. Adding a pipeline to the module fits only the new one; the other pipelines cost nothing.
 3. `sql "SELECT name, metric, value FROM board WHERE window = '1'"` is the board.
 
@@ -29,11 +29,11 @@ Done when: the second run prints zero fits and zero predictions and the query li
 
 Context: one of the pipelines is the model in production.
 
-1. `fy decide $D ridge_3m --kind promote --why "incumbent"` appends a decision on that pipeline's score with nothing to compare against. The baseline view resolves to it.
-2. `fy board $D` reads each pipeline's latest score against the baseline: Pareto verdict, relative delta per metric. Reading writes nothing.
-3. `fy decide $D bonsai_lw --kind promote|reject --why "..."` appends a decision carrying the baseline score, verdict and deltas it saw.
+1. A promote decision on `ridge_3m`'s score, with the reason "incumbent", is appended with nothing to compare against. The baseline resolves to it.
+2. A board reads each pipeline's latest score against the baseline: Pareto verdict, relative delta per metric. Reading writes nothing.
+3. A promote or reject decision on `bonsai_lw` carries the baseline score, verdict and deltas it saw.
 
-Done when: `fy history $D` shows the promotes in order, each with what it was made against, and the old baseline reads as superseded.
+Done when: the decision history shows the promotes in order, each with what it was made against, and the old baseline reads as superseded. No command does this today; the decisions row under Later in the spec holds the design.
 
 ## S4: a scoring idea
 
@@ -49,7 +49,7 @@ Done when: both evaluations read from `score_aggregate` and nothing was overwrit
 
 Context: a feature in `steps.py` changes.
 
-1. `lab run $D`, committed or not. Each fit recorded the git blob sha of every module it imported; the ones whose shas no longer match refit, their predictions change, and each affected pipeline gets a new score. A dirty tree is recorded with its diff. The rest reuse.
+1. `lab run $D`, committed or not. Each fit recorded the code key of every repo module its steps import; the ones whose code keys no longer match refit, their predictions change, and each affected pipeline gets a new score. A dirty tree is recorded with its diff. The rest reuse.
 2. `score_latest` moves to the new scores; the old ones stand in `raw_score`, pointing at their run, commit and shas.
 
 Done when: `sql "SELECT * FROM raw_score WHERE pipeline = ..."` shows both scores with different runs.

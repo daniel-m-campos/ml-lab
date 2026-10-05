@@ -250,6 +250,14 @@ def test_the_dataset_blob_opens_with_polars_alone(ledger, dataset):
     assert ledger.sql("SELECT source FROM raw_dataset")[0] == {"source": "synthetic"}
 
 
+def test_a_target_that_is_not_numeric_is_refused_at_ingest(ledger):
+    rows = Session({"x": np.arange(4.0), "class": _strings("1", "2", "1", "2")})
+    with pytest.raises(TypeError, match="encode labels as numbers"):
+        record(ledger, rows, source="toy", params={}, filters=(), targets=("class",))
+    flags = Session({"x": np.arange(4.0), "up": np.array([True, False, True, False])})
+    assert record(ledger, flags, source="toy", params={}, filters=(), targets=("up",))
+
+
 def test_a_string_column_hashes_by_its_values_not_its_objects():
     def session(*values):
         return Session({"c": _strings(*values), "x": np.arange(3.0)})
@@ -519,10 +527,23 @@ def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
     assert middle.train == ((0, lo - 10), (hi + 10, n))
     assert sum(hi - lo for f in folds for lo, hi in f.windows.values()) == n
     (hold,) = splits.Holdout(train_fraction=0.8, embargo_rows=5).folds(session)
-    assert (
-        hold.train == ((0, round(0.8 * n)),)
-        and hold.windows["test"][0] == round(0.8 * n) + 5
+    cut = session.boundary(round(0.8 * n))
+    assert hold.train == ((0, cut),) and hold.windows["test"][0] == cut + 5
+
+
+def test_row_splits_cut_on_timestamp_boundaries():
+    stamps = np.datetime64("2000-01-01T00:00:00", "s") + np.arange(10).astype(
+        "timedelta64[s]"
     )
+    session = Session({"x": np.zeros(70)}, np.repeat(stamps, 7))
+    folds = splits.BlockedKFold(k=3).folds(session)
+    assert [f.windows["test"] for f in folds] == [(0, 21), (21, 42), (42, 70)]
+    (hold,) = splits.Holdout(0.75).folds(session)
+    assert hold.train == ((0, 49),) and hold.windows["test"] == (49, 70)
+    (walk,) = splits.WalkForward(45, 70, 20, min_folds=1).folds(session)
+    assert walk.train == ((0, 42),) and walk.windows["test"] == (42, 63)
+    bare = Session({"x": np.zeros(70)})
+    assert splits.Holdout(0.75).folds(bare)[0].train == ((0, 52),)
 
 
 def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
@@ -899,6 +920,24 @@ def test_a_fold_training_on_an_unrevealed_label_is_refused(ledger):
             r"more timestamps \(2 rows\)",
         ):
             _run(ledger, evaluation, synthetic.ridge(0), dry=dry)
+    assert not ledger.events(Event.EVALUATION)
+
+
+@dataclasses.dataclass(frozen=True)
+class OverlapSplit:
+    def folds(self, session):
+        return [splits.Fold("f0", ((0, 3000),), {"test": (2500, 3500)})]
+
+
+@pytest.mark.parametrize("dry", [False, True])
+def test_a_fold_whose_train_overlaps_its_window_is_refused(ledger, dataset, dry):
+    evaluation = synthetic.evaluation(dataset, split=OverlapSplit())
+    with pytest.raises(
+        Refused,
+        match=r"fold f0 trains on segment \(0, 3000\), which overlaps window "
+        r"test \(2500, 3500\)",
+    ):
+        _run(ledger, evaluation, synthetic.ridge(0), dry=dry)
     assert not ledger.events(Event.EVALUATION)
 
 
@@ -1732,6 +1771,43 @@ def test_head_to_head_names_its_evaluation_and_reconciles_with_the_pooled_value(
     assert np.isclose(row["mean_delta"], a["fold_mean"] - b["fold_mean"])
 
 
+def test_wins_follow_the_direction_recorded_with_each_score(
+    ledger, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    steps = tmp_path / "steps_x.py"
+    steps.write_text(
+        (REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNX")
+    )
+    scoring = tmp_path / "scoring_x.py"
+    scoring.write_text(
+        "from ml_lab.experiment import scorer\n"
+        "from steps_x import sign_sim, sim_metrics\n\n"
+        '@scorer(metrics=sim_metrics, directions={"pnl": "max", "turnover": "min"})\n'
+        "def sim(pred, session, rng, config):\n"
+        "    return sign_sim(pred, session, rng, config)\n"
+    )
+    module = cli._load(str(steps))
+    evaluation = dataclasses.replace(
+        module.evaluation(module.dataset(ledger)), scorer=cli._load(str(scoring)).sim
+    )
+    pipelines = [module.ridge(1), module.ridge(3)]
+    runs.run(ledger, pipelines, evaluation, code_root=tmp_path)
+    query = (
+        "SELECT folds, wins FROM head_to_head WHERE name = 'ridge_1m' "
+        "AND window = '1' AND metric = 'pnl'"
+    )
+    (before,) = ledger.sql(query)
+    scoring.write_text(scoring.read_text().replace('"pnl": "max"', '"pnl": "min"'))
+    sim = importlib.reload(cli._load(str(scoring))).sim
+    flipped = dataclasses.replace(evaluation, scorer=sim)
+    assert flipped.id == evaluation.id
+    runs.run(ledger, pipelines, flipped, code_root=tmp_path)
+    (after,) = ledger.sql(query)
+    assert 0 < before["wins"] < before["folds"]
+    assert after["wins"] == before["folds"] - before["wins"]
+
+
 def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
     holdout = synthetic.evaluation(dataset, split=splits.Holdout(0.7))
     _run(ledger, holdout, synthetic.ridge(1), synthetic.ridge(6))
@@ -1813,18 +1889,34 @@ def test_a_dotted_window_keeps_its_series_and_a_dotted_metric_counts_wins(
     assert rows and all(r["wins"] is not None for r in rows)
 
 
-def test_fold_and_delta_std_survive_a_large_metric_offset(ledger):
+def _two_scores(ledger: Ledger, values: list[float]):
     ledger.append(Event.DATASET, "d", "d", {"source": "s"}, id="d")
     ledger.append(Event.EVALUATION, "e", "e", {"dataset": "d", "metrics": {}})
     for p in ("a", "b"):
         ledger.append(Event.PIPELINE, p, p, {"name": p})
-    _score(ledger, "sa", "a", [1e9 + i * i for i in range(4)])
-    _score(ledger, "sb", "b", [0.0] * 4)
+    _score(ledger, "sa", "a", values)
+    _score(ledger, "sb", "b", [0.0] * len(values))
+
+
+def test_fold_and_delta_std_survive_a_large_metric_offset(ledger):
+    _two_scores(ledger, [1e9 + i * i for i in range(4)])
     std = pytest.approx(np.std([0, 1, 4, 9], ddof=1), rel=1e-6)
     (row,) = ledger.sql("SELECT fold_std FROM score_aggregate WHERE score = 'sa'")
     assert row["fold_std"] == std
     (row,) = ledger.sql("SELECT delta_std FROM head_to_head WHERE pipeline = 'a'")
     assert row["delta_std"] == std
+
+
+def test_a_null_fold_metric_is_left_out_of_the_fold_count_and_spread(ledger):
+    _two_scores(ledger, [1.0, float("nan"), 4.0, 9.0])
+    std = pytest.approx(np.std([1.0, 4.0, 9.0], ddof=1))
+    query = "SELECT folds, fold_std FROM score_aggregate WHERE score = 'sa'"
+    (row,) = ledger.sql(query)
+    assert (row["folds"], row["fold_std"]) == (3, std)
+    (row,) = ledger.sql(
+        "SELECT folds, delta_std FROM head_to_head WHERE pipeline = 'a'"
+    )
+    assert (row["folds"], row["delta_std"]) == (3, std)
 
 
 def _auc(series: np.ndarray) -> dict[str, float]:

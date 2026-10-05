@@ -82,14 +82,15 @@ def run(
     refused, since the ledger keeps one name per id and would score the second as a
     duplicate. ``log`` receives one line per feature set, fit, prediction set and score
     as it is written. A ``dry`` run computes every id, looks each one up and writes
-    nothing; it computes features it would need, so every id is one a real run
-    would write, and logs what it would compute and, for a fit, which repo files moved
-    against the newest earlier fit of the same pipeline and label. ``planned`` carries
-    the ids a dry run would write across several calls, so shared work counts once.
-    A declaration error (an unregistered step, a slot holding something that is not a
-    step, a config class its step does not import, a blend whose ``fit`` arity
-    disagrees with ``in_sample``, ``in_sample`` without members), at any depth of
-    blends inside blends, is refused before anything is read or written.
+    nothing; it computes features it would need without the five-prefix probe, so
+    every id is one a real run would write, and logs what it would compute and, for a
+    fit, which repo files moved against the newest earlier fit of the same pipeline
+    and label. ``planned`` carries the ids a dry run would write across several calls,
+    so shared work counts once. A declaration error (an unregistered step, a slot
+    holding something that is not a step, a config class its step does not import, a
+    blend whose ``fit`` arity disagrees with ``in_sample``, ``in_sample`` without
+    members), at any depth of blends inside blends, is refused before anything is read
+    or written.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -137,6 +138,7 @@ def run(
     recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
     targets = {name: _lag(lag) for name, lag in recipe["targets"].items()}
     schedule = evaluation.split.folds(session)
+    _refuse_overlap(schedule)
     _refuse_unrevealed(session, targets, schedule)
     _declare_evaluation(ledger, evaluation, schedule, dry)
     report = RunReport()
@@ -825,6 +827,7 @@ def _score(
             "predictions": predictions,
             "folds": per_fold,
             "aggregate": aggregate,
+            "directions": evaluation.directions,
             "series": stored,
             "scorer_shas": scorer_shas,
         },
@@ -871,6 +874,17 @@ def _refuse_changed(
             f"by up to {worst:.3g}, {worst / scale if scale else np.inf:.3g} of the "
             f"largest |{name}| {scale:.3g} (rounding is allowed up to {rtol:g})"
         )
+
+
+def _refuse_overlap(folds: list[Fold]):
+    for fold in folds:
+        for segment in fold.train:
+            for window, rng in fold.windows.items():
+                if segment[0] < rng[1] and rng[0] < segment[1]:
+                    raise Refused(
+                        f"fold {fold.label} trains on segment {tuple(segment)}, which "
+                        f"overlaps window {window} {tuple(rng)}"
+                    )
 
 
 def _refuse_unrevealed(session: Session, targets: dict[str, Lag], folds: list[Fold]):

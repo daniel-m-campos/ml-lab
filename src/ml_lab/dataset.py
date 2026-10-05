@@ -1,9 +1,10 @@
 """Recording a dataset and loading it back.
 
 A dataset is the rows of one (source, params, window) passed through filter steps,
-with named target columns. Its id is the data: column names, dtypes and bytes, so a
-loader fix that changes rows is a new dataset and an edit that changes nothing is not.
-The recipe rides on the event as provenance; the bytes are Parquet.
+with named target columns. Its id is the data: the ``ts`` bytes, column names, dtypes
+and values, so a loader fix that changes rows is a new dataset and an edit that
+changes nothing is not. The recipe rides on the event as provenance; the bytes are
+Parquet.
 
 Examples
 --------
@@ -66,6 +67,12 @@ def record(
     missing = [t for t in targets if t not in session.columns]
     if missing:
         raise KeyError(f"targets not in session: {missing}")
+    text = [t for t in targets if not _numeric(session.columns[t].dtype)]
+    if text:
+        raise TypeError(
+            f"targets {text} are not numeric; targets are masked with NaN, so encode "
+            "labels as numbers"
+        )
     dataset_id = data_id(session, labels)
     if ledger.latest(Event.DATASET, dataset_id) is not None:
         return dataset_id
@@ -79,6 +86,10 @@ def record(
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
     return dataset_id
+
+
+def _numeric(dtype: np.dtype) -> bool:
+    return np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.bool_)
 
 
 def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str, int]:
@@ -95,9 +106,9 @@ def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str,
 
 
 def data_id(session: Session, targets: Mapping[str, Any] | None = None) -> str:
-    """The content id of a session: its column names, dtypes and values (a string
-    column by its strings), and which columns are targets with their reveal lags in
-    seconds.
+    """The content id of a session: its ``ts`` bytes, column names, dtypes and values
+    (a string column by its strings), and which columns are targets with their reveal
+    lags in seconds or a count of dates.
     """
     ts = None if session.ts is None else identity.bytes_hash(session.ts.tobytes())
     columns = {

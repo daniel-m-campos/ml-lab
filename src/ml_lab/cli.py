@@ -1,16 +1,17 @@
 """``lab``: the command line over the log, two verbs; reading is SQL over the views.
 
 Declarations are plain module attributes, so a project may organize them freely: one
-script, or ``dataset.py`` + ``steps.py`` + ``experiment.py``, or one file per idea. ``fy
-ingest`` reads ``dataset(ledger, *args)`` from a module. ``lab run`` takes one or more
-modules, reads ``pipelines`` (a list of ``Pipeline``) from each and ``evaluations`` (a
-list of ``Evaluation``, or a function of the dataset id returning one) from exactly one
-of them, so a file an agent wrote holding only new pipelines runs beside the project's
-declarations; every pipeline is scored under every evaluation. A module
-is a dotted name importable from the current directory or a ``.py`` path. The dataset
-defaults to the newest one recorded. The ledger root comes from ``--root`` or
-``ML_LAB_ROOT`` (default ``.ml-lab``); only ``lab ingest`` creates one, ``lab run``
-refuses a root without a ledger. The actor comes from ``ML_LAB_ACTOR``.
+script, or ``dataset.py`` + ``steps.py`` + ``experiment.py``, or one file per idea.
+``lab ingest`` reads ``dataset(ledger, *args)`` from a module. ``lab run`` takes one or
+more modules, reads ``pipelines`` (a list of ``Pipeline``) from each and
+``evaluations`` (a list of ``Evaluation``, or a function of the dataset id returning
+one) from exactly one of them, so a file an agent wrote holding only new pipelines
+runs beside the project's declarations; every pipeline is scored under every
+evaluation. A module is a dotted name importable from the current directory or a
+``.py`` path. The dataset defaults to the newest one recorded when the ledger holds
+one source. The ledger root comes from ``--root`` or ``ML_LAB_ROOT`` (default
+``.ml-lab``); only ``lab ingest`` creates one, ``lab run`` refuses a root without a
+ledger. The actor comes from ``ML_LAB_ACTOR``.
 
 Examples
 --------
