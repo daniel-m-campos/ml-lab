@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ml_lab.analytics import paired
 from ml_lab.experiment import Evaluation, Pipeline, Scorer
 from ml_lab.ledger import Ledger
 from ml_lab.panel import Panel
@@ -18,4 +19,5 @@ __all__ = [
     "Pipeline",
     "Scorer",
     "WalkForward",
+    "paired",
 ]

@@ -2,7 +2,7 @@
 
 Run it from the repository root:
 
-    export ML_LAB_ROOT=$PWD/.ml-lab-minimal
+    export ML_LAB_ROOT=$PWD/.ml-lab-minimal ML_LAB_ACTOR=$USER
     lab ingest examples/minimal/project.py
     lab run examples/minimal/project.py
     sqlite3 -box $ML_LAB_ROOT/ml_lab.sqlite "SELECT name, metric, fold_mean FROM board"

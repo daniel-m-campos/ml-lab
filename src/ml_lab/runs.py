@@ -25,9 +25,8 @@ import sys
 import tempfile
 import time
 import traceback
-import types
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
@@ -67,7 +66,6 @@ def run(
     evaluation: Evaluation,
     *,
     code_root: pathlib.Path | None = None,
-    experiments: Sequence[types.ModuleType] = (),
     log: Callable[[str], None] = lambda line: None,
     dry: bool = False,
     planned: set[str] | None = None,
@@ -95,9 +93,7 @@ def run(
     is refused before anything is read or written, as is a reached module the memo
     cannot see (``identity.refuse_unseen_code``) and an evaluation that validates on a
     sealed tail without ``sealed=True``. ``code_root`` is where repo modules are hashed
-    from, the git root of the first pipeline's fit when not given; the code keys of
-    ``experiments``, the modules ``lab run`` imported, join every id, since a module
-    that sets a global a function reads is code the function runs.
+    from, the git root of the first pipeline's fit when not given.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -139,7 +135,6 @@ def run(
     identity.refuse_unseen_code(
         [
             *scoring,
-            *experiments,
             *(
                 f
                 for pipeline in pipelines
@@ -205,7 +200,6 @@ def run(
         log,
         dry,
         set() if planned is None else planned,
-        identity.own_keys(experiments, root),
     )
     for pipeline in pipelines:
         if not dry:
@@ -250,7 +244,6 @@ class _Run:
     log: Callable[[str], None]
     dry: bool
     planned: set[str]
-    experiment_keys: dict[str, str]
     features: dict[str, Features] = dataclasses.field(default_factory=dict)
     stages: dict[str, _Stage] = dataclasses.field(default_factory=dict)
 
@@ -299,7 +292,8 @@ class _Stage:
             for stage, functions in self.functions.items()
         }
         self.stage_keys = {
-            stage: self._keys(functions) for stage, functions in self.functions.items()
+            stage: identity.code_keys(functions, self.root)
+            for stage, functions in self.functions.items()
         }
         self.dists = identity.imported_dists(pipeline.functions, self.root)
         self.locks = {
@@ -315,7 +309,7 @@ class _Stage:
                 {
                     "dataset": self.evaluation.dataset,
                     "features": function,
-                    "code_keys": self._keys((function,)),
+                    "code_keys": identity.code_keys((function,), self.root),
                     "env_lock": identity.bytes_hash(
                         _lock_text(
                             identity.imported_dists((function,), self.root)
@@ -338,12 +332,6 @@ class _Stage:
         if train not in self.fits:
             self.fits[train] = self._fit(fold, index)
         return self.fits[train]
-
-    def _keys(self, functions: tuple[Callable, ...]) -> dict[str, str]:
-        return {
-            **identity.code_keys(functions, self.root),
-            **self.experiment_keys,
-        }
 
     def _fit(self, fold: Fold, index: int) -> str:
         train = [list(seg) for seg in fold.train]
@@ -702,7 +690,7 @@ class _Stage:
                 "run": run_id,
                 "features": identity.canonical(function),
                 "import_shas": identity.import_shas((function,), self.root),
-                "code_keys": self._keys((function,)),
+                "code_keys": identity.code_keys((function,), self.root),
                 "columns": list(columns),
                 "columns_id": columns_id,
                 "probe_rows": probe_rows,
@@ -739,8 +727,8 @@ class _Stage:
         newest earlier fit of this pipeline and label.
         """
         rows = self.ledger.sql(
-            "SELECT code_keys, env_lock FROM raw_fit WHERE pipeline = ? AND label = ? "
-            "ORDER BY seq DESC LIMIT 1",
+            "SELECT code_keys, env_lock FROM event_fit WHERE pipeline = ? "
+            "AND label = ? ORDER BY seq DESC LIMIT 1",
             (self.pipeline.id, label),
         )
         moved = ["no earlier fit of this pipeline and label"]
@@ -855,10 +843,7 @@ def _score(
             "evaluation": evaluation.id,
             "pipeline": pipeline.id,
             "predictions": sorted(predictions.values()),
-            "scorer_keys": {
-                **identity.code_keys(scoring, context.root),
-                **context.experiment_keys,
-            },
+            "scorer_keys": identity.code_keys(scoring, context.root),
             "env_lock": identity.bytes_hash(lock.encode()),
             "directions": evaluation.directions,
         }
@@ -1039,7 +1024,7 @@ def _refuse_sealed(evaluation: Evaluation, folds: list[Fold], sealed: int | None
 
 def _refuse_rescoring(ledger: Ledger, evaluation: Evaluation, pipeline: Pipeline):
     held = ledger.sql(
-        "SELECT id FROM raw_score WHERE evaluation = ? AND pipeline = ?",
+        "SELECT id FROM event_score WHERE evaluation = ? AND pipeline = ?",
         (evaluation.id, pipeline.id),
     )
     if held:

@@ -177,19 +177,14 @@ def repo_root(start: pathlib.Path) -> pathlib.Path:
 def imports(
     funcs: Iterable[Callable], code_root: pathlib.Path
 ) -> list[types.ModuleType]:
-    """Every module reachable from the functions' modules (or the modules given)
-    through module-level names.
+    """Every module reachable from the functions' modules through module-level names.
 
     Modules outside ``code_root`` are reached but not expanded, so a third-party package
     appears once and its internals are never walked, except an editable install's
     modules, which are expanded as the repo's are, their sources read once per process.
     """
     root = code_root.resolve()
-    queue = [
-        f if isinstance(f, types.ModuleType) else sys.modules.get(f.__module__)
-        for f in funcs
-    ]
-    queue = [m for m in queue if m is not None]
+    queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
     seen: dict[str, types.ModuleType] = {}
     while queue:
         module = queue.pop()
@@ -229,18 +224,7 @@ def code_keys(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, s
     return {p: code_key(b) for p, b in _sources(funcs, code_root).items()}
 
 
-def own_keys(
-    modules: Iterable[types.ModuleType], code_root: pathlib.Path
-) -> dict[str, str]:
-    """Code keys of the modules under ``code_root`` themselves, not of what they
-    import.
-    """
-    root = code_root.resolve()
-    paths = [p for m in modules if (p := _module_path(m, root))]
-    return {p.relative_to(root).as_posix(): code_key(p.read_bytes()) for p in paths}
-
-
-def refuse_unseen_code(funcs: Iterable[Any], code_root: pathlib.Path):
+def refuse_unseen_code(funcs: Iterable[Callable], code_root: pathlib.Path):
     """Refuse a reached module whose code the memo cannot see: a ``.py`` file outside
     ``code_root`` that no installed distribution owns, whose edit would not refit, or a
     module under it that ran from cached bytecode other than its source.

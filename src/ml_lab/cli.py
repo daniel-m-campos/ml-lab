@@ -8,12 +8,13 @@ more modules, reads ``pipelines`` (a list of ``Pipeline``) from each and
 one) from exactly one of them, so a file an agent wrote holding only new pipelines
 runs beside the project's declarations; every pipeline is scored under every
 evaluation. The code root the memo hashes from is the git root of the module that
-declares the evaluations, and the code keys of every module given join every id. A
-module is a dotted name importable from the current directory or a ``.py`` path,
-imported without writing bytecode. The dataset defaults to the newest one recorded
-when the ledger holds one source. The ledger root comes from ``--root`` or
-``ML_LAB_ROOT`` (default ``.ml-lab``); only ``lab ingest`` creates one, ``lab run``
-refuses a root without a ledger. The actor comes from ``ML_LAB_ACTOR``.
+declares the evaluations; the modules themselves join no id, so adding a pipeline to
+one refits nothing else. A module is a dotted name importable from the current
+directory or a ``.py`` path, imported without writing bytecode. The dataset defaults
+to the newest one recorded when the ledger holds one source. The ledger root comes
+from ``--root`` or ``ML_LAB_ROOT`` (default ``.ml-lab``); only ``lab ingest`` creates
+one, ``lab run`` refuses a root without a ledger. The actor comes from
+``ML_LAB_ACTOR``; both verbs refuse it unset.
 
 Examples
 --------
@@ -35,7 +36,7 @@ from typing import Any
 
 from ml_lab import identity, runs
 from ml_lab.experiment import Evaluation, Pipeline
-from ml_lab.ledger import Ledger, Refused
+from ml_lab.ledger import Ledger, Refused, actor
 
 DEFAULT_ROOT = ".ml-lab"
 
@@ -71,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = pathlib.Path(args.root)
     try:
+        actor()
         if root.exists() and not root.is_dir():
             raise Refused(f"{root} is not a directory")
         if args.command == "run" and not (root / "ml_lab.sqlite").exists():
@@ -117,7 +119,6 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
             live,
             evaluation,
             code_root=root,
-            experiments=modules,
             log=lambda line: print(line, flush=True),
             dry=args.dry_run,
             planned=planned,
@@ -209,7 +210,7 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
     newest dataset only while one actor wrote it: two studies under one source name
     are refused with their ids, since the newest would silently be someone else's.
     """
-    rows = ledger.sql("SELECT id, source, actor FROM raw_dataset ORDER BY seq")
+    rows = ledger.sql("SELECT id, source, actor FROM event_dataset ORDER BY seq")
     by_source: dict[str, str] = {r["source"]: r["id"] for r in rows}
     if selector is None and len(by_source) == 1:
         selector = rows[-1]["source"]

@@ -14,7 +14,6 @@ Examples
 
 from __future__ import annotations
 
-import getpass
 import json
 import os
 import pathlib
@@ -29,6 +28,7 @@ from ml_lab.identity import Refused
 
 SCHEMA_VERSION = 17
 ACTOR_ENV = "ML_LAB_ACTOR"
+BUSY_TIMEOUT_S = 5.0
 
 
 class Event:
@@ -56,31 +56,32 @@ CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
 """
 
 VIEWS = """
-CREATE VIEW raw_dataset AS SELECT seq, id, at, actor,
+CREATE VIEW event_dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.source') AS source,
-  json_extract(payload,'$.window[0]') AS window_start,
-  json_extract(payload,'$.window[1]') AS window_end,
+  json_extract(payload,'$.window[0]') AS span_start,
+  json_extract(payload,'$.window[1]') AS span_end,
+  json_extract(payload,'$.recipe') AS recipe,
   json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
   json_extract(payload,'$.blob.format') AS format
 FROM event WHERE type='dataset_recorded';
 
-CREATE VIEW raw_pipeline AS SELECT seq, key AS id, at, actor,
+CREATE VIEW event_pipeline AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,
   json_extract(payload,'$.declaration') AS declaration
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
       FROM event WHERE type='pipeline_declared') WHERE rn = 1;
 
-CREATE VIEW raw_evaluation AS SELECT seq, key AS id, at, actor,
+CREATE VIEW event_evaluation AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name,
   json_extract(payload,'$.dataset') AS dataset,
-  json_extract(payload,'$.metrics') AS metrics,
+  json_extract(payload,'$.metrics') AS directions,
   json_extract(payload,'$.declaration.config') AS config,
   json_extract(payload,'$.declaration') AS declaration,
   json_extract(payload,'$.folds') AS folds
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
       FROM event WHERE type='evaluation_declared') WHERE rn = 1;
 
-CREATE VIEW raw_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
+CREATE VIEW event_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.git.commit') AS "commit",
   json_extract(payload,'$.git.dirty') AS dirty,
   json_extract(payload,'$.git.diff.sha') AS diff,
@@ -90,7 +91,7 @@ CREATE VIEW raw_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.pipelines') AS pipelines
 FROM event WHERE type='run_started';
 
-CREATE VIEW raw_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
+CREATE VIEW event_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.columns') AS columns,
   json_extract(payload,'$.columns_id') AS columns_id,
@@ -101,7 +102,7 @@ CREATE VIEW raw_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='features_computed';
 
-CREATE VIEW raw_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
+CREATE VIEW event_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.train') AS train, json_extract(payload,'$.label') AS label,
   json_extract(payload,'$.env_lock') AS env_lock,
@@ -114,7 +115,7 @@ CREATE VIEW raw_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='fit_computed';
 
-CREATE VIEW raw_prediction AS SELECT seq, id, at, stream AS dataset,
+CREATE VIEW event_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.fit') AS fit,
   json_extract(payload,'$.range[0]') AS range_start,
   json_extract(payload,'$.range[1]') AS range_end,
@@ -123,7 +124,9 @@ CREATE VIEW raw_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.postprocess') AS postprocess
 FROM event WHERE type='predictions_computed';
 
-CREATE VIEW raw_score AS SELECT seq, id, at, actor, stream AS evaluation,
+CREATE VIEW event_score AS SELECT seq, id, at, actor, stream AS evaluation,
+  (SELECT json_extract(v.payload,'$.dataset') FROM event v
+   WHERE v.type='evaluation_declared' AND v.key = event.stream LIMIT 1) AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run
 FROM event WHERE type='score_recorded';
 
@@ -131,19 +134,22 @@ CREATE VIEW score_fold AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline,
   json_extract(f.value,'$.fold') AS fold,
   json_extract(f.value,'$.label') AS label,
-  m.key AS metric, m.value AS value
+  m.key AS metric, m.value AS value,
+  json_extract(e.payload,'$.directions."' || m.key || '"') AS direction
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
 WHERE e.type='score_recorded';
 
 CREATE VIEW score_aggregate AS SELECT e.id AS score,
   e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline,
-  m.key AS metric, m.value AS value, f.folds, f.fold_mean,
-  CASE WHEN f.folds > 1 THEN sqrt(f.ss / (f.folds - 1)) END AS fold_std,
+  m.key AS metric,
+  json_extract(e.payload,'$.directions."' || m.key || '"') AS direction,
+  m.value AS pooled, f.n_folds, f.fold_mean,
+  CASE WHEN f.n_folds > 1 THEN sqrt(f.ss / (f.n_folds - 1)) END AS fold_std,
   json_extract(e.payload,'$.series.sha') AS series,
   json_extract(e.payload,'$.series.fold_rows') AS fold_rows
 FROM event e, json_each(e.payload,'$.aggregate') m
-JOIN (SELECT score, metric, COUNT(value) AS folds, AVG(value) AS fold_mean,
+JOIN (SELECT score, metric, COUNT(value) AS n_folds, AVG(value) AS fold_mean,
              SUM((value - mean) * (value - mean)) AS ss
       FROM (SELECT *, AVG(value) OVER (PARTITION BY score, metric) AS mean
             FROM score_fold)
@@ -152,13 +158,14 @@ JOIN (SELECT score, metric, COUNT(value) AS folds, AVG(value) AS fold_mean,
 WHERE e.type='score_recorded';
 
 CREATE VIEW score_latest AS SELECT l.evaluation, e.name AS evaluation_name,
-  l.pipeline, p.name, e.dataset, d.source, l.score, l.run, l.seq
-FROM (SELECT evaluation, pipeline, id AS score, run, seq,
-        ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
-      FROM raw_score) l
-JOIN raw_pipeline p ON p.id = l.pipeline
-JOIN raw_evaluation e ON e.id = l.evaluation
-JOIN raw_dataset d ON d.id = e.dataset
+  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq
+FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq,
+        ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline, actor ORDER BY seq DESC)
+          AS rn
+      FROM event_score) l
+JOIN event_pipeline p ON p.id = l.pipeline
+JOIN event_evaluation e ON e.id = l.evaluation
+JOIN event_dataset d ON d.id = e.dataset
 WHERE l.rn = 1;
 
 CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, fit) AS (
@@ -175,44 +182,52 @@ CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, f
 )
 SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
   json_extract(f.payload,'$.pipeline') AS fit_pipeline,
+  json_extract(f.payload,'$.run') AS run,
   json_extract(f.payload,'$.label') AS label,
   json_extract(f.payload,'$.duration_s') AS duration_s
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
-CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, a.metric,
-  a.fold_mean, a.fold_std, a.folds, a.value,
+CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, l.actor, a.metric,
+  a.direction,
+  CASE WHEN a.direction IN ('max', 'min') AND a.fold_mean IS NOT NULL
+    THEN RANK() OVER (PARTITION BY l.evaluation, a.metric, l.actor
+    ORDER BY CASE a.direction WHEN 'max' THEN -a.fold_mean ELSE a.fold_mean END
+      NULLS LAST) END AS rank,
+  a.fold_mean, a.fold_std, a.n_folds, a.pooled,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
 FROM score_latest l JOIN score_aggregate a ON a.score = l.score;
 
-CREATE VIEW head_to_head AS WITH f AS MATERIALIZED (
-  SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
-    s.fold, s.metric, s.value,
-    coalesce(json_extract(e.payload, '$.directions."' || s.metric || '"'),
-             json_extract(v.metrics, '$."' || s.metric || '"')) AS direction,
-    json_extract(e.payload, '$.aggregate."' || s.metric || '"') AS pooled
-  FROM score_latest l JOIN score_fold s ON s.score = l.score
-  JOIN raw_evaluation v ON v.id = l.evaluation JOIN event e ON e.id = l.score),
-d AS (SELECT a.evaluation, a.evaluation_name, a.source, a.metric,
-  a.pipeline, a.name, a.score,
-  b.pipeline AS reference, b.name AS reference_name, b.score AS reference_score,
-  a.value - b.value AS delta,
-  AVG(a.value - b.value) OVER (PARTITION BY a.score, b.score, a.metric) AS mean,
+CREATE VIEW pair_fold AS WITH f AS MATERIALIZED (
+  SELECT l.evaluation, l.evaluation_name, l.source, l.actor, l.pipeline, l.name,
+    l.score, s.fold, s.label, s.metric, s.value, s.direction
+  FROM score_latest l JOIN score_fold s ON s.score = l.score)
+SELECT a.evaluation, a.evaluation_name, a.source, a.actor, a.metric, a.fold, a.label,
+  a.pipeline, a.name, b.pipeline AS reference, b.name AS reference_name,
+  a.value, b.value AS reference_value, a.value - b.value AS delta,
   CASE a.direction WHEN 'max' THEN a.value > b.value
       WHEN 'min' THEN a.value < b.value END AS win,
-  a.pooled - b.pooled AS pooled_delta
-FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
-  AND b.fold = a.fold AND b.metric = a.metric),
-h AS (SELECT evaluation, evaluation_name, source, metric, pipeline, name,
+  a.score, b.score AS reference_score
+FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.actor = a.actor
+  AND b.pipeline <> a.pipeline AND b.fold = a.fold AND b.metric = a.metric;
+
+CREATE VIEW head_to_head AS WITH d AS (
+  SELECT *, AVG(delta) OVER (PARTITION BY score, reference_score, metric) AS mean
+  FROM pair_fold),
+h AS (SELECT evaluation, evaluation_name, source, actor, metric, pipeline, name,
   score, reference, reference_name, reference_score,
-  COUNT(delta) AS folds, AVG(delta) AS mean_delta,
+  COUNT(delta) AS n_folds, AVG(delta) AS delta_mean,
   CASE WHEN COUNT(delta) > 1
        THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(delta) - 1))
   END AS delta_std,
-  SUM(win) AS wins, pooled_delta
+  SUM(win) AS wins
 FROM d GROUP BY score, reference_score, metric)
-SELECT *, mean_delta * sqrt(folds) / delta_std AS t FROM h;
+SELECT h.*,
+  json_extract(a.payload,'$.aggregate."' || h.metric || '"')
+    - json_extract(b.payload,'$.aggregate."' || h.metric || '"') AS pooled_delta,
+  delta_mean * sqrt(n_folds) / delta_std AS t
+FROM h JOIN event a ON a.id = h.score JOIN event b ON b.id = h.reference_score;
 
-CREATE VIEW raw_failure AS SELECT seq, id, at, actor, host,
+CREATE VIEW event_failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.error') AS error
@@ -229,9 +244,11 @@ class Ledger:
         self.root = pathlib.Path(root)
         self.blobs = self.root / "blobs" / "sha256"
         self.blobs.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.root / "ml_lab.sqlite", isolation_level=None)
+        self._db = sqlite3.connect(
+            self.root / "ml_lab.sqlite", timeout=BUSY_TIMEOUT_S, isolation_level=None
+        )
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
+        _wal(self._db)
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, SCHEMA_VERSION):
             raise Refused(
@@ -330,8 +347,29 @@ class Ledger:
 
 
 def actor() -> str:
-    """Who is writing: ``ML_LAB_ACTOR`` or the login name."""
-    return os.environ.get(ACTOR_ENV) or getpass.getuser()
+    """Who is writing: ``ML_LAB_ACTOR``, refused when unset."""
+    if not os.environ.get(ACTOR_ENV):
+        raise Refused(
+            f"set {ACTOR_ENV} to the person or agent writing; the ledger keeps one "
+            "log for many writers"
+        )
+    return os.environ[ACTOR_ENV]
+
+
+def _wal(db: sqlite3.Connection):
+    """Switch to WAL, retrying for the busy timeout: the switch needs an exclusive
+    lock, and SQLite refuses it at once, without waiting, while another connection
+    holds a write lock, as when several processes open a new ledger together.
+    """
+    deadline = time.monotonic() + BUSY_TIMEOUT_S
+    while True:
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.01)
 
 
 def _event(row: dict[str, Any]) -> dict[str, Any]:
