@@ -62,13 +62,14 @@ class Pipeline:
     The slots are the three scopes of a time-ordered evaluation, not a chain of
     transforms, and a function's slot says what it may read: ``features`` has dataset
     scope (the whole dataset without its target columns, computed and stored once per
-    dataset, function, code and environment, however many pipelines and folds share
-    it); ``fit`` has fold scope (the prefix up to its train end, once per train range);
-    ``predict`` and ``postprocess`` have window scope (the prefix up to the window end
-    with targets masked, once per fit and range). A function belongs in the broadest
-    scope of what it reads, so a per-fold standardiser, or a lagged target whose reveal
-    lag the dataset does not declare, lives in ``fit`` and ``predict``, and composition
-    within a scope is the object ``fit`` returns, an sklearn pipeline included.
+    dataset, function, code and environment, however many pipelines and folds share it);
+    ``fit`` has fold scope (the prefix up to its train end, once per train range);
+    ``predict`` and ``postprocess`` have range scope (the prefix up to the end of the
+    range they predict, with targets masked, once per fit and range). A function belongs
+    in the broadest scope of what it reads, so a per-fold standardiser, or a lagged
+    target whose reveal lag the dataset does not declare, lives in ``fit`` and
+    ``predict``, and composition within a scope is the object ``fit`` returns, an
+    sklearn pipeline included.
 
     ``save(model) -> bytes`` and ``load(bytes) -> model`` round-trip the model in
     ``format``, one of ``formats.KNOWN``. ``features(dataset) -> {name: array}`` adds
@@ -81,11 +82,11 @@ class Pipeline:
     postprocess_config)`` is the cheap stateless stage after ``predict``: neutralise,
     clip, rank. Its config enters the prediction's identity and not the fit's. A
     pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a fourth
-    argument, the members' predictions as a list of arrays, over the window for
-    ``predict`` and, only when ``in_sample=True``, over the train segments for ``fit``.
-    Those are in-sample, so a weight learned on them overfits; a blend with fixed
-    weights leaves ``in_sample`` off and computes no train-range predictions, and a
-    ``fit`` whose arity disagrees with ``in_sample`` is refused before anything runs.
+    argument, the members' predictions as a list of arrays, over the fold's test range
+    for ``predict`` and, only when ``in_sample=True``, over the train segments for
+    ``fit``. Those are in-sample, so a weight learned on them overfits; a blend with
+    fixed weights leaves ``in_sample`` off and computes no train-range predictions, and
+    a ``fit`` whose arity disagrees with ``in_sample`` is refused before anything runs.
     A blend without its own ``features`` sees its members' feature columns when every
     member declares the same functions. The members' fits and predictions are memoized
     on their own.

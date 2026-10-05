@@ -119,7 +119,6 @@ CREATE VIEW raw_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.range[0]') AS range_start,
   json_extract(payload,'$.range[1]') AS range_end,
   json_extract(payload,'$.fold') AS fold,
-  json_extract(payload,'$.window') AS window,
   json_extract(payload,'$.blob.sha') AS blob, json_extract(payload,'$.raw') AS raw,
   json_extract(payload,'$.postprocess') AS postprocess
 FROM event WHERE type='predictions_computed';
@@ -131,25 +130,25 @@ FROM event WHERE type='score_recorded';
 CREATE VIEW score_fold AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline,
   json_extract(f.value,'$.fold') AS fold,
-  json_extract(f.value,'$.label') AS label, json_extract(f.value,'$.window') AS window,
+  json_extract(f.value,'$.label') AS label,
   m.key AS metric, m.value AS value
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
 WHERE e.type='score_recorded';
 
 CREATE VIEW score_aggregate AS SELECT e.id AS score,
   e.stream AS evaluation,
-  json_extract(e.payload,'$.pipeline') AS pipeline, a.key AS window,
+  json_extract(e.payload,'$.pipeline') AS pipeline,
   m.key AS metric, m.value AS value, f.folds, f.fold_mean,
   CASE WHEN f.folds > 1 THEN sqrt(f.ss / (f.folds - 1)) END AS fold_std,
-  json_extract(e.payload,'$.series."' || a.key || '".sha') AS series,
-  json_extract(e.payload,'$.series."' || a.key || '".fold_rows') AS fold_rows
-FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
-JOIN (SELECT score, window, metric, COUNT(value) AS folds, AVG(value) AS fold_mean,
+  json_extract(e.payload,'$.series.sha') AS series,
+  json_extract(e.payload,'$.series.fold_rows') AS fold_rows
+FROM event e, json_each(e.payload,'$.aggregate') m
+JOIN (SELECT score, metric, COUNT(value) AS folds, AVG(value) AS fold_mean,
              SUM((value - mean) * (value - mean)) AS ss
-      FROM (SELECT *, AVG(value) OVER (PARTITION BY score, window, metric) AS mean
+      FROM (SELECT *, AVG(value) OVER (PARTITION BY score, metric) AS mean
             FROM score_fold)
-      GROUP BY score, window, metric) f
-  ON f.score = e.id AND f.window = a.key AND f.metric = m.key
+      GROUP BY score, metric) f
+  ON f.score = e.id AND f.metric = m.key
 WHERE e.type='score_recorded';
 
 CREATE VIEW score_latest AS SELECT l.evaluation, e.name AS evaluation_name,
@@ -180,39 +179,37 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
   json_extract(f.payload,'$.duration_s') AS duration_s
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
-CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, a.window, a.metric,
+CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, a.metric,
   a.fold_mean, a.fold_std, a.folds, a.value,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
 FROM score_latest l JOIN score_aggregate a ON a.score = l.score;
 
 CREATE VIEW head_to_head AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
-    s.fold, s.window, s.metric, s.value,
+    s.fold, s.metric, s.value,
     coalesce(json_extract(e.payload, '$.directions."' || s.metric || '"'),
              json_extract(v.metrics, '$."' || s.metric || '"')) AS direction,
-    json_extract(e.payload, '$.aggregate."' || s.window || '"."' || s.metric || '"')
-      AS pooled
+    json_extract(e.payload, '$.aggregate."' || s.metric || '"') AS pooled
   FROM score_latest l JOIN score_fold s ON s.score = l.score
   JOIN raw_evaluation v ON v.id = l.evaluation JOIN event e ON e.id = l.score),
-d AS (SELECT a.evaluation, a.evaluation_name, a.source, a.window, a.metric,
+d AS (SELECT a.evaluation, a.evaluation_name, a.source, a.metric,
   a.pipeline, a.name, a.score,
   b.pipeline AS reference, b.name AS reference_name, b.score AS reference_score,
   a.value - b.value AS delta,
-  AVG(a.value - b.value) OVER (PARTITION BY a.score, b.score, a.window, a.metric)
-    AS mean,
+  AVG(a.value - b.value) OVER (PARTITION BY a.score, b.score, a.metric) AS mean,
   CASE a.direction WHEN 'max' THEN a.value > b.value
       WHEN 'min' THEN a.value < b.value END AS win,
   a.pooled - b.pooled AS pooled_delta
 FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
-  AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric),
-h AS (SELECT evaluation, evaluation_name, source, window, metric, pipeline, name,
+  AND b.fold = a.fold AND b.metric = a.metric),
+h AS (SELECT evaluation, evaluation_name, source, metric, pipeline, name,
   score, reference, reference_name, reference_score,
   COUNT(delta) AS folds, AVG(delta) AS mean_delta,
   CASE WHEN COUNT(delta) > 1
        THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(delta) - 1))
   END AS delta_std,
   SUM(win) AS wins, pooled_delta
-FROM d GROUP BY score, reference_score, window, metric)
+FROM d GROUP BY score, reference_score, metric)
 SELECT *, mean_delta * sqrt(folds) / delta_std AS t FROM h;
 
 CREATE VIEW raw_failure AS SELECT seq, id, at, actor, host,

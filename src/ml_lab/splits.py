@@ -2,14 +2,14 @@
 every cut lands on the first row of its timestamp. The calendar walk-forward reads the
 dataset's ``ts``.
 
-A fold trains on contiguous segments and scores one or more named windows. A splitter is
-a frozen dataclass, so it hashes into the evaluation id like any declaration, and a
+A fold trains on contiguous segments and scores one validation range. A splitter is a
+frozen dataclass, so it hashes into the evaluation id like any declaration, and a
 project can declare its own next to its functions.
 
 Examples
 --------
->>> WalkForward(first_cutoff_rows=1000, step_rows=500, window_rows=500).horizons
-()
+>>> WalkForward(1000, 500, window_rows=500).folds(dataset)[1].test  # doctest: +SKIP
+(1500, 2000)
 >>> BlockedKFold(k=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
 'block 2'
 """
@@ -30,44 +30,33 @@ from ml_lab.identity import Refused
 class Fold:
     label: str
     train: Segments
-    windows: dict[str, Range]
+    test: Range
 
 
 @dataclasses.dataclass(frozen=True)
 class WalkForward:
     """Cutoffs every ``step_rows`` from ``first_cutoff_rows``; train on every row before
-    each, minus ``embargo_rows``, and score ``window_rows`` after it. Without
-    ``horizons`` the window is ``test``; with them, horizon ``h`` is the ``h``-th
-    window after the cutoff, named ``str(h)``.
+    each, minus ``embargo_rows``, and score the ``window_rows`` after it.
     """
 
     first_cutoff_rows: int
     step_rows: int
     window_rows: int
-    horizons: tuple[int, ...] = ()
     embargo_rows: int = 0
     min_folds: int = 3
 
     def folds(self, dataset: Dataset) -> list[Fold]:
-        names = self.horizons or (1,)
         _require(
             step_rows=(self.step_rows, 1),
             window_rows=(self.window_rows, 1),
             embargo_rows=(self.embargo_rows, 0),
-            **{f"horizon {h}": (h, 1) for h in names},
         )
         out: list[Fold] = []
         cutoff = self.first_cutoff_rows
-        while cutoff + max(names) * self.window_rows <= dataset.rows:
+        while cutoff + self.window_rows <= dataset.rows:
             train = ((0, _snap(dataset, max(cutoff - self.embargo_rows, 0))),)
-            windows = {
-                str(h) if self.horizons else "test": (
-                    _snap(dataset, cutoff + (h - 1) * self.window_rows),
-                    _snap(dataset, cutoff + h * self.window_rows),
-                )
-                for h in names
-            }
-            out.append(Fold(f"row {cutoff}", train, windows))
+            test = (_snap(dataset, cutoff), _snap(dataset, cutoff + self.window_rows))
+            out.append(Fold(f"row {cutoff}", train, test))
             cutoff += self.step_rows
         return _at_least(out, self.min_folds)
 
@@ -76,19 +65,20 @@ class WalkForward:
 class CalendarWalkForward:
     """Cutoffs on the dataset clock every ``every`` units, a unit being a calendar
     month or a day the clock has rows on; train on everything before each cutoff
-    minus ``embargo_timestamps`` distinct timestamps, score the ``window`` units after
-    it. Horizon ``h`` is the ``h``-th window after the cutoff, named ``str(h)``. A
-    window ends on a unit boundary at or before ``end`` (the day after the data when
-    ``end`` is not given); the boundary after the last day is ``end`` itself, so the
-    last trading day is scored. Folds that reach past ``end`` are dropped, never cut,
-    so a test period at the end of the data stays unscored.
+    minus ``embargo_timestamps`` distinct timestamps, and score the ``horizon``-th
+    run of ``window`` units after it, so ``horizon=1`` scores the ``window`` units
+    right after the cutoff. A validation range ends on a unit boundary at or before
+    ``end`` (the day after the data when ``end`` is not given); the boundary after the
+    last day is ``end`` itself, so the last trading day is scored. Folds that reach
+    past ``end`` are dropped, never cut, so a test period at the end of the data stays
+    unscored.
     """
 
     first_cutoff: str
     unit: str = "month"
     every: int = 1
     window: int = 1
-    horizons: tuple[int, ...] = (1, 2, 3)
+    horizon: int = 1
     embargo_timestamps: int = 0
     end: str | None = None
     min_folds: int = 3
@@ -98,25 +88,22 @@ class CalendarWalkForward:
             every=(self.every, 1),
             window=(self.window, 1),
             embargo_timestamps=(self.embargo_timestamps, 0),
-            **{f"horizon {h}": (h, 1) for h in self.horizons},
+            horizon=(self.horizon, 1),
         )
         stop = dates.as_date(self.end) if self.end else dates.span(dataset)[1]
         at = self._boundaries(dataset, stop)
-        reach = max(self.horizons) * self.window
+        reach = self.horizon * self.window
         out: list[Fold] = []
         for c in range(0, len(at) - reach, self.every):
             cut = dataset.index_of(at[c])
             for _ in range(self.embargo_timestamps):
                 if cut:
                     cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
-            windows = {
-                str(h): (
-                    dataset.index_of(at[c + (h - 1) * self.window]),
-                    dataset.index_of(at[c + h * self.window]),
-                )
-                for h in self.horizons
-            }
-            out.append(Fold(str(at[c]), ((0, cut),), windows))
+            test = (
+                dataset.index_of(at[c + reach - self.window]),
+                dataset.index_of(at[c + reach]),
+            )
+            out.append(Fold(str(at[c]), ((0, cut),), test))
         why = (
             f"{max(len(at) - 1, 0)} {self.unit}s from the first cutoff "
             f"{self.first_cutoff} to {stop}, {reach} needed per fold"
@@ -125,7 +112,7 @@ class CalendarWalkForward:
             first = dates.add_months(dates.as_date(self.first_cutoff), reach)
             why += (
                 f"; a month is whole or dropped, so set end={first} or later to score "
-                "a window that runs to the data's end, or use unit='day'"
+                "a validation range that runs to the data's end, or use unit='day'"
             )
         return _at_least(out, self.min_folds, why)
 
@@ -146,8 +133,8 @@ class CalendarWalkForward:
 @dataclasses.dataclass(frozen=True)
 class BlockedKFold:
     """``k`` contiguous blocks over the first ``train_fraction`` of rows, the rows
-    ``Holdout(train_fraction)`` trains on; each is scored once as ``test`` with the
-    rest as train, minus ``embargo_rows`` on either side of it.
+    ``Holdout(train_fraction)`` trains on; each is scored once with the rest as
+    train, minus ``embargo_rows`` on either side of it.
     """
 
     k: int
@@ -166,14 +153,14 @@ class BlockedKFold:
                 for seg in ((0, lo - self.embargo_rows), (hi + self.embargo_rows, n))
                 if seg[0] < seg[1]
             )
-            out.append(Fold(f"block {i}", train, {"test": (lo, hi)}))
+            out.append(Fold(f"block {i}", train, (lo, hi)))
         return _at_least(out, 2)
 
 
 @dataclasses.dataclass(frozen=True)
 class Holdout:
     """One fold: the first ``train_fraction`` of rows train, the rest after
-    ``embargo_rows`` is scored as ``test``.
+    ``embargo_rows`` is scored.
     """
 
     train_fraction: float = 0.7
@@ -184,7 +171,7 @@ class Holdout:
         n = dataset.rows
         cut = _snap(dataset, round(n * self.train_fraction))
         test = (min(cut + self.embargo_rows, n), n)
-        return _at_least([Fold("holdout", ((0, cut),), {"test": test})], 1)
+        return _at_least([Fold("holdout", ((0, cut),), test)], 1)
 
 
 def _snap(dataset: Dataset, row: int) -> int:
@@ -207,12 +194,11 @@ def _at_least(folds: list[Fold], minimum: int, why: str = "") -> list[Fold]:
             f"split yields {len(folds)} folds, at least {minimum} needed"
             + (f": {why}" if why else "")
         )
-    empty = [
-        f"{f.label} {n}" for f in folds for n, (lo, hi) in f.windows.items() if lo >= hi
-    ]
+    empty = [f.label for f in folds if f.test[0] >= f.test[1]]
     if empty:
         raise Refused(
-            f"split yields empty windows: {empty}" + (f"; {why}" if why else "")
+            f"split yields empty validation ranges: {empty}"
+            + (f"; {why}" if why else "")
         )
     bare = [f.label for f in folds if all(lo >= hi for lo, hi in f.train)]
     if bare:

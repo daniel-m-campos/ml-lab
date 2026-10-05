@@ -308,7 +308,6 @@ def evaluation(dataset: str, cost: float = 0.001, split: Any = None) -> Evaluati
         split=split
         or CalendarWalkForward(
             first_cutoff="2025-05-01",
-            horizons=(1, 2),
             embargo_timestamps=1,
             min_folds=3,
         ),

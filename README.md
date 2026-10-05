@@ -4,7 +4,7 @@ A local-first record of experimentation on frozen datasets with a fixed row orde
 
 - **Memo.** A fit, prediction or score is reused when the log holds one for the same data, declaration, code and environment. A rerun of an unchanged tree writes nothing.
 - **Identity from content.** A dataset id is its rows, a pipeline id its declaration, a fit id the code keys (syntax trees, so comments do not count) of every module its functions import plus the environment lock. Names are labels.
-- **Guards that refuse.** A function sees rows only up to where it may look; unknown labels are NaN; a fold that trains on labels revealed after its window starts is refused; every window is recomputed on a shorter prefix and must agree.
+- **Guards that refuse.** A function sees rows only up to where it may look; unknown labels are NaN; a fold that trains on labels revealed after its validation range starts is refused; every prediction is recomputed on a shorter prefix and must agree.
 - **Provenance.** A score names its run, predictions and fits; a run records the commit, dirty diff, host and the tool's commit.
 - **One ledger, many writers.** People and agents append to one SQLite file under an actor name.
 
@@ -124,33 +124,31 @@ def evaluations(dataset: str) -> list[Evaluation]:
 ```
 
 - **`Dataset`**: equal-length numpy columns in a fixed order, optional sorted `ts`. `record` stores the rows and returns an id that is a hash of them; `targets` names the labels the tool will hide.
-- **`fit(dataset, train, config)`**: `train` is the train row segments; the dataset ends at the last train row and targets are NaN outside the segments, so a fit cannot read its window or a k-fold validation block. Returns any object.
-- **`predict(model, dataset, rng)`**: one row per window row, `(rows,)` or `(rows, k)`. Unknown labels inside the window are NaN. The tool recomputes the window on a shorter prefix and refuses the function if earlier rows changed: a feature reading later rows or a non-deterministic model is caught with the first moved row.
-- **`save(model)` and `load(payload)`**: bytes in the pipeline's `format`, one of `formats.KNOWN` (`arrow-arrays` and `zip` open without Python, `pickle` is marked non-portable). A fit is recorded only after the reloaded model predicts the first window as the fitted one did.
+- **`fit(dataset, train, config)`**: `train` is the train row segments; the dataset ends at the last train row and targets are NaN outside the segments, so a fit cannot read its validation range. Returns any object.
+- **`predict(model, dataset, rng)`**: one row per row of the range, `(rows,)` or `(rows, k)`. Unknown labels inside the range are NaN. The tool recomputes the range on a shorter prefix and refuses the function if earlier rows changed: a feature reading later rows or a non-deterministic model is caught with the first moved row.
+- **`save(model)` and `load(payload)`**: bytes in the pipeline's `format`, one of `formats.KNOWN` (`arrow-arrays` and `zip` open without Python, `pickle` is marked non-portable). A fit is recorded only after the reloaded model predicts its first range as the fitted one did.
 - **`Scorer(score, metrics, directions)`**: `score(pred, dataset, rng, config)` returns a series, one row per scoring unit; `metrics(series)` reduces it, per fold (`fold_mean`, `fold_std`) and over the concatenated folds (`value`). The series is stored for later paired tests. Only `score` enters the evaluation id; `metrics` and `directions` are code under the memo.
 - **`Pipeline`**: functions, config, format. Its id is the declaration; `name` is a label. Any module-level function fills a slot; a lambda, closure or method is refused. A config is a frozen dataclass in a module `fit` imports, so an edited default refits. `with_config` and `named` make variants.
 - **`Evaluation`**: dataset, split, scorer, config; `evaluations(dataset_id)` returns the list every pipeline is scored under. A split is a frozen dataclass with `folds(dataset)` returning contiguous row ranges, so the ingest order is the split's design: shuffled rows make `BlockedKFold` a random k-fold, interleaved by class a stratified one. The folds are recorded with the evaluation and a split whose code moved them is refused.
 
 ## Evaluations and splits
 
-An evaluation is a split and a scorer over one dataset. The split turns the dataset into folds, and a fold is a set of train row segments plus one or more named windows. For each fold the tool fits on the train segments, predicts each window with that fit, and scores the window's predictions against the real labels. Every scored prediction is out of sample for the fit that made it: a window never overlaps its fold's train segments (the tool refuses a split where one does), the fit never saw the window's labels, and the labels the scorer uses are the real ones. The example's `WalkForward(first_cutoff_rows=2000, step_rows=1000, window_rows=1000)` gives:
+An evaluation is a split and a scorer over one dataset. The split turns the dataset into folds, and a fold is a train range (one or more row segments) and a validation range. The tool fits on the train range, predicts the validation range with that fit and scores it against the real labels, so every scored prediction is out of sample for its fit; a split whose validation range overlaps its train range is refused. The example's `WalkForward(first_cutoff_rows=2000, step_rows=1000, window_rows=1000)` gives:
 
-| fold | trains on | scores window `test` |
+| fold | trains on | validation range |
 |---|---|---|
 | row 2000 | rows 0 to 2000 | rows 2000 to 3000 |
 | row 3000 | rows 0 to 3000 | rows 3000 to 4000 |
 | row 4000 | rows 0 to 4000 | rows 4000 to 5000 |
 
-`BlockedKFold(k=5)` makes five folds, each scoring one block with the other four as train segments; `Holdout(0.8)` is one fold; `CalendarWalkForward(first_cutoff="2021-05-04", horizons=(1, 2, 3))` cuts on the clock and names three windows per fold, the first, second and third month after each cutoff, so a model is scored at three ages from one fit. An embargo (`embargo_rows` or `embargo_timestamps`) drops rows between the train segments and the window, which matters once a feature or a label reaches forward in time.
-
-The scorer runs once per (fold, window): `metrics` over the fold's series gives the per-fold numbers, averaged into `fold_mean` with `fold_std` across folds, and `metrics` over the windows concatenated gives the pooled `value`. One fit serves every fold that shares its train range, so three horizons cost one fit per cutoff, and a second evaluation on the same cutoffs (another scorer, another cost setting) costs no fits at all.
+`BlockedKFold(k=5)` validates each of five blocks with the other four as train, `Holdout(0.8)` is one fold, `CalendarWalkForward(first_cutoff="2021-05-04")` validates the month after each cutoff, and an embargo (`embargo_rows` or `embargo_timestamps`) drops rows between the two ranges. `metrics` runs per fold (`fold_mean`, `fold_std`) and over the folds concatenated (`value`). Decay is another evaluation: `horizon=3` validates the third month after the same cutoffs and shares every fit with `horizon=1` through the memo, so it costs predictions only; finer decay is read from the stored series.
 
 Growing it:
 
 - `features(dataset) -> {name: array}`: columns computed once per dataset, shared by every pipeline declaring the function, read via `dataset.feature_columns`; probed on five prefixes.
 - `Pipeline(postprocess=clip, postprocess_config=Clip(at=3.0))`: a stateless stage after `predict`, called as `clip(pred, dataset, rng, config)`; its config enters the prediction id, not the fit's.
 - `Pipeline(members=(a, b))`: a blend whose `fit` and `predict` take the members' predictions as a fourth argument.
-- `Dataset(columns, ts)`: a clock adds `CalendarWalkForward` (cutoffs in months or trading days, named horizons, an embargo in timestamps) and reveal lags, `record(..., reveal={"y": timedelta(days=1)})` or an integer count of trading dates.
+- `Dataset(columns, ts)`: a clock adds `CalendarWalkForward` (cutoffs in months or trading days, an embargo in timestamps) and reveal lags, `record(..., reveal={"y": timedelta(days=1)})` or an integer count of trading dates.
 - A test set is a second `Evaluation` on `Holdout(train_fraction)` in its own `test.py`, run once after the pick is written; `BlockedKFold(k, train_fraction)` validates on the same cut. The `ml-lab-exp` studies are the template.
 
 ## Run and read
@@ -167,12 +165,12 @@ A pipeline that raises is recorded as a failure and the rest continue; `lab run`
 
 ```sql
 SELECT name, metric, fold_mean, fold_std, folds, value FROM board
-WHERE evaluation_name = 'validation' AND window = '1' ORDER BY metric, fold_mean DESC;
+WHERE evaluation_name = 'validation' ORDER BY metric, fold_mean DESC;
 
 SELECT name, mean_delta, delta_std, t, wins, folds FROM head_to_head
-WHERE reference_name = 'ridge_3m' AND evaluation_name = 'validation' AND window = '1' AND metric = 'pnl';
+WHERE reference_name = 'ridge_3m' AND evaluation_name = 'validation' AND metric = 'pnl';
 
-SELECT f.fold, f.label, f.window, f.metric, f.value FROM score_latest l
+SELECT f.fold, f.label, f.metric, f.value FROM score_latest l
 JOIN score_fold f ON f.score = l.score WHERE l.name = 'ridge_3m';
 
 SELECT p.name, x.error, x.run FROM raw_failure x JOIN raw_pipeline p ON p.id = x.pipeline;
@@ -182,7 +180,7 @@ SELECT p.name, x.error, x.run FROM raw_failure x JOIN raw_pipeline p ON p.id = x
 
 ## Refusals you will meet
 
-- **"fold windows train on labels revealed after they start"**: the embargo is shorter than the reveal lag; the message says how many more timestamps to drop.
+- **"folds train on labels revealed after their test range starts"**: the embargo is shorter than the reveal lag; the message says how many more timestamps to drop.
 - **"read past row N"**: a function's output changed when recomputed on a shorter prefix; the first moved row and both values are named.
 - **"source changed during the run"**: a module a function imports was edited mid-run; rerun.
 - **"the model loaded from its saved bytes predicts differently"**: `save` loses what `predict` reads.

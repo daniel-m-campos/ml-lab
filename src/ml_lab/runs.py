@@ -78,19 +78,19 @@ def run(
     ``pipeline_failed`` and the others continue; what it had written stays and a rerun
     resumes from there. Every function sees a prefix of the dataset: fit up to the end
     of its last train segment, predict, postprocess and the scorer up to the end of the
-    window, so nothing after the cutoff can be read. Two names on one declaration are
-    refused, since the ledger keeps one name per id and would score the second as a
-    duplicate. ``log`` receives one line per feature set, fit, prediction set and score
-    as it is written. A ``dry`` run computes every id, looks each one up and writes
-    nothing; it computes features it would need without the five-prefix probe, so
-    every id is one a real run would write, and logs what it would compute and, for a
-    fit, which repo files moved against the newest earlier fit of the same pipeline
-    and label. ``planned`` carries the ids a dry run would write across several calls,
-    so shared work counts once. A declaration error (a function that is not
+    fold's test range, so nothing after the cutoff can be read. Two names on one
+    declaration are refused, since the ledger keeps one name per id and would score the
+    second as a duplicate. ``log`` receives one line per feature set, fit, prediction
+    set and score as it is written. A ``dry`` run computes every id, looks each one up
+    and writes nothing; it computes features it would need without the five-prefix
+    probe, so every id is one a real run would write, and logs what it would compute
+    and, for a fit, which repo files moved against the newest earlier fit of the same
+    pipeline and label. ``planned`` carries the ids a dry run would write across several
+    calls, so shared work counts once. A declaration error (a function that is not
     module-level, a slot holding something that is not a function, a config class its
-    function does not import, a blend whose ``fit`` arity disagrees with
-    ``in_sample``, ``in_sample`` without members), at any depth of blends inside
-    blends, is refused before anything is read or written.
+    function does not import, a blend whose ``fit`` arity disagrees with ``in_sample``,
+    ``in_sample`` without members), at any depth of blends inside blends, is refused
+    before anything is read or written.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -246,11 +246,8 @@ def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
     stage = context.stage(pipeline)
     predictions: dict[str, str] = {}
     for index, fold in enumerate(folds):
-        fit_id = stage.fit(fold)
-        for window, rng in fold.windows.items():
-            predictions[f"{index}:{window}"] = stage.predictions(
-                fit_id, fold, index, window, rng
-            )
+        fit_id = stage.fit(fold, index)
+        predictions[str(index)] = stage.predictions(fit_id, fold, index, fold.test)
     _score(context, folds, pipeline, predictions)
 
 
@@ -311,17 +308,17 @@ class _Stage:
         self.checked: set[str] = set()
         self.widths: dict[str, tuple[int, ...]] = {}
 
-    def fit(self, fold: Fold) -> str:
+    def fit(self, fold: Fold, index: int) -> str:
         if fold.label in self.fits:
             return self.fits[fold.label]
-        self.fits[fold.label] = fit_id = self._fit(fold)
+        self.fits[fold.label] = fit_id = self._fit(fold, index)
         return fit_id
 
-    def _fit(self, fold: Fold) -> str:
+    def _fit(self, fold: Fold, index: int) -> str:
         train = [list(seg) for seg in fold.train]
-        member_fits = [m.fit(fold) for m in self.members]
+        member_fits = [m.fit(fold, index) for m in self.members]
         train_preds = (
-            self._train_predictions(member_fits, fold)
+            self._train_predictions(member_fits, fold, index)
             if self.pipeline.in_sample
             else []
         )
@@ -393,12 +390,10 @@ class _Stage:
         self.report.fits_computed += 1
         return fit_id
 
-    def predictions(
-        self, fit_id: str, fold: Fold, index: int, window: str, rng: Range
-    ) -> str:
-        member_fits = [m.fit(fold) for m in self.members]
+    def predictions(self, fit_id: str, fold: Fold, index: int, rng: Range) -> str:
+        member_fits = [m.fit(fold, index) for m in self.members]
         member_preds = [
-            m.predictions(f, fold, index, window, rng)
+            m.predictions(f, fold, index, rng)
             for m, f in zip(self.members, member_fits, strict=True)
         ]
         raw_id = identity.content_hash(
@@ -437,7 +432,6 @@ class _Stage:
             "fit": fit_id,
             "range": list(rng),
             "fold": index,
-            "window": window,
             **({"members": member_preds} if self.members else {}),
         }
         visible = self._visible(rng[1]).masked(self.targets, rng[0])
@@ -463,7 +457,7 @@ class _Stage:
             )
             self._check_imports("predict", loaded)
             raw = self._write(raw_id, raw, where)
-            self.log(f"predictions {self.name} {window} rows {rng[0]}:{rng[1]}")
+            self.log(f"predictions {self.name} rows {rng[0]}:{rng[1]}")
         if self.pipeline.postprocess is not None:
             postprocess = self.pipeline.postprocess
             config = self.pipeline.postprocess_config
@@ -492,13 +486,13 @@ class _Stage:
                     "postprocess_config": identity.canonical(config),
                 },
             )
-            self.log(f"postprocess {self.name} {window} rows {rng[0]}:{rng[1]}")
+            self.log(f"postprocess {self.name} rows {rng[0]}:{rng[1]}")
         return pred_id
 
     def _record_fit(
         self, fit_id: str, fold: Fold, loaded: np.ndarray, predict: Callable
     ):
-        """Append a fit once its reloaded model predicts its first window as the
+        """Append a fit once its reloaded model predicts its first range as the
         fitted one did, so a save that drops state is refused, not recorded.
         """
         fitted, why, payload = self.pending.pop(fit_id)
@@ -516,12 +510,11 @@ class _Stage:
         )
         self.log(f"fit {self.name} {fold.label} {payload['duration_s']:.1f}s: {why}")
 
-    def _train_predictions(self, member_fits: list[str], fold: Fold) -> list[list[str]]:
+    def _train_predictions(
+        self, member_fits: list[str], fold: Fold, index: int
+    ) -> list[list[str]]:
         return [
-            [
-                member.predictions(fit_id, fold, -1, f"train:{k}", seg)
-                for k, seg in enumerate(fold.train)
-            ]
+            [member.predictions(fit_id, fold, index, seg) for seg in fold.train]
             for member, fit_id in zip(self.members, member_fits, strict=True)
         ]
 
@@ -721,9 +714,9 @@ class _Stage:
         visible: Dataset,
         rng: Range,
     ):
-        """Rerun the function on the rows before the first row of the window's middle
+        """Rerun the function on the rows before the first row of the range's middle
         timestamp, with its array inputs cut there, and require the predictions
-        before it to stand; every computed window, before it is written.
+        before it to stand; every computed range, before it is written.
         """
         at = visible.boundary((rng[0] + rng[1]) // 2, rng[0])
         if at is None:
@@ -739,14 +732,14 @@ class _Stage:
         if values.ndim not in (1, 2) or values.shape[0] != rows:
             raise Refused(
                 f"{self.name}: {stage} returned shape {values.shape}; it must return "
-                f"one row per row of the window, shape ({rows},) or ({rows}, k)"
+                f"one row per row of the range, shape ({rows},) or ({rows}, k)"
             )
         width = self.widths.setdefault(stage, values.shape[1:])
         if values.shape[1:] != width:
             raise Refused(
                 f"{self.name}: {stage} returned shape {values.shape} at rows "
                 f"{rng[0]}:{rng[1]} and shape ({rows}, {', '.join(map(str, width))}) "
-                f"on an earlier window; the width is a property of {stage}"
+                f"on an earlier fold; the width is a property of {stage}"
             )
         return values
 
@@ -804,40 +797,30 @@ def _score(
         report.scores_recorded += 1
         context.log(f"would score {name}")
         return
-    per_fold, series = [], {}
-    aggregate: dict[str, dict[str, float]] = {}
+    per_fold, parts = [], []
     for index, fold in enumerate(folds):
-        for window, rng in fold.windows.items():
-            pred = _load_predictions(ledger, predictions[f"{index}:{window}"])
-            visible = context.dataset.upto(rng[1])
-            rows = np.asarray(scorer.score(pred, visible, rng, evaluation.config))
-            series.setdefault(window, []).append(rows)
-            per_fold.append(
-                {
-                    "fold": index,
-                    "label": fold.label,
-                    "window": window,
-                    "metrics": evaluation.metrics(rows),
-                }
-            )
-    stored: dict[str, dict[str, Any]] = {}
-    for window, parts in series.items():
-        whole = np.concatenate(parts)
-        aggregate[window] = evaluation.metrics(whole)
-        columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
-        names = scorer.columns or [str(i) for i in range(columns.shape[1])]
-        if len(names) != columns.shape[1]:
-            raise Refused(
-                f"scorer declares columns {list(names)}; its series has "
-                f"{columns.shape[1]}"
-            )
-        stored[window] = {
-            "sha": ledger.put_blob(
-                formats.arrays_save(dict(zip(names, columns.T, strict=True)))
-            ),
-            "format": formats.Format.ARROW_ARRAYS,
-            "fold_rows": [len(part) for part in parts],
-        }
+        pred = _load_predictions(ledger, predictions[str(index)])
+        visible = context.dataset.upto(fold.test[1])
+        rows = np.asarray(scorer.score(pred, visible, fold.test, evaluation.config))
+        parts.append(rows)
+        per_fold.append(
+            {"fold": index, "label": fold.label, "metrics": evaluation.metrics(rows)}
+        )
+    whole = np.concatenate(parts)
+    aggregate = evaluation.metrics(whole)
+    columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
+    names = scorer.columns or [str(i) for i in range(columns.shape[1])]
+    if len(names) != columns.shape[1]:
+        raise Refused(
+            f"scorer declares columns {list(names)}; its series has {columns.shape[1]}"
+        )
+    stored = {
+        "sha": ledger.put_blob(
+            formats.arrays_save(dict(zip(names, columns.T, strict=True)))
+        ),
+        "format": formats.Format.ARROW_ARRAYS,
+        "fold_rows": [len(part) for part in parts],
+    }
     ledger.append(
         Event.SCORE,
         evaluation.id,
@@ -855,11 +838,9 @@ def _score(
         id=score_id,
     )
     report.scores_recorded += 1
-    for window, metrics in aggregate.items():
-        context.log(
-            f"score {name} {window} "
-            + " ".join(f"{k}={v:.4g}" for k, v in metrics.items())
-        )
+    context.log(
+        f"score {name} " + " ".join(f"{k}={v:.4g}" for k, v in aggregate.items())
+    )
 
 
 def _refuse_changed(
@@ -900,51 +881,51 @@ def _refuse_changed(
 
 def _refuse_overlap(folds: list[Fold]):
     for fold in folds:
+        lo, hi = fold.test
         for segment in fold.train:
-            for window, rng in fold.windows.items():
-                if segment[0] < rng[1] and rng[0] < segment[1]:
-                    raise Refused(
-                        f"fold {fold.label} trains on segment {tuple(segment)}, which "
-                        f"overlaps window {window} {tuple(rng)}"
-                    )
+            if segment[0] < hi and lo < segment[1]:
+                raise Refused(
+                    f"fold {fold.label} trains on segment {tuple(segment)}, which "
+                    f"overlaps its test range {tuple(fold.test)}"
+                )
 
 
 def _refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fold]):
-    """Refuse the folds that train on a row before one of their windows whose label
-    is not known at the window's start, naming the worst one, the lag, and the
+    """Refuse the folds that train on a row before their test range whose label is
+    not known at the range's start, naming the worst one, the lag, and the
     embargo that clears every fold at once.
     """
     worst: tuple[int, int, str] = (0, 0, "")
     leaky = 0
     for fold in folds:
         train = row_mask(dataset.rows, fold.train)
-        for window, (lo, _) in fold.windows.items():
-            known = dataset.upto(lo + 1).masked(targets, lo)
-            for name in targets:
-                late = np.flatnonzero(
-                    train[:lo]
-                    & np.isnan(known.columns[name][:lo])
-                    & ~np.isnan(dataset.columns[name][:lo])
-                )
-                if not late.size:
-                    continue
-                leaky += 1
-                stamps = len(np.unique(dataset.ts[late]))
-                where = (
-                    f"fold {fold.label} trains on rows {late[0]} to {late[-1]} whose "
-                    f"{name} labels (reveal lag {_lag_text(targets[name])}) are not "
-                    f"known when window {window} starts at row {lo}"
-                )
-                if (stamps, late.size) > worst[:2]:
-                    worst = (stamps, late.size, where)
+        lo = fold.test[0]
+        known = dataset.upto(lo + 1).masked(targets, lo)
+        for name in targets:
+            late = np.flatnonzero(
+                train[:lo]
+                & np.isnan(known.columns[name][:lo])
+                & ~np.isnan(dataset.columns[name][:lo])
+            )
+            if not late.size:
+                continue
+            leaky += 1
+            stamps = len(np.unique(dataset.ts[late]))
+            where = (
+                f"fold {fold.label} trains on rows {late[0]} to {late[-1]} whose "
+                f"{name} labels (reveal lag {_lag_text(targets[name])}) are not "
+                f"known when its test range starts at row {lo}"
+            )
+            if (stamps, late.size) > worst[:2]:
+                worst = (stamps, late.size, where)
     if leaky:
         stamps, rows, where = worst
         raise Refused(
-            f"{leaky} fold windows train on labels revealed after they start; the "
-            f"worst: {where}; embargo {stamps} more timestamps ({rows} rows) than the "
-            "split drops now and they all clear; a label known at a later date's open "
-            "takes an integer reveal "
-            "lag, record(reveal={name: dates}), which is exact across holidays"
+            f"{leaky} folds train on labels revealed after their test range starts; "
+            f"the worst: {where}; embargo {stamps} more timestamps ({rows} rows) than "
+            "the split drops now and they all clear; a label known at a later date's "
+            "open takes an integer reveal lag, record(reveal={name: dates}), which is "
+            "exact across holidays"
         )
 
 
@@ -1004,7 +985,7 @@ def _declare_evaluation(
             "index": i,
             "label": f.label,
             "train": [list(seg) for seg in f.train],
-            "windows": f.windows,
+            "test": f.test,
         }
         for i, f in enumerate(folds)
     ]

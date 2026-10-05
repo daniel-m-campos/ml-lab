@@ -216,10 +216,9 @@ def _lazy_steps(tmp_path, tag: str):
 
 def _score(ledger: Ledger, score: str, pipeline: str, values: list[float]):
     folds = [
-        {"fold": i, "label": str(i), "window": "w", "metrics": {"m": v}}
-        for i, v in enumerate(values)
+        {"fold": i, "label": str(i), "metrics": {"m": v}} for i, v in enumerate(values)
     ]
-    payload = {"pipeline": pipeline, "folds": folds, "aggregate": {"w": {"m": 0.0}}}
+    payload = {"pipeline": pipeline, "folds": folds, "aggregate": {"m": 0.0}}
     ledger.append(Event.SCORE, "e", score, payload, id=score)
 
 
@@ -435,7 +434,7 @@ def test_a_blend_whose_fit_takes_three_arguments_predicts_no_train_range(
         name="equal",
     )
     _run(ledger, evaluation, fixed)
-    assert _count(ledger, "raw_prediction WHERE window LIKE 'train:%'") == 0
+    assert _count(ledger, "raw_prediction") == _count(ledger, "raw_fit")
     assert "equal" in _latest(ledger, evaluation)
     with pytest.raises(Refused, match="in_sample"):
         _run(ledger, evaluation, dataclasses.replace(fixed, in_sample=True))
@@ -519,7 +518,7 @@ def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
 def test_any_evaluation_field_change_is_a_new_evaluation_id(dataset, evaluation):
     cost = synthetic.evaluation(dataset, cost=0.01)
     one = dataclasses.replace(
-        evaluation, split=dataclasses.replace(evaluation.split, horizons=(1,))
+        evaluation, split=dataclasses.replace(evaluation.split, horizon=2)
     )
     assert len({evaluation.id, cost.id, one.id}) == 3
 
@@ -531,7 +530,7 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     folds = evaluation.split.folds(data)
     assert len(folds) >= evaluation.split.min_folds
     for fold in folds:
-        skipped = data.ts[fold.train[-1][1] : fold.windows["1"][0]]
+        skipped = data.ts[fold.train[-1][1] : fold.test[0]]
         assert len(np.unique(skipped)) == evaluation.split.embargo_timestamps
     _run(ledger, evaluation, synthetic.ridge(3))
     stored = ledger.latest(Event.EVALUATION, evaluation.id)["payload"]
@@ -551,14 +550,14 @@ def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
     n = data.rows
     folds = splits.BlockedKFold(k=4, embargo_rows=10).folds(data)
     assert [f.label for f in folds] == [f"block {i}" for i in range(4)]
-    assert folds[0].train == ((folds[0].windows["test"][1] + 10, n),)
+    assert folds[0].train == ((folds[0].test[1] + 10, n),)
     middle = folds[1]
-    lo, hi = middle.windows["test"]
+    lo, hi = middle.test
     assert middle.train == ((0, lo - 10), (hi + 10, n))
-    assert sum(hi - lo for f in folds for lo, hi in f.windows.values()) == n
+    assert sum(hi - lo for lo, hi in (f.test for f in folds)) == n
     (hold,) = splits.Holdout(train_fraction=0.8, embargo_rows=5).folds(data)
     cut = data.boundary(round(0.8 * n))
-    assert hold.train == ((0, cut),) and hold.windows["test"][0] == cut + 5
+    assert hold.train == ((0, cut),) and hold.test[0] == cut + 5
 
 
 def test_row_splits_cut_on_timestamp_boundaries():
@@ -567,11 +566,11 @@ def test_row_splits_cut_on_timestamp_boundaries():
     )
     dataset = Dataset({"x": np.zeros(70)}, np.repeat(stamps, 7))
     folds = splits.BlockedKFold(k=3).folds(dataset)
-    assert [f.windows["test"] for f in folds] == [(0, 21), (21, 42), (42, 70)]
+    assert [f.test for f in folds] == [(0, 21), (21, 42), (42, 70)]
     (hold,) = splits.Holdout(0.75).folds(dataset)
-    assert hold.train == ((0, 49),) and hold.windows["test"] == (49, 70)
+    assert hold.train == ((0, 49),) and hold.test == (49, 70)
     (walk,) = splits.WalkForward(45, 70, 20, min_folds=1).folds(dataset)
-    assert walk.train == ((0, 42),) and walk.windows["test"] == (42, 63)
+    assert walk.train == ((0, 42),) and walk.test == (42, 63)
     bare = Dataset({"x": np.zeros(70)})
     assert splits.Holdout(0.75).folds(bare)[0].train == ((0, 52),)
 
@@ -580,7 +579,7 @@ def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
     data = load(ledger, dataset)
     folds = splits.BlockedKFold(k=5, train_fraction=0.8).folds(data)
     (hold,) = splits.Holdout(train_fraction=0.8).folds(data)
-    ends = [hi for f in folds for _, hi in [*f.train, *f.windows.values()]]
+    ends = [hi for f in folds for _, hi in [*f.train, f.test]]
     assert max(ends) == hold.train[0][1]
     assert identity.content_hash(splits.BlockedKFold(k=5)) == identity.content_hash(
         splits.BlockedKFold(k=5, train_fraction=1.0)
@@ -604,36 +603,18 @@ def test_a_clockless_dataset_fits_on_segments_and_refuses_walk_forward(ledger):
     ).weights.shape == (3,)
 
 
-def test_row_walk_forward_steps_by_rows_and_names_windows_only_when_asked(
-    ledger, dataset
-):
+def test_row_walk_forward_steps_by_rows(ledger, dataset):
     data = load(ledger, dataset)
     plain = splits.WalkForward(
         first_cutoff_rows=1000, step_rows=500, window_rows=500, embargo_rows=10
     )
     folds = plain.folds(data)
     assert len(folds) == (data.rows - 1000) // 500
-    assert folds[0].train == ((0, 990),) and folds[0].windows == {"test": (1000, 1500)}
+    assert folds[0].train == ((0, 990),) and folds[0].test == (1000, 1500)
     assert folds[1].label == "row 1500"
-    named = dataclasses.replace(plain, horizons=(1, 2)).folds(data)
-    assert named[0].windows == {"1": (1000, 1500), "2": (1500, 2000)}
     evaluation = synthetic.evaluation(dataset, split=plain)
     report = _run(ledger, evaluation, synthetic.ridge(0))
     assert report.fits_computed == len(folds) and report.scores_recorded == 1
-
-
-def test_a_blocked_kfold_evaluation_scores_one_test_window_per_fold(ledger, dataset):
-    evaluation = synthetic.evaluation(
-        dataset, split=splits.BlockedKFold(k=3, embargo_rows=20)
-    )
-    report = _run(ledger, evaluation, synthetic.ridge(0))
-    assert report.fits_computed == 3 and report.scores_recorded == 1
-    rows = ledger.sql(
-        "SELECT DISTINCT window FROM score_fold WHERE evaluation = ?", (evaluation.id,)
-    )
-    assert [r["window"] for r in rows] == ["test"]
-    fit = ledger.sql("SELECT train, label FROM raw_fit ORDER BY seq LIMIT 2")[1]
-    assert fit["label"] == "block 1" and len(json.loads(fit["train"])) == 2
 
 
 def test_a_day_walk_forward_steps_over_dates_with_rows():
@@ -650,18 +631,16 @@ def test_a_day_walk_forward_steps_over_dates_with_rows():
     )
     hours = np.array([9, 15], "timedelta64[h]")
     dataset = Dataset({"x": np.arange(12.0)}, (days[:, None] + hours).ravel())
-    folds = splits.CalendarWalkForward(
-        "2019-06-08", unit="day", horizons=(1,), min_folds=1
-    ).folds(dataset)
+    folds = splits.CalendarWalkForward("2019-06-08", unit="day", min_folds=1).folds(
+        dataset
+    )
     assert [f.label for f in folds] == [f"2019-06-1{d}" for d in range(5)]
-    assert folds[0].windows == {"1": (2, 4)} and folds[0].train == ((0, 2),)
-    assert folds[-1].windows == {"1": (10, 12)}
+    assert folds[0].test == (2, 4) and folds[0].train == ((0, 2),)
+    assert folds[-1].test == (10, 12)
     with pytest.raises(Refused, match=r"no train rows: \['2019-06-07'\]"):
-        splits.CalendarWalkForward(
-            "2019-06-07", unit="day", horizons=(1,), min_folds=1
-        ).folds(dataset)
+        splits.CalendarWalkForward("2019-06-07", unit="day", min_folds=1).folds(dataset)
     with pytest.raises(Refused, match="0 months from the first cutoff"):
-        splits.CalendarWalkForward("2019-06-12", horizons=(1,)).folds(dataset)
+        splits.CalendarWalkForward("2019-06-12").folds(dataset)
 
 
 def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
@@ -672,25 +651,38 @@ def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
         "2021-03-01",
         every=2,
         window=2,
-        horizons=(1,),
         embargo_timestamps=2,
         end="2021-12-06",
         min_folds=1,
     ).folds(dataset)
-    last = max(dataset.ts[hi - 1] for f in folds for _, hi in f.windows.values())
+    last = max(dataset.ts[f.test[1] - 1] for f in folds)
     assert last < np.datetime64("2021-12-06")
-    gaps = [
-        len(np.unique(dataset.ts[f.train[0][1] : f.windows["1"][0]])) for f in folds
-    ]
+    gaps = [len(np.unique(dataset.ts[f.train[0][1] : f.test[0]])) for f in folds]
     assert gaps == [2] * len(folds) and len(folds) == 4
 
 
 def test_a_month_split_that_drops_the_tail_says_how_to_score_it(ledger, dataset):
     data = load(ledger, dataset)
-    split = splits.CalendarWalkForward(first_cutoff="2025-11-01", horizons=(1, 2))
+    split = splits.CalendarWalkForward(first_cutoff="2025-11-01", horizon=2)
     with pytest.raises(Refused, match="set end=2026-01-01 or later") as info:
         split.folds(data)
     assert "use unit='day'" in str(info.value)
+
+
+def test_a_later_horizon_scores_the_next_window_and_shares_every_fit(
+    ledger, dataset, evaluation
+):
+    data = load(ledger, dataset)
+    later = dataclasses.replace(
+        evaluation, split=dataclasses.replace(evaluation.split, horizon=2)
+    )
+    near, far = evaluation.split.folds(data), later.split.folds(data)
+    assert [f.train for f in far] == [f.train for f in near[:-1]]
+    assert [f.test for f in far] == [f.test for f in near[1:]]
+    _run(ledger, evaluation, synthetic.ridge(3))
+    report = _run(ledger, later, synthetic.ridge(3))
+    assert report.fits_computed == 0 and report.fits_reused == len(far)
+    assert report.predictions_computed == len(far) and report.scores_recorded == 1
 
 
 def test_the_clock_keeps_nanoseconds_and_the_dataset_id_sees_them():
@@ -872,7 +864,7 @@ def test_a_run_posts_fits_predictions_and_one_score_and_a_rerun_writes_nothing(
     folds = evaluation.split.folds(load(ledger, dataset))
     first = _run(ledger, evaluation, synthetic.ridge(3))
     assert first.fits_computed == len(folds)
-    assert first.predictions_computed == len(folds) * len(evaluation.split.horizons)
+    assert first.predictions_computed == len(folds)
     assert first.scores_recorded == 1
     before = len(ledger.events())
     second = _run(ledger, evaluation, synthetic.ridge(3))
@@ -883,7 +875,7 @@ def test_a_run_posts_fits_predictions_and_one_score_and_a_rerun_writes_nothing(
     ) == (0, 0, 0)
     assert (second.fits_reused, second.predictions_reused, second.scores_reused) == (
         len(folds),
-        len(folds) * len(evaluation.split.horizons),
+        len(folds),
         1,
     )
     assert second.run == "" and ledger.events()[before:] == []
@@ -911,7 +903,7 @@ def test_steps_see_only_the_rows_before_their_cutoff(ledger, dataset, evaluation
         first.matrix((8, 12), ("f0",))
 
 
-def test_targets_are_hidden_inside_the_window(ledger, dataset, evaluation):
+def test_targets_are_hidden_inside_the_test_range(ledger, dataset, evaluation):
     cheat = dataclasses.replace(synthetic.ridge(1), predict=synthetic.cheating_predict)
     _run(ledger, evaluation, cheat)
     pred = _load_predictions(ledger, ledger.events(Event.PREDICTIONS)[0]["id"])
@@ -940,7 +932,7 @@ def test_a_fold_training_on_an_unrevealed_label_is_refused(ledger):
     for dry in (True, False):
         with pytest.raises(
             Refused,
-            match=r"4 fold windows.*rows 198 to 199 whose ret_1 .*0:02:00.*embargo 1 "
+            match=r"4 folds train.*rows 198 to 199 whose ret_1 .*0:02:00.*embargo 1 "
             r"more timestamps \(2 rows\)",
         ):
             _run(ledger, evaluation, synthetic.ridge(0), dry=dry)
@@ -950,22 +942,22 @@ def test_a_fold_training_on_an_unrevealed_label_is_refused(ledger):
 @dataclasses.dataclass(frozen=True)
 class OverlapSplit:
     def folds(self, dataset):
-        return [splits.Fold("f0", ((0, 3000),), {"test": (2500, 3500)})]
+        return [splits.Fold("f0", ((0, 3000),), (2500, 3500))]
 
 
 @pytest.mark.parametrize("dry", [False, True])
-def test_a_fold_whose_train_overlaps_its_window_is_refused(ledger, dataset, dry):
+def test_a_fold_whose_train_overlaps_its_test_range_is_refused(ledger, dataset, dry):
     evaluation = synthetic.evaluation(dataset, split=OverlapSplit())
     with pytest.raises(
         Refused,
-        match=r"fold f0 trains on segment \(0, 3000\), which overlaps window "
-        r"test \(2500, 3500\)",
+        match=r"fold f0 trains on segment \(0, 3000\), which overlaps its "
+        r"test range \(2500, 3500\)",
     ):
         _run(ledger, evaluation, synthetic.ridge(0), dry=dry)
     assert not ledger.events(Event.EVALUATION)
 
 
-def test_a_predict_that_reads_the_future_inside_its_window_is_refused(
+def test_a_predict_that_reads_the_future_inside_its_range_is_refused(
     ledger, dataset, evaluation
 ):
     peek = dataclasses.replace(synthetic.ridge(1), predict=synthetic.peeking_predict)
@@ -1042,7 +1034,7 @@ def test_a_predict_of_k_columns_is_stored_scored_and_blended_as_such(ledger, dat
     assert ledger.sql("SELECT value FROM board WHERE name = 'ridge_1m'")[0]["value"] > 0
 
 
-def test_a_predict_whose_width_changes_between_windows_is_refused(ledger, evaluation):
+def test_a_predict_whose_width_changes_between_folds_is_refused(ledger, evaluation):
     p = dataclasses.replace(synthetic.ridge(1), predict=widening_predict, name="wide")
     report = _run(ledger, evaluation, p)
     assert "the width is a property of predict" in report.failed["wide"]
@@ -1051,13 +1043,13 @@ def test_a_predict_whose_width_changes_between_windows_is_refused(ledger, evalua
 @pytest.mark.parametrize(
     "change", [{"predict": scalar_predict}, {"postprocess": first_row_postprocess}]
 )
-def test_an_output_that_is_not_one_row_per_window_row_is_refused(
+def test_an_output_that_is_not_one_row_per_range_row_is_refused(
     ledger, evaluation, change
 ):
     p = dataclasses.replace(synthetic.ridge(1), **change, name="shaped")
     report = _run(ledger, evaluation, p)
     assert f"{next(iter(change))} returned shape" in report.failed["shaped"]
-    assert "one row per row of the window" in report.failed["shaped"]
+    assert "one row per row of the range" in report.failed["shaped"]
     rows = ledger.sql("SELECT id, range_start, range_end FROM raw_prediction")
     assert all(
         len(_load_predictions(ledger, r["id"])) == r["range_end"] - r["range_start"]
@@ -1195,7 +1187,6 @@ def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     ledger, dataset, evaluation
 ):
     folds = evaluation.split.folds(load(ledger, dataset))
-    windows = sum(len(f.windows) for f in folds)
     plain = synthetic.ridge(1)
     doubled = dataclasses.replace(
         plain, postprocess=synthetic.scale, postprocess_config=2.0, name="ridge_1m_x2"
@@ -1203,15 +1194,15 @@ def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     assert doubled.id != plain.id
     report = _run(ledger, evaluation, plain, doubled)
     assert report.fits_computed == len(folds) and report.fits_reused == len(folds)
-    assert report.predictions_computed == 2 * windows
+    assert report.predictions_computed == 2 * len(folds)
     assert report.predictions_reused == 0 and report.scores_recorded == 2
     post = [e for e in ledger.events(Event.PREDICTIONS) if "raw" in e["payload"]]
-    assert len(post) == windows
+    assert len(post) == len(folds)
     assert post[0]["payload"]["postprocess_config"] == 2.0
     raw = _load_predictions(ledger, post[0]["payload"]["raw"])
     assert np.allclose(_load_predictions(ledger, post[0]["id"]), 2 * raw)
     again = _run(ledger, evaluation, plain, doubled)
-    assert again.run == "" and again.predictions_reused == 2 * windows
+    assert again.run == "" and again.predictions_reused == 2 * len(folds)
 
 
 def test_a_postprocess_config_enters_the_prediction_id_and_shares_the_fit(
@@ -1240,16 +1231,15 @@ def test_a_postprocess_config_enters_the_prediction_id_and_shares_the_fit(
 
 def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evaluation):
     folds = evaluation.split.folds(load(ledger, dataset))
-    windows = sum(len(f.windows) for f in folds)
     one, three = synthetic.ridge(1), synthetic.ridge(3)
     _run(ledger, evaluation, one, three)
     report = _run(ledger, evaluation, synthetic.blend(one, three))
     assert report.fits_reused == 2 * len(folds) and report.fits_computed == len(folds)
-    assert report.predictions_reused == 2 * windows
-    assert report.predictions_computed == windows + 2 * len(folds)
+    assert report.predictions_reused == 2 * len(folds)
+    assert report.predictions_computed == 3 * len(folds)
     assert report.scores_recorded == 1
     blended = [e for e in ledger.events(Event.PREDICTIONS) if "members" in e["payload"]]
-    first = next(e for e in blended if e["payload"]["window"] != "train:0")
+    first = blended[0]
     parts = [_load_predictions(ledger, p) for p in first["payload"]["members"]]
     assert np.allclose(_load_predictions(ledger, first["id"]), np.mean(parts, axis=0))
     fit = ledger.latest(Event.FIT, first["payload"]["fit"])
@@ -1766,10 +1756,10 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     db = sqlite3.connect(tmp_path / "ml-lab" / "ml_lab.sqlite")
     metrics = len(evaluation.directions)
     assert db.execute("SELECT COUNT(*) FROM score_fold").fetchone()[0] == (
-        2 * len(folds) * len(evaluation.split.horizons) * metrics
+        2 * len(folds) * metrics
     )
     assert db.execute("SELECT COUNT(*) FROM score_aggregate").fetchone()[0] == (
-        2 * len(evaluation.split.horizons) * metrics
+        2 * metrics
     )
     assert db.execute("SELECT COUNT(*) FROM score_latest").fetchone()[0] == 2
     assert db.execute("SELECT COUNT(*) FROM raw_fit").fetchone()[0] == 2 * len(folds)
@@ -1782,10 +1772,10 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
         ("synthetic",)
     ]
     scored, folds_, std, sha = db.execute(
-        "SELECT score, folds, fold_std, series FROM score_aggregate WHERE window = '1'"
+        "SELECT score, folds, fold_std, series FROM score_aggregate"
     ).fetchone()
     assert folds_ == len(folds) and std > 0
-    stored = ledger.latest(Event.SCORE, scored)["payload"]["series"]["1"]
+    stored = ledger.latest(Event.SCORE, scored)["payload"]["series"]
     assert stored["sha"] == sha
     assert len(_load_series(ledger, sha)) == sum(stored["fold_rows"])
     assert db.execute("SELECT resolution, pipelines FROM raw_run").fetchone()[1]
@@ -1793,22 +1783,16 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
 
 def test_board_reads_names_and_values_without_a_join(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
-    rows = ledger.sql("SELECT * FROM board WHERE window = '1' AND metric = 'pnl'")
+    rows = ledger.sql("SELECT * FROM board WHERE metric = 'pnl'")
     joined = ledger.sql(
         "SELECT l.name, a.value FROM score_latest l "
         "JOIN score_aggregate a ON a.score = l.score "
-        "WHERE a.window = '1' AND a.metric = 'pnl'"
+        "WHERE a.metric = 'pnl'"
     )
     assert {r["name"]: r["value"] for r in rows} == {
         r["name"]: r["value"] for r in joined
     }
-    assert list(rows[0])[:5] == [
-        "source",
-        "evaluation_name",
-        "name",
-        "window",
-        "metric",
-    ]
+    assert list(rows[0])[:4] == ["source", "evaluation_name", "name", "metric"]
     assert rows[0]["source"] == "synthetic" and rows[0]["folds"] > 1
 
 
@@ -1820,21 +1804,21 @@ def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
     values = {}
     for name, score in scores.items():
         rows = ledger.sql(
-            "SELECT value FROM score_fold WHERE score = ? AND window = '1' "
-            "AND metric = 'pnl' ORDER BY fold",
+            "SELECT value FROM score_fold WHERE score = ? AND metric = 'pnl' "
+            "ORDER BY fold",
             (score,),
         )
         values[name] = np.array([r["value"] for r in rows])
     d = values["ridge_1m"] - values["ridge_6m"]
     row = ledger.sql(
         "SELECT * FROM head_to_head WHERE name = 'ridge_1m' AND reference_name = "
-        "'ridge_6m' AND window = '1' AND metric = 'pnl'"
+        "'ridge_6m' AND metric = 'pnl'"
     )[0]
     assert row["folds"] == len(d) and row["wins"] == int((d > 0).sum())
     assert np.isclose(row["mean_delta"], d.mean())
     assert np.isclose(row["delta_std"], d.std(ddof=1))
     assert np.isclose(row["t"], d.mean() / (d.std(ddof=1) / np.sqrt(len(d))))
-    sha = ledger.sql("SELECT series FROM score_aggregate WHERE window = '1' LIMIT 1")
+    sha = ledger.sql("SELECT series FROM score_aggregate LIMIT 1")
     assert list(formats.arrays_load(ledger.get_blob(sha[0]["series"]))) == [
         "pnl",
         "flips",
@@ -1847,14 +1831,13 @@ def test_head_to_head_names_its_evaluation_and_reconciles_with_the_pooled_value(
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     row = ledger.sql(
         "SELECT * FROM head_to_head WHERE name = 'ridge_1m' AND reference_name = "
-        "'ridge_6m' AND window = '1' AND metric = 'pnl'"
+        "'ridge_6m' AND metric = 'pnl'"
     )[0]
     assert (row["evaluation_name"], row["source"]) == ("", "synthetic")
     agg = {
         r["score"]: r
         for r in ledger.sql(
-            "SELECT score, value, fold_mean FROM score_aggregate "
-            "WHERE window = '1' AND metric = 'pnl'"
+            "SELECT score, value, fold_mean FROM score_aggregate WHERE metric = 'pnl'"
         )
     }
     a, b = agg[row["score"]], agg[row["reference_score"]]
@@ -1887,7 +1870,7 @@ def test_wins_follow_the_direction_recorded_with_each_score(
     runs.run(ledger, pipelines, evaluation, code_root=tmp_path)
     query = (
         "SELECT folds, wins FROM head_to_head WHERE name = 'ridge_1m' "
-        "AND window = '1' AND metric = 'pnl'"
+        "AND metric = 'pnl'"
     )
     (before,) = ledger.sql(query)
     declared = evaluation.id
@@ -1910,7 +1893,7 @@ def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
     assert row["folds"] == 1 and row["delta_std"] is None and row["t"] is None
     series = ledger.sql(
         "SELECT score, series, fold_rows FROM score_aggregate "
-        "WHERE window = 'test' AND metric = 'pnl' AND score IN (?, ?)",
+        "WHERE metric = 'pnl' AND score IN (?, ?)",
         (row["score"], row["reference_score"]),
     )
     assert series[0]["fold_rows"] == series[1]["fold_rows"]
@@ -1959,8 +1942,7 @@ class DottedSplit:
     def folds(self, dataset):
         cuts = (2000, 3000, 4000)
         return [
-            splits.Fold(f"f{k}", ((0, c),), {"1.5d": (c, c + 500)})
-            for k, c in enumerate(cuts)
+            splits.Fold(f"f{k}", ((0, c),), (c, c + 500)) for k, c in enumerate(cuts)
         ]
 
 
@@ -1975,9 +1957,7 @@ def dotted_score(pred, dataset, rng, config):
 dotted_scorer = Scorer(dotted_score, _dotted_metrics, {"hit.rate": "max"})
 
 
-def test_a_dotted_window_keeps_its_series_and_a_dotted_metric_counts_wins(
-    ledger, dataset
-):
+def test_a_dotted_metric_keeps_its_series_and_counts_wins(ledger, dataset):
     evaluation = Evaluation(dataset=dataset, split=DottedSplit(), scorer=dotted_scorer)
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(3))
     rows = ledger.sql("SELECT series, fold_rows FROM score_aggregate")
@@ -2199,7 +2179,7 @@ def test_a_revealed_target_is_a_feature_no_earlier_than_its_lag(ledger):
 def test_the_features_probe_reruns_on_five_prefixes_and_catches_a_day_lookahead(
     ledger, dataset
 ):
-    no_embargo = splits.CalendarWalkForward(first_cutoff="2025-05-01", horizons=(1, 2))
+    no_embargo = splits.CalendarWalkForward(first_cutoff="2025-05-01")
     evaluation = synthetic.evaluation(dataset, split=no_embargo)
     day = synthetic.featured(synthetic.ridge(1), synthetic.day_mean, "day_mean")
     report = _run(ledger, evaluation, day)
