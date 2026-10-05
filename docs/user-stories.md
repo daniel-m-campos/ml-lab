@@ -19,7 +19,7 @@ Context: `project/experiment.py` lists the pipelines and declares the evaluation
 
 1. `lab run $D` appends `evaluation_declared` with the metric directions and the schedule expanded into folds and windows; then `run_started` with the commit, dirty flag, resolution file and host; then, per pipeline, `fit_computed` per cutoff carrying the import shas and environment lock, `predictions_computed` per eval window, and one `score_recorded` keyed by the prediction ids.
 2. `lab run $D` again writes nothing: every fit and prediction is reused and every score already exists, and the report says so. Adding a pipeline to the module fits only the new one; the other pipelines cost nothing.
-3. `sql "SELECT l.name, s.metric, s.value FROM latest_score l JOIN aggregate_score s ON s.score = l.score WHERE s.window = '1'"` is the board.
+3. `sql "SELECT name, metric, value FROM board WHERE window = '1'"` is the board.
 
 Log after: one evaluation, N pipelines, one run, N scores, fits, predictions.
 
@@ -43,16 +43,16 @@ Context: the cost assumption in the simulator changes.
 2. `lab run $D`: a new evaluation, zero fits, every pipeline rescored from its memoized predictions.
 3. Scores under the old evaluation are untouched; the two evaluations never compare across.
 
-Done when: both evaluations read from `aggregate_score` and nothing was overwritten.
+Done when: both evaluations read from `score_aggregate` and nothing was overwritten.
 
 ## S5: code evolves
 
 Context: a feature in `steps.py` changes.
 
 1. `lab run $D`, committed or not. Each fit recorded the git blob sha of every module it imported; the ones whose shas no longer match refit, their predictions change, and each affected pipeline gets a new score. A dirty tree is recorded with its diff. The rest reuse.
-2. `latest_score` moves to the new scores; the old ones stand in `score`, pointing at their run, commit and shas.
+2. `score_latest` moves to the new scores; the old ones stand in `raw_score`, pointing at their run, commit and shas.
 
-Done when: `sql "SELECT * FROM score WHERE pipeline = ..."` shows both scores with different runs.
+Done when: `sql "SELECT * FROM raw_score WHERE pipeline = ..."` shows both scores with different runs.
 
 ## S6 (Later): iteration 100
 
@@ -68,7 +68,7 @@ Done when: a newcomer can say what was tried, why each one lost, what moved the 
 
 Context: a new pipeline raises at its third fit.
 
-1. `lab run $D` records the two fits it finished, appends `pipeline_failed` with the traceback, runs every other pipeline, and exits 1 naming the failure. `sql "SELECT * FROM failure"` shows the error; the traceback is the blob it names.
+1. `lab run $D` records the two fits it finished, appends `pipeline_failed` with the traceback, runs every other pipeline, and exits 1 naming the failure. `sql "SELECT * FROM raw_failure"` shows the error; the traceback is the blob it names.
 2. Fix the code, `lab run $D`: the two recorded fits are reused, the rest are computed, the score is scored.
 
 Done when: the second run's fit count is the fold count minus two.

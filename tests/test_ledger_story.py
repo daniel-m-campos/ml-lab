@@ -63,8 +63,8 @@ def _load_series(ledger, sha: str) -> np.ndarray:
 
 def _latest(ledger, evaluation) -> dict[str, str]:
     rows = ledger.sql(
-        "SELECT p.name, l.score FROM latest_score l "
-        "JOIN pipeline p ON p.id = l.pipeline "
+        "SELECT p.name, l.score FROM score_latest l "
+        "JOIN raw_pipeline p ON p.id = l.pipeline "
         "WHERE l.evaluation = ?",
         (evaluation.id,),
     )
@@ -100,7 +100,7 @@ def test_the_dataset_blob_opens_with_polars_alone(ledger, dataset):
     assert (
         synthetic.TARGET in table.columns and table.height == event["payload"]["rows"]
     )
-    assert ledger.sql("SELECT source FROM dataset")[0] == {"source": "synthetic"}
+    assert ledger.sql("SELECT source FROM raw_dataset")[0] == {"source": "synthetic"}
 
 
 # Declarations =========================================================================
@@ -126,7 +126,7 @@ def test_adding_a_defaulted_field_keeps_the_id_and_a_rename_reaches_the_views(
     _run(ledger, evaluation, synthetic.ridge(1))
     _run(ledger, evaluation, synthetic.ridge(1).named("renamed"))
     assert set(_latest(ledger, evaluation)) == {"renamed"}
-    rows = ledger.sql("SELECT COUNT(*) AS n FROM pipeline")
+    rows = ledger.sql("SELECT COUNT(*) AS n FROM raw_pipeline")
     assert rows[0]["n"] == 1 and len(ledger.events(Event.PIPELINE)) == 2
 
 
@@ -164,7 +164,7 @@ def test_a_blend_whose_fit_takes_three_arguments_predicts_no_train_range(
     )
     _run(ledger, evaluation, fixed)
     rows = ledger.sql(
-        "SELECT COUNT(*) AS n FROM prediction WHERE window LIKE 'train:%'"
+        "SELECT COUNT(*) AS n FROM raw_prediction WHERE window LIKE 'train:%'"
     )
     assert rows[0]["n"] == 0 and "equal" in _latest(ledger, evaluation)
 
@@ -223,10 +223,10 @@ def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
     out = capsys.readouterr().out
     assert re.search(r"evaluation [0-9a-f]{16} c0\.001\n", out) and " c0.01\n" in out
     rows = ledger.sql(
-        "SELECT evaluation_name AS e, COUNT(*) AS n FROM latest_score GROUP BY 1"
+        "SELECT evaluation_name AS e, COUNT(*) AS n FROM score_latest GROUP BY 1"
     )
     assert {r["e"]: r["n"] for r in rows} == {"c0.001": 2, "c0.01": 2}
-    assert ledger.sql("SELECT COUNT(*) AS n FROM fit")[0]["n"] == 2 * len(
+    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_fit")[0]["n"] == 2 * len(
         synthetic.evaluation(dataset).split.folds(load(ledger, dataset))
     )
 
@@ -315,10 +315,10 @@ def test_a_blocked_kfold_evaluation_scores_one_test_window_per_fold(ledger, data
     report = _run(ledger, evaluation, synthetic.ridge(0))
     assert report.fits_computed == 3 and report.scores_recorded == 1
     rows = ledger.sql(
-        "SELECT DISTINCT window FROM fold_score WHERE evaluation = ?", (evaluation.id,)
+        "SELECT DISTINCT window FROM score_fold WHERE evaluation = ?", (evaluation.id,)
     )
     assert [r["window"] for r in rows] == ["test"]
-    fit = ledger.sql("SELECT train, label FROM fit ORDER BY seq LIMIT 2")[1]
+    fit = ledger.sql("SELECT train, label FROM raw_fit ORDER BY seq LIMIT 2")[1]
     assert fit["label"] == "block 1" and len(json.loads(fit["train"])) == 2
 
 
@@ -493,10 +493,12 @@ def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     report = _run(ledger, evaluation, a, b)
     cutoff = evaluation.split.folds(load(ledger, evaluation.dataset))[0].train[-1][1]
     assert not report.failed and synthetic.FEATURE_CALLS[1:] == [cutoff - 1, cutoff]
-    rows = ledger.sql("SELECT columns, probe_rows FROM feature")
+    rows = ledger.sql("SELECT columns, probe_rows FROM raw_feature")
     assert len(rows) == 1 and json.loads(rows[0]["columns"]) == ["f0_lag"]
     assert json.loads(rows[0]["probe_rows"]) == [cutoff - 1, cutoff]
-    assert ledger.sql("SELECT COUNT(*) AS n FROM fit")[0]["n"] == report.fits_computed
+    assert (
+        ledger.sql("SELECT COUNT(*) AS n FROM raw_fit")[0]["n"] == report.fits_computed
+    )
     assert set(_latest(ledger, evaluation)) == {"ridge_1m_lag", "ridge_3m_lag"}
     assert a.id != synthetic.ridge(1).id
     leaky = synthetic.featured(synthetic.ridge(1), synthetic.next_f0, "leaky")
@@ -504,7 +506,7 @@ def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     report = _run(ledger, evaluation, leaky, copier)
     assert "features read past row" in report.failed["leaky"]
     assert synthetic.TARGET in report.failed["copier"]
-    assert ledger.sql("SELECT COUNT(*) AS n FROM feature")[0]["n"] == 1
+    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_feature")[0]["n"] == 1
 
 
 def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
@@ -597,7 +599,7 @@ def test_pickle_is_marked_not_portable_and_an_unknown_format_is_refused(
         synthetic.ridge(1), save=synthetic.pickle_save, load=synthetic.pickle_load
     )
     _run(ledger, evaluation, pickled)
-    assert ledger.sql("SELECT portable FROM fit")[0]["portable"] == 0
+    assert ledger.sql("SELECT portable FROM raw_fit")[0]["portable"] == 0
     with pytest.raises(Refused, match="'tar', not one of"):
         _run(ledger, evaluation, dataclasses.replace(pickled, save=synthetic.tar_save))
 
@@ -613,7 +615,7 @@ def test_a_zip_model_is_portable_only_if_every_member_is(ledger, evaluation):
         name="zp",
     )
     _run(ledger, evaluation, zipped, pickled)
-    rows = ledger.sql("SELECT pipeline, format, portable, model FROM fit")
+    rows = ledger.sql("SELECT pipeline, format, portable, model FROM raw_fit")
     assert {(r["pipeline"], r["format"], r["portable"]) for r in rows} == {
         (zipped.id, "zip", 1),
         (pickled.id, "zip", 0),
@@ -671,9 +673,9 @@ def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
     module = importlib.reload(module)
     featured = synthetic.featured(synthetic.ridge(3), module.lag)
     report = runs.run(ledger, [featured], evaluation, code_root=tmp_path)
-    assert ledger.sql("SELECT COUNT(*) AS n FROM feature")[0]["n"] == 2
+    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_feature")[0]["n"] == 2
     assert report.fits_computed == report.predictions_computed == 0
-    rows = ledger.sql("SELECT DISTINCT features FROM fit")
+    rows = ledger.sql("SELECT DISTINCT features FROM raw_fit")
     assert len(rows) == 1 and rows[0]["features"]
 
 
@@ -682,7 +684,7 @@ def test_fit_and_predict_read_the_feature_columns_in_step_order(ledger, evaluati
     _run(ledger, evaluation, a, synthetic.ridge(1))
     weights = {
         r["pipeline"]: a.load(ledger.get_blob(r["model"])).weights.shape
-        for r in ledger.sql("SELECT pipeline, model FROM fit")
+        for r in ledger.sql("SELECT pipeline, model FROM raw_fit")
     }
     assert weights[a.id] == (4,) and weights[synthetic.ridge(1).id] == (3,)
 
@@ -786,7 +788,7 @@ def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resume
     report = _run(ledger, evaluation, flaky, synthetic.ridge(1))
     assert list(report.failed) == ["flaky"] and "boom" in report.failed["flaky"]
     assert report.fits_computed == 2 + len(folds) and report.scores_recorded == 1
-    failure = ledger.sql("SELECT pipeline, error FROM failure")[0]
+    failure = ledger.sql("SELECT pipeline, error FROM raw_failure")[0]
     assert failure["pipeline"] == flaky.id and "boom" in failure["error"]
     event = ledger.events(Event.FAILED, key=flaky.id)[-1]
     assert (
@@ -915,38 +917,38 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     db = sqlite3.connect(tmp_path / "ml-lab" / "ml_lab.sqlite")
     metrics = len(evaluation.directions)
-    assert db.execute("SELECT COUNT(*) FROM fold_score").fetchone()[0] == (
+    assert db.execute("SELECT COUNT(*) FROM score_fold").fetchone()[0] == (
         2 * len(folds) * len(evaluation.split.horizons) * metrics
     )
-    assert db.execute("SELECT COUNT(*) FROM aggregate_score").fetchone()[0] == (
+    assert db.execute("SELECT COUNT(*) FROM score_aggregate").fetchone()[0] == (
         2 * len(evaluation.split.horizons) * metrics
     )
-    assert db.execute("SELECT COUNT(*) FROM latest_score").fetchone()[0] == 2
-    assert db.execute("SELECT COUNT(*) FROM fit").fetchone()[0] == 2 * len(folds)
+    assert db.execute("SELECT COUNT(*) FROM score_latest").fetchone()[0] == 2
+    assert db.execute("SELECT COUNT(*) FROM raw_fit").fetchone()[0] == 2 * len(folds)
     assert db.execute("SELECT COUNT(*) FROM score_fit").fetchone()[0] == 2 * len(folds)
     assert (
         db.execute("SELECT SUM(duration_s) FROM score_fit").fetchone()
-        == db.execute("SELECT SUM(duration_s) FROM fit").fetchone()
+        == db.execute("SELECT SUM(duration_s) FROM raw_fit").fetchone()
     )
-    assert db.execute("SELECT DISTINCT source FROM latest_score").fetchall() == [
+    assert db.execute("SELECT DISTINCT source FROM score_latest").fetchall() == [
         ("synthetic",)
     ]
     scored, folds_, std, sha = db.execute(
-        "SELECT score, folds, fold_std, series FROM aggregate_score WHERE window = '1'"
+        "SELECT score, folds, fold_std, series FROM score_aggregate WHERE window = '1'"
     ).fetchone()
     assert folds_ == len(folds) and std > 0
     stored = ledger.latest(Event.SCORE, scored)["payload"]["series"]["1"]
     assert stored["sha"] == sha
     assert len(_load_series(ledger, sha)) == sum(stored["fold_rows"])
-    assert db.execute("SELECT resolution, pipelines FROM run").fetchone()[1]
+    assert db.execute("SELECT resolution, pipelines FROM raw_run").fetchone()[1]
 
 
 def test_board_reads_names_and_values_without_a_join(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     rows = ledger.sql("SELECT * FROM board WHERE window = '1' AND metric = 'pnl'")
     joined = ledger.sql(
-        "SELECT l.name, a.value FROM latest_score l "
-        "JOIN aggregate_score a ON a.score = l.score "
+        "SELECT l.name, a.value FROM score_latest l "
+        "JOIN score_aggregate a ON a.score = l.score "
         "WHERE a.window = '1' AND a.metric = 'pnl'"
     )
     assert {r["name"]: r["value"] for r in rows} == {
@@ -960,8 +962,6 @@ def test_board_reads_names_and_values_without_a_join(ledger, evaluation):
         "metric",
     ]
     assert rows[0]["source"] == "synthetic" and rows[0]["folds"] > 1
-    alias = ledger.sql("SELECT * FROM paired_score")
-    assert alias and alias == ledger.sql("SELECT * FROM head_to_head")
 
 
 def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
@@ -972,7 +972,7 @@ def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
     values = {}
     for name, score in scores.items():
         rows = ledger.sql(
-            "SELECT value FROM fold_score WHERE score = ? AND window = '1' "
+            "SELECT value FROM score_fold WHERE score = ? AND window = '1' "
             "AND metric = 'pnl' ORDER BY fold",
             (score,),
         )
@@ -985,7 +985,7 @@ def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
     assert row["folds"] == len(d) and row["wins"] == int((d > 0).sum())
     assert np.isclose(row["mean_delta"], d.mean())
     assert np.isclose(row["delta_std"], d.std(ddof=1))
-    sha = ledger.sql("SELECT series FROM aggregate_score WHERE window = '1' LIMIT 1")
+    sha = ledger.sql("SELECT series FROM score_aggregate WHERE window = '1' LIMIT 1")
     assert list(formats.arrays_load(ledger.get_blob(sha[0]["series"]))) == [
         "pnl",
         "flips",
@@ -1004,7 +1004,7 @@ def test_head_to_head_names_its_evaluation_and_reconciles_with_the_pooled_value(
     agg = {
         r["score"]: r
         for r in ledger.sql(
-            "SELECT score, value, fold_mean FROM aggregate_score "
+            "SELECT score, value, fold_mean FROM score_aggregate "
             "WHERE window = '1' AND metric = 'pnl'"
         )
     }
@@ -1021,7 +1021,7 @@ def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
     )[0]
     assert row["folds"] == 1 and row["delta_std"] is None
     series = ledger.sql(
-        "SELECT score, series, fold_rows FROM aggregate_score "
+        "SELECT score, series, fold_rows FROM score_aggregate "
         "WHERE window = 'test' AND metric = 'pnl' AND score IN (?, ?)",
         (row["score"], row["reference_score"]),
     )
@@ -1038,7 +1038,7 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(6))
     before = ledger.events()[-1]["seq"]
     _run(ledger, evaluation, synthetic.ridge(1))
-    rows = ledger.sql("SELECT COUNT(*) AS n FROM score WHERE seq <= ?", (before,))
+    rows = ledger.sql("SELECT COUNT(*) AS n FROM raw_score WHERE seq <= ?", (before,))
     assert rows[0]["n"] == 1 and len(ledger.events(Event.SCORE)) == 2
 
 

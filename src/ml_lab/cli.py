@@ -17,7 +17,7 @@ Examples
 $ lab ingest examples/optiver/dataset.py 20
 $ lab run examples/optiver/experiment.py
 $ lab run examples/optiver/experiment.py ideas/agent7.py
-$ sqlite3 -box .ml-lab/ml_lab.sqlite "SELECT * FROM latest_score"
+$ sqlite3 -box .ml-lab/ml_lab.sqlite "SELECT * FROM score_latest"
 """
 
 from __future__ import annotations
@@ -157,7 +157,7 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
     """The dataset named by an id prefix or a source; with no selector, the newest,
     provided every dataset in the ledger shares one source.
     """
-    rows = ledger.sql("SELECT id, source FROM dataset ORDER BY seq")
+    rows = ledger.sql("SELECT id, source FROM raw_dataset ORDER BY seq")
     by_source: dict[str, str] = {r["source"]: r["id"] for r in rows}
     if selector in by_source:
         return by_source[selector]

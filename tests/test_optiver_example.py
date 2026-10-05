@@ -64,7 +64,8 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
     assert table.height > 100_000 and table.height == event["payload"]["rows"]
     assert not table[optiver_dataset.TARGET].is_nan().any()
     assert (
-        ledger.sql("SELECT source FROM dataset")[0]["source"] == optiver_dataset.SOURCE
+        ledger.sql("SELECT source FROM raw_dataset")[0]["source"]
+        == optiver_dataset.SOURCE
     )
     assert (
         event["payload"]["recipe"]["params"]["instrument"] == optiver_dataset.INSTRUMENT
@@ -74,8 +75,8 @@ def test_the_dataset_is_parquet_with_a_null_free_target(root, dataset):
 def test_the_run_scores_every_declared_pipeline_readable_by_sql(root, dataset):
     lab(root, "run", DECL)
     rows = Ledger(root).sql(
-        "SELECT l.name, s.metric, s.value FROM latest_score l "
-        "JOIN aggregate_score s ON s.score = l.score WHERE s.window = '1'"
+        "SELECT l.name, s.metric, s.value FROM score_latest l "
+        "JOIN score_aggregate s ON s.score = l.score WHERE s.window = '1'"
     )
     names = {r["name"] for r in rows}
     assert {"ridge_1m", "ridge_3m", "ridge_6m"} <= names

@@ -17,10 +17,10 @@ lab run $D
 
 echo "== latest aggregate scores, horizon 1"
 sqlite3 -box $ML_LAB_ROOT/ml_lab.sqlite "
-SELECT l.name, s.metric, round(s.value, 2) AS value FROM latest_score l
-JOIN aggregate_score s ON s.score = l.score
+SELECT l.name, s.metric, round(s.value, 2) AS value FROM score_latest l
+JOIN score_aggregate s ON s.score = l.score
 WHERE s.window = '1' ORDER BY s.metric, s.value DESC"
 
 echo
 echo "Next: export ML_LAB_ROOT=$ML_LAB_ROOT, add a Pipeline to $D (or a file of pipelines), lab run $D <file>,"
-echo "      then sqlite3 -box \$ML_LAB_ROOT/ml_lab.sqlite over fold_score, aggregate_score, fit, failure."
+echo "      then sqlite3 -box \$ML_LAB_ROOT/ml_lab.sqlite over board, head_to_head, raw_fit, raw_failure."

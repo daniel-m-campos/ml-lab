@@ -58,17 +58,16 @@ Fits and predictions live on the dataset stream because a scoring change reuses 
 
 ### Views
 
-Shipped as SQL in the same file so `sqlite3` shows them as tables. Two are for reading, `board` and `head_to_head`; the rest are the log as columns, for joins. The one-event-type views carry `seq`, so `WHERE seq <= N` reads the log as it stood; `latest_score` ranks over the whole log.
+Shipped as SQL in the same file so `sqlite3` shows them as tables. The names say the layer: `board` and `head_to_head` are for reading and carry no prefix; `raw_` is one event type as columns, for joins; `score_` is a building block over scores. `.tables raw%` lists a layer. The `raw_` views carry `seq`, so `WHERE seq <= N` reads the log as it stood; `score_latest` ranks over the whole log.
 
 | view | definition |
 |---|---|
-| board | how each pipeline did: per (evaluation, pipeline, window, metric) the latest score's `value`, `folds`, `fold_mean` and `fold_std`, with the dataset source and the evaluation and pipeline names first and the ids last; `latest_score` joined to `aggregate_score` |
-| head_to_head | is A better than B: per (evaluation, window, metric) and ordered pair of latest pipelines, with the evaluation name and dataset source: the fold count, `mean_delta` (the mean per-fold difference, the difference of the pair's `fold_mean`), its sample std, the folds the first wins, and `pooled_delta` (the difference of their pooled `value`); `fold_std` on `board` is one pipeline's spread across folds, so the noise of a comparison is `delta_std` here; with one fold it is NULL, pair the series (Analytics). `paired_score` is its old name, kept until the next round |
-| dataset, pipeline, evaluation, run, feature, fit, prediction, score | one event type each, payload fields as columns; pipeline and evaluation show the newest name per id |
-| fold_score, aggregate_score | `score_recorded` unpacked one row per (fold, window, metric) and per (window, metric); `value` is `metrics` over the folds' rows concatenated and `fold_mean` the mean of the per-fold values, which differ and can disagree in sign for a metric that does not add over rows (a correlation, a Sharpe); the aggregate row carries the series sha and its `fold_rows`, the fold count, fold mean and fold standard deviation of the metric and the series blob sha |
-| latest_score | per (evaluation, pipeline), the newest score, with the pipeline and evaluation names and the dataset's id and source joined on. A label is not an id: a declaration change under one name lists the name once per id, and the log cannot say which declaration the code holds (a rerun that reuses everything writes nothing), so a board filters on the id `lab run` prints |
+| board | how each pipeline did: per (evaluation, pipeline, window, metric) the latest score's `value`, `folds`, `fold_mean` and `fold_std`, with the dataset source and the evaluation and pipeline names first and the ids last; `score_latest` joined to `score_aggregate` |
+| head_to_head | is A better than B: per (evaluation, window, metric) and ordered pair of latest pipelines, with the evaluation name and dataset source: the fold count, `mean_delta` (the mean per-fold difference, the difference of the pair's `fold_mean`), its sample std, the folds the first wins, and `pooled_delta` (the difference of their pooled `value`); `fold_std` on `board` is one pipeline's spread across folds, so the noise of a comparison is `delta_std` here; with one fold it is NULL, pair the series (Analytics) |
+| raw_dataset, raw_pipeline, raw_evaluation, raw_run, raw_feature, raw_fit, raw_prediction, raw_score, raw_failure | one event type each, payload fields as columns; pipeline and evaluation show the newest name per id; failure carries the run and the error |
+| score_fold, score_aggregate | `score_recorded` unpacked one row per (fold, window, metric) and per (window, metric); `value` is `metrics` over the folds' rows concatenated and `fold_mean` the mean of the per-fold values, which differ and can disagree in sign for a metric that does not add over rows (a correlation, a Sharpe); the aggregate row carries the series sha and its `fold_rows`, the fold count, fold mean and fold standard deviation of the metric and the series blob sha |
+| score_latest | per (evaluation, pipeline), the newest score, with the pipeline and evaluation names and the dataset's id and source joined on. A label is not an id: a declaration change under one name lists the name once per id, and the log cannot say which declaration the code holds (a rerun that reuses everything writes nothing), so a board filters on the id `lab run` prints |
 | score_fit | one row per (score, fit): the fits a score stands on, including a blend's members, with the fit's pipeline, label and seconds |
-| failure | `pipeline_failed` with run and error |
 
 The payload is JSON so a shape change is a new payload version and an edited view, not a migration. Materialize a view only when a read is measured past a second.
 
@@ -90,7 +89,7 @@ Day one, because rows written wrong cannot be repaired: ids that merge across ho
 
 ## Blobs
 
-Every sha reference in a payload carries a `format` from `formats.KNOWN`, which also says whether the format opens without this Python environment. Every shipped format does except `pickle`, admitted because scikit-learn has nothing else; a fit whose model is a pickle carries `portable = false`, so `SELECT ... FROM fit WHERE NOT portable` names the models hostage to the environment. A save step declaring a format outside the set is refused at run. `zip` is the container for a model that is a foreign file plus a few numbers: named members with a `formats.json` manifest naming each member's format, portable iff every member is; a member outside the set, or a nested zip, is refused.
+Every sha reference in a payload carries a `format` from `formats.KNOWN`, which also says whether the format opens without this Python environment. Every shipped format does except `pickle`, admitted because scikit-learn has nothing else; a fit whose model is a pickle carries `portable = false`, so `SELECT ... FROM raw_fit WHERE NOT portable` names the models hostage to the environment. A save step declaring a format outside the set is refused at run. `zip` is the container for a model that is a foreign file plus a few numbers: named members with a `formats.json` manifest naming each member's format, portable iff every member is; a member outside the set, or a nested zip, is refused.
 
 | blob | format name | bytes |
 |---|---|---|
@@ -104,7 +103,7 @@ A blob's name is the sha256 of its bytes as stored, so identical content is writ
 
 ## Analytics
 
-SQLite is the record; DuckDB is the analyst. `ATTACH 'ml_lab.sqlite' (TYPE sqlite)` queries the same views with columnar speed and hands frames to polars or pandas. Per-fold and aggregate metrics come from the views; A paired test at the scorer's unit reads both scores' `aggregate_score.series` for one window; their rows pair one to one when `fold_rows` match. For a metric that sums over rows, the row differences `d` give `pooled_delta = d.sum()` and an iid standard error `sqrt(len(d)) * d.std(ddof=1)`; a ratio metric or serially dependent rows want a block bootstrap of `metrics` over paired blocks, which the project owns. Nothing in the log is redesigned for analytics.
+SQLite is the record; DuckDB is the analyst. `ATTACH 'ml_lab.sqlite' (TYPE sqlite)` queries the same views with columnar speed and hands frames to polars or pandas. Per-fold and aggregate metrics come from the views; A paired test at the scorer's unit reads both scores' `score_aggregate.series` for one window; their rows pair one to one when `fold_rows` match. For a metric that sums over rows, the row differences `d` give `pooled_delta = d.sum()` and an iid standard error `sqrt(len(d)) * d.std(ddof=1)`; a ratio metric or serially dependent rows want a block bootstrap of `metrics` over paired blocks, which the project owns. Nothing in the log is redesigned for analytics.
 
 ## From inception to experimentation
 
@@ -141,15 +140,15 @@ WHERE reference_name = 'zero' AND evaluation_name = 'validation' AND window = '1
 ORDER BY mean_delta DESC;
 
 -- one pipeline fold by fold
-SELECT f.fold, f.label, f.window, f.metric, f.value FROM latest_score l
-JOIN fold_score f ON f.score = l.score
+SELECT f.fold, f.label, f.window, f.metric, f.value FROM score_latest l
+JOIN score_fold f ON f.score = l.score
 WHERE l.name = 'ridge_3m' ORDER BY f.fold, f.window, f.metric;
 
 -- what failed, and in which run
-SELECT p.name, x.error, x.run, x.at FROM failure x JOIN pipeline p ON p.id = x.pipeline;
+SELECT p.name, x.error, x.run, x.at FROM raw_failure x JOIN raw_pipeline p ON p.id = x.pipeline;
 
 -- what each scored pipeline cost to fit
-SELECT l.name, COUNT(*) AS fits, SUM(sf.duration_s) AS seconds FROM latest_score l
+SELECT l.name, COUNT(*) AS fits, SUM(sf.duration_s) AS seconds FROM score_latest l
 JOIN score_fit sf ON sf.score = l.score GROUP BY l.score ORDER BY seconds DESC;
 ```
 

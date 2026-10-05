@@ -587,7 +587,7 @@ class _Stage:
         newest earlier fit of this pipeline and label.
         """
         rows = self.ledger.sql(
-            "SELECT code_keys, env_lock FROM fit WHERE pipeline = ? AND label = ? "
+            "SELECT code_keys, env_lock FROM raw_fit WHERE pipeline = ? AND label = ? "
             "ORDER BY seq DESC LIMIT 1",
             (self.pipeline.id, label),
         )
