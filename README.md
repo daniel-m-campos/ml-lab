@@ -131,6 +131,20 @@ def evaluations(dataset: str) -> list[Evaluation]:
 - **`Pipeline`**: functions, config, format. Its id is the declaration; `name` is a label. Any module-level function fills a slot; a lambda, closure or method is refused. A config is a frozen dataclass in a module `fit` imports, so an edited default refits. `with_config` and `named` make variants.
 - **`Evaluation`**: dataset, split, scorer, config; `evaluations(dataset_id)` returns the list every pipeline is scored under. A split is a frozen dataclass with `folds(dataset)` returning contiguous row ranges, so the ingest order is the split's design: shuffled rows make `BlockedKFold` a random k-fold, interleaved by class a stratified one. The folds are recorded with the evaluation and a split whose code moved them is refused.
 
+## Evaluations and splits
+
+An evaluation is a split and a scorer over one dataset. The split turns the dataset into folds, and a fold is a set of train row segments plus one or more named windows. For each fold the tool fits on the train segments, predicts each window with that fit, and scores the window's predictions against the real labels. Every scored prediction is out of sample for the fit that made it: a window never overlaps its fold's train segments (the tool refuses a split where one does), the fit never saw the window's labels, and the labels the scorer uses are the real ones. The example's `WalkForward(first_cutoff_rows=2000, step_rows=1000, window_rows=1000)` gives:
+
+| fold | trains on | scores window `test` |
+|---|---|---|
+| row 2000 | rows 0 to 2000 | rows 2000 to 3000 |
+| row 3000 | rows 0 to 3000 | rows 3000 to 4000 |
+| row 4000 | rows 0 to 4000 | rows 4000 to 5000 |
+
+`BlockedKFold(k=5)` makes five folds, each scoring one block with the other four as train segments; `Holdout(0.8)` is one fold; `CalendarWalkForward(first_cutoff="2021-05-04", horizons=(1, 2, 3))` cuts on the clock and names three windows per fold, the first, second and third month after each cutoff, so a model is scored at three ages from one fit. An embargo (`embargo_rows` or `embargo_timestamps`) drops rows between the train segments and the window, which matters once a feature or a label reaches forward in time.
+
+The scorer runs once per (fold, window): `metrics` over the fold's series gives the per-fold numbers, averaged into `fold_mean` with `fold_std` across folds, and `metrics` over the windows concatenated gives the pooled `value`. One fit serves every fold that shares its train range, so three horizons cost one fit per cutoff, and a second evaluation on the same cutoffs (another scorer, another cost setting) costs no fits at all.
+
 Growing it:
 
 - `features(dataset) -> {name: array}`: columns computed once per dataset, shared by every pipeline declaring the function, read via `dataset.feature_columns`; probed on five prefixes.
