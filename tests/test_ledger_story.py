@@ -1,6 +1,7 @@
 """The ledger story on synthetic data: ingest, declare, run, read back with SQL.
 
-Mirrors docs/user-stories.md; every event type in docs/spec.md is written and read back.
+Every event type in docs/spec.md is written and read back; what each step refuses is
+pinned here.
 """
 
 from __future__ import annotations

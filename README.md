@@ -2,7 +2,7 @@
 
 A local-first record of experimentation on frozen, time-ordered datasets. Git owns the code, a content-addressed blob store owns the bytes, an append-only event log owns what happened. Declare pipelines and evaluations, run them memoized on code, data and environment identity, and read the results with SQL.
 
-- Design: [docs/spec.md](docs/spec.md); concrete walkthroughs: [docs/user-stories.md](docs/user-stories.md)
+- The log: [docs/spec.md](docs/spec.md), the event and view tables, blob formats, declined designs and what is deferred
 - Landscape survey and build-versus-buy verdict: [reports/Forestry MLOps landscape survey.md](reports/Forestry%20MLOps%20landscape%20survey.md), notes under `research_notes/`
 
 ## Try it
