@@ -1,8 +1,8 @@
 """Datasets: columns over rows in a fixed order, recorded once and loaded back.
 
 A ``Dataset`` is a table held resident, read by row ranges, with a clock lookup when
-``ts`` is given. A recorded dataset is the rows of one (source, params, window) passed
-through filter functions, with named target columns. Its id is the data: the ``ts``
+``ts`` is given. A recorded dataset is the rows of one (source, params), cleaned by the
+caller before ``record``, with named target columns. Its id is the data: the ``ts``
 bytes, column names, dtypes and values, so a loader fix that changes rows is a new
 dataset and an edit that changes nothing is not. The recipe rides on the event as
 provenance; the bytes are Parquet.
@@ -14,8 +14,7 @@ Examples
 >>> d = Dataset({"x": np.array([1.0, 2.0])}, ts)
 >>> d.index_of("2025-01-02")
 1
->>> dataset_id = record(ledger, d, source="toy", params={},
-...                     filters=(), targets=("x",))  # doctest: +SKIP
+>>> dataset_id = record(ledger, d, source="toy", targets=("x",))  # doctest: +SKIP
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ from __future__ import annotations
 import datetime
 import io
 import pathlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -42,7 +41,7 @@ Lag = np.timedelta64 | int | None
 
 class Dataset:
     """Columns over rows in a fixed order, with date lookups when ``ts`` is given.
-    ``feature_columns`` names the columns a pipeline's features functions added, in
+    ``computed_columns`` names the columns a pipeline's features functions added, in
     order; they are not in ``columns`` but read on demand from the Parquet file in
     ``stores`` through ``column`` and ``matrix``, so a column no function names costs
     no memory.
@@ -52,14 +51,14 @@ class Dataset:
         self,
         columns: dict[str, np.ndarray],
         ts: np.ndarray | None = None,
-        feature_columns: tuple[str, ...] = (),
+        computed_columns: tuple[str, ...] = (),
         stores: dict[str, pathlib.Path] | None = None,
     ):
         self.columns = {
             n: a.astype("datetime64[ns]", copy=False) if a.dtype.kind == "M" else a
             for n, a in columns.items()
         }
-        self.feature_columns = feature_columns
+        self.computed_columns = computed_columns
         self.stores = stores or {}
         self.cut: int | None = None
         self.keep: np.ndarray | None = None
@@ -93,7 +92,7 @@ class Dataset:
         view = Dataset.__new__(Dataset)
         view.columns = {k: v[:row] for k, v in self.columns.items()}
         view.ts = None if self.ts is None else self.ts[:row]
-        view.feature_columns = self.feature_columns
+        view.computed_columns = self.computed_columns
         view.stores = self.stores
         view.cut = min(row, self.rows)
         view.keep = None if self.keep is None else self.keep[:row]
@@ -122,7 +121,7 @@ class Dataset:
         return view
 
     def train_view(self, train: Segments) -> Dataset:
-        """The view a fit sees: every column, feature columns included, blank outside
+        """The view a fit sees: every column, computed columns included, blank outside
         ``train``, so a fit reads no row of a range it is scored on. A blank is NaN, NaT
         or None by dtype; an integer or boolean column becomes float.
         """
@@ -160,11 +159,12 @@ class Dataset:
         first = np.unique(stamps, return_index=True)[1]
         return lo + int(first[len(first) // 2])
 
-    def matrix(self, rows: Rows, cols: tuple[str, ...]) -> np.ndarray:
-        """Column-stacked features over a range or segments, shape (rows, len(cols)),
-        filled one column at a time so the matrix is the only copy.
+    def matrix(self, cols: Sequence[str], rows: Rows | None = None) -> np.ndarray:
+        """Column-stacked features over a range or segments, every visible row when
+        ``rows`` is None, shape (rows, len(cols)), filled one column at a time so the
+        matrix is the only copy.
         """
-        parts = segments(rows)
+        parts = segments((0, self.rows) if rows is None else rows)
         first = self.column(cols[0], parts)
         dtype = np.result_type(first, *(self._dtype(c) for c in cols[1:]))
         out = np.empty((len(first), len(cols)), dtype)
@@ -173,8 +173,11 @@ class Dataset:
             out[:, j] = self.column(name, parts)
         return out
 
-    def column(self, name: str, rows: Rows) -> np.ndarray:
-        parts = segments(rows)
+    def column(self, name: str, rows: Rows | None = None) -> np.ndarray:
+        """One column over a range or segments, every visible row when ``rows`` is
+        None.
+        """
+        parts = segments((0, self.rows) if rows is None else rows)
         for lo, hi in parts:
             if lo < 0 or hi < lo:
                 raise ValueError(f"segment ({lo}, {hi}) asked; one needs 0 <= lo <= hi")
@@ -189,7 +192,7 @@ class Dataset:
         if name not in self.stores:
             raise KeyError(
                 f"{name!r} is not a column: dataset columns {sorted(self.columns)}, "
-                f"feature columns {list(self.feature_columns)}"
+                f"computed columns {list(self.computed_columns)}"
             )
         scan = pl.scan_parquet(self.stores[name]).select(name)
         values = np.concatenate(
@@ -227,6 +230,22 @@ def row_mask(size: int, rows: Rows) -> np.ndarray:
     return mask
 
 
+def stratified_order(y: np.ndarray, seed: int = 0) -> np.ndarray:
+    """A row permutation that shuffles each class and interleaves the classes in
+    proportion, so every contiguous block of the reordered rows holds each class in
+    its share: rows sort by rank within their class over the class size, ties by
+    class. Reorder the rows before ``record`` and a ``BlockedKFold`` is stratified.
+    """
+    classes = np.unique(y, return_inverse=True)[1]
+    shuffled = np.random.default_rng(seed).permutation(len(classes))
+    owner = classes[shuffled]
+    by_class = np.argsort(owner, kind="stable")
+    grouped = owner[by_class]
+    rank = np.empty(len(owner))
+    rank[by_class] = np.arange(len(owner)) - np.searchsorted(grouped, grouped)
+    return shuffled[np.lexsort((owner, rank / np.bincount(owner)[owner]))]
+
+
 def _blank(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
     """A copy of ``values`` blank where ``keep`` is False."""
     kind = values.dtype.kind
@@ -245,22 +264,22 @@ def record(
     dataset: Dataset,
     *,
     source: str,
-    params: Mapping[str, Any],
-    filters: Sequence[Callable],
     targets: Sequence[str],
+    params: Mapping[str, Any] | None = None,
     reveal: Mapping[str, datetime.timedelta | np.timedelta64 | int] | None = None,
     sealed_from: int | str | None = None,
 ) -> str:
-    """Apply the filters, check the targets, store the rows; returns the dataset id.
+    """Check the targets and store the rows; returns the dataset id.
 
-    ``reveal`` maps a target to when its label is known: a ``timedelta`` or
-    ``numpy.timedelta64`` after its row's timestamp, or an ``int`` of later dates with
-    rows (``1`` is the next trading day's open, ``2`` two trading dates later whatever
-    the calendar gap). A features function may read a revealed target, probed against
-    that lag. ``sealed_from``, a row or a date (its first row at or after it), starts
-    the sealed tail that only an ``Evaluation(sealed=True)`` validates on, each pipeline
-    once. Targets, their lags and the sealed tail's first row are part of the dataset
-    id.
+    ``source`` and ``params`` name how the rows were made, cleaning included, so clean
+    before ``record`` and name the cleaning in ``params``. ``reveal`` maps a target to
+    when its label is known: a ``timedelta`` or ``numpy.timedelta64`` after its row's
+    timestamp, or an ``int`` of later dates with rows (``1`` is the next trading day's
+    open, ``2`` two trading dates later whatever the calendar gap). A features function
+    may read a revealed target, probed against that lag. ``sealed_from``, a row or a
+    date (its first row at or after it), starts the sealed tail that only an
+    ``Evaluation(sealed=True)`` validates on, each pipeline once. Targets, their lags
+    and the sealed tail's first row are part of the dataset id.
     """
     if not targets:
         raise Refused(
@@ -278,15 +297,7 @@ def record(
         )
     labels = {t: _lag(reveal[t]) if t in reveal else None for t in targets}
     window = [str(d) for d in dates.span(dataset)] if has_clock else None
-    recipe = {
-        "source": source,
-        "params": params,
-        "window": window,
-        "filters": list(filters),
-        "targets": labels,
-    }
-    for filt in filters:
-        dataset = filt(dataset)
+    recipe = {"source": source, "params": params or {}, "targets": labels}
     missing = [t for t in targets if t not in dataset.columns]
     if missing:
         raise KeyError(f"targets not in dataset: {missing}")
@@ -374,6 +385,21 @@ def data_id(
     return identity.content_hash(
         {"ts": ts, "columns": columns, "targets": targets, **sealed}
     )
+
+
+def resolve(ledger: Ledger, prefix: str) -> str:
+    """The one recorded dataset id starting with ``prefix``; none or several are
+    refused, naming the matches.
+    """
+    rows = ledger.sql("SELECT id FROM event_dataset ORDER BY seq")
+    matches = [r["id"] for r in rows if r["id"].startswith(prefix)]
+    if len(matches) != 1:
+        hint = "pass a longer prefix: " + ", ".join(matches)
+        raise Refused(
+            f"dataset {prefix}: {len(matches)} matches in {ledger.root.resolve()}; "
+            f"{hint if matches else 'lab ingest first'}"
+        )
+    return matches[0]
 
 
 def load(ledger: Ledger, dataset_id: str) -> Dataset:

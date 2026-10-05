@@ -9,7 +9,7 @@ changes are caught by the fit memo, not by hashing files.
 
 Examples
 --------
->>> Pipeline(fit, predict, save, load, config, "arrow-arrays")  # doctest: +SKIP
+>>> Pipeline(fit, predict, save, load, "arrow-arrays", params)  # doctest: +SKIP
 >>> Scorer(squared_error, metrics=mean, directions={"mse": "min"})  # doctest: +SKIP
 """
 
@@ -24,21 +24,21 @@ from ml_lab import identity
 
 @dataclasses.dataclass(frozen=True)
 class Scorer:
-    """``score(pred, dataset, range, config) -> series`` with the code that reads its
-    series.
+    """``series(pred, dataset, rows, scorer_params) -> series`` with the code that
+    reads its series.
 
-    The series is a 1-D or 2-D array with one row per scoring unit: a prediction, or a
-    day for a cross-sectional metric. ``metrics`` defines the unit; it runs per fold
-    and over the concatenated folds, and the pooled value equals the row-weighted fold
-    mean only for a metric that adds over rows. It reruns on the stored series alone,
-    so the series carries what it needs. Only ``score`` enters the evaluation id;
-    ``metrics`` and ``directions`` are code under the memo, and each score records the
-    directions it was scored under.
+    The series is a 1-D or 2-D array with one row per row of the test range; a series
+    of another length is refused. ``metrics`` runs per fold and over the concatenated
+    folds, and the pooled value equals the row-weighted fold mean only for a metric
+    that adds over rows. It reruns on the stored series alone, so the series carries
+    what it needs. Only ``series`` enters the evaluation id; ``metrics`` and
+    ``directions`` are code under the memo, and each score records the directions it
+    was scored under.
 
     Parameters
     ----------
-    score : Callable
-        ``score(pred, dataset, range, config) -> series``.
+    series : Callable
+        ``series(pred, dataset, rows, scorer_params) -> series``.
     metrics : Callable
         ``metrics(series) -> dict``; applied per fold and over the concatenated folds.
     directions : dict[str, str]
@@ -48,7 +48,7 @@ class Scorer:
         scorer's code; ``"0"``, ``"1"``, ... when absent. A count mismatch is refused.
     """
 
-    score: Callable
+    series: Callable
     metrics: Callable = dataclasses.field(metadata={"label": True})
     directions: dict[str, str] = dataclasses.field(metadata={"label": True})
     columns: tuple[str, ...] = dataclasses.field(default=(), metadata={"label": True})
@@ -76,26 +76,26 @@ class Pipeline:
     one column per array; a tuple of functions adds each function's columns in order,
     every one memoized, probed and shared on its own, and their names must not collide.
     The added columns are read through ``dataset.column`` and ``dataset.matrix`` by the
-    names in ``dataset.feature_columns``; they are not in ``dataset.columns``, and a
+    names in ``dataset.computed_columns``; they are not in ``dataset.columns``, and a
     column no function reads is never loaded, so a learned selection lives in ``fit``
-    and costs only the columns it keeps. ``postprocess(predictions, dataset, range,
-    postprocess_config)`` is the cheap stateless stage after ``predict``: neutralise,
-    clip, rank. Its config enters the prediction's identity and not the fit's. A
-    pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a fourth
-    argument, the members' predictions as a list of arrays, over the fold's test range
-    for ``predict`` and, only when ``in_sample=True``, over the train segments for
-    ``fit``. Those are in-sample, so a weight learned on them overfits; a blend with
-    fixed weights leaves ``in_sample`` off and computes no train-range predictions, and
-    a ``fit`` whose arity disagrees with ``in_sample`` is refused before anything runs.
-    A blend without its own ``features`` sees its members' feature columns when every
-    member declares the same functions. The members' fits and predictions are memoized
-    on their own.
+    and costs only the columns it keeps. ``fit(dataset, train, params)`` receives
+    ``params``, ``predict(model, dataset, rows)`` the fold's test range.
+    ``postprocess(predictions, dataset, rows, postprocess_config)`` is the cheap
+    stateless stage after ``predict``: neutralise, clip, rank. Its config enters the
+    prediction's identity and not the fit's. A pipeline with ``members`` is a blend:
+    its ``predict`` takes a fourth argument, the members' predictions over the test
+    range as a list of arrays, and a ``fit`` with four positional parameters receives
+    the members' predictions over the train segments as its fourth. Those are
+    in-sample, so a weight learned on them overfits; a blend with fixed weights takes
+    three and computes no train-segment predictions. A blend without its own
+    ``features`` sees its members' computed columns when every member declares the
+    same functions. The members' fits and predictions are memoized on their own.
 
     Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip,
     postprocess_config=Clip(at=3.0), name="gbt_clip")`` shares every fit and raw
     prediction with ``p``, since the fit id reads ``fit_declaration`` and the raw
-    prediction id excludes ``postprocess``. A config class must live in a module its
-    function imports (``config`` beside ``fit``, ``postprocess_config`` beside
+    prediction id excludes ``postprocess``. A params class must live in a module its
+    function imports (``params`` beside ``fit``, ``postprocess_config`` beside
     ``postprocess``), so an edited default is caught by the memo.
     """
 
@@ -103,13 +103,12 @@ class Pipeline:
     predict: Callable
     save: Callable
     load: Callable
-    config: Any
     format: str
+    params: Any = None
     features: Callable | tuple[Callable, ...] | None = None
     postprocess: Callable | None = None
     postprocess_config: Any = None
     members: tuple[Pipeline, ...] = ()
-    in_sample: bool = False
     name: str = dataclasses.field(default="", metadata={"label": True})
 
     def __post_init__(self):
@@ -144,20 +143,20 @@ class Pipeline:
     @property
     def fit_declaration(self) -> dict[str, Any]:
         """What a fit depends on: the fit, save and load functions, the format and the
-        config.
+        params.
         """
         return {
             "fit": self.fit,
             "save": self.save,
             "load": self.load,
             "format": self.format,
-            "config": self.config,
+            "params": self.params,
         }
 
-    def with_config(self, **changes: Any) -> Pipeline:
-        """A copy with config fields replaced."""
+    def with_params(self, **changes: Any) -> Pipeline:
+        """A copy with params fields replaced."""
         return dataclasses.replace(
-            self, config=dataclasses.replace(self.config, **changes)
+            self, params=dataclasses.replace(self.params, **changes)
         )
 
     def named(self, name: str) -> Pipeline:
@@ -167,18 +166,19 @@ class Pipeline:
 @dataclasses.dataclass(frozen=True)
 class Evaluation:
     """How every pipeline on a dataset is scored: a split into folds, a scorer and its
-    config. Splits live in ``ml_lab.splits``; any frozen dataclass with
-    ``folds(dataset) -> list[Fold]`` works. ``name`` is a label. A sweep is a list of
-    ``dataclasses.replace(base, config=SimConfig(t), name=f"cost{t}")``; the scorer's
-    config class must live in a module the scorer imports. Only a ``sealed``
+    params. ``dataset_id`` may be a prefix of the id, resolved at run as ``lab run
+    --dataset`` resolves one. Splits live in ``ml_lab.splits``; any frozen dataclass
+    with ``folds(dataset) -> list[Fold]`` works. ``name`` is a label. A sweep is a list
+    of ``dataclasses.replace(base, scorer_params=SimParams(t), name=f"cost{t}")``; the
+    scorer's params class must live in a module the scorer imports. Only a ``sealed``
     evaluation validates on the dataset's sealed tail (``record(sealed_from=...)``),
     and it scores each pipeline once.
     """
 
-    dataset: str
+    dataset_id: str
     split: Any
     scorer: Scorer
-    config: Any = None
+    scorer_params: Any = None
     sealed: bool = False
     name: str = dataclasses.field(default="", metadata={"label": True})
 

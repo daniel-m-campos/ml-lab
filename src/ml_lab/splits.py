@@ -1,8 +1,8 @@
 """Splits: how a dataset becomes folds. Row-based splits need no clock; with one,
-every cut lands on the first row of its timestamp. An embargo edge is a count of rows
-from a cut and does not snap, so ``embargo_rows`` can end a train segment inside a
-timestamp; the calendar walk-forward reads the dataset's ``ts`` and embargoes whole
-timestamps.
+every cut lands on the first row of its timestamp, and with a ``group`` column first on
+the first row of its group. An embargo edge is a count of rows from a cut and does not
+snap, so ``embargo_rows`` can end a train segment inside a timestamp; the calendar
+walk-forward reads the dataset's ``ts`` and embargoes whole timestamps.
 
 A fold trains on contiguous segments and scores one validation range. A splitter is a
 frozen dataclass, so it hashes into the evaluation id like any declaration, and a
@@ -10,9 +10,9 @@ project can declare its own next to its functions.
 
 Examples
 --------
->>> WalkForward(1000, 500, window_rows=500).folds(dataset)[1].test  # doctest: +SKIP
+>>> WalkForward(1000, 500, test_rows=500).folds(dataset)[1].test  # doctest: +SKIP
 (1500, 2000)
->>> BlockedKFold(k=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
+>>> BlockedKFold(n_splits=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
 'block 2'
 """
 
@@ -38,48 +38,62 @@ class Fold:
 @dataclasses.dataclass(frozen=True)
 class WalkForward:
     """Cutoffs every ``step_rows`` from ``first_cutoff_rows``; train on every row before
-    each, minus ``embargo_rows``, and score the ``window_rows`` after it.
+    each, or on the last ``max_train_rows`` of them, and score the ``horizon``-th block
+    of ``test_rows`` after it, so ``horizon=1`` scores the ``test_rows`` right after the
+    cutoff. ``embargo_rows`` cuts the train side: it drops the rows just before the
+    cutoff from train.
     """
 
     first_cutoff_rows: int
     step_rows: int
-    window_rows: int
+    test_rows: int
     embargo_rows: int = 0
+    horizon: int = 1
+    max_train_rows: int | None = None
     min_folds: int = 3
 
     def folds(self, dataset: Dataset) -> list[Fold]:
         _require(
             step_rows=(self.step_rows, 1),
-            window_rows=(self.window_rows, 1),
+            test_rows=(self.test_rows, 1),
             embargo_rows=(self.embargo_rows, 0),
+            horizon=(self.horizon, 1),
+            max_train_rows=(
+                1 if self.max_train_rows is None else self.max_train_rows,
+                1,
+            ),
         )
         out: list[Fold] = []
         cutoff = self.first_cutoff_rows
-        while cutoff + self.window_rows <= dataset.rows:
-            train = ((0, _snap(dataset, max(cutoff - self.embargo_rows, 0))),)
-            test = (_snap(dataset, cutoff), _snap(dataset, cutoff + self.window_rows))
-            out.append(Fold(f"row {cutoff}", train, test))
+        while cutoff + self.horizon * self.test_rows <= dataset.rows:
+            end = _snap(dataset, max(cutoff - self.embargo_rows, 0))
+            start = (
+                0 if self.max_train_rows is None else max(end - self.max_train_rows, 0)
+            )
+            last = cutoff + self.horizon * self.test_rows
+            test = (_snap(dataset, last - self.test_rows), _snap(dataset, last))
+            out.append(Fold(f"row {cutoff}", ((start, end),), test))
             cutoff += self.step_rows
         return _at_least(out, self.min_folds)
 
 
 @dataclasses.dataclass(frozen=True)
 class CalendarWalkForward:
-    """Cutoffs on the dataset clock every ``every`` units, a unit being a calendar
-    month or a day the clock has rows on; train on everything before each cutoff
-    minus ``embargo_timestamps`` distinct timestamps, and score the ``horizon``-th
-    run of ``window`` units after it, so ``horizon=1`` scores the ``window`` units
-    right after the cutoff. A validation range ends on a unit boundary at or before
-    ``end`` (the day after the data when ``end`` is not given); the boundary after the
-    last day is ``end`` itself, so the last trading day is scored. Folds that reach
-    past ``end`` are dropped, never cut, so a test period at the end of the data stays
-    unscored.
+    """Cutoffs on the dataset clock every ``step`` units, a unit being a calendar month
+    or a day the clock has rows on; train on everything before each cutoff minus
+    ``embargo_timestamps`` distinct timestamps, which cuts the train side, and score the
+    ``horizon``-th run of ``test_units`` units after it, so ``horizon=1`` scores the
+    ``test_units`` units right after the cutoff. A validation range ends on a unit
+    boundary at or before ``end`` (the day after the data when ``end`` is not given);
+    the boundary after the last day is ``end`` itself, so the last trading day is
+    scored. Folds that reach past ``end`` are dropped, never cut, so a test period at
+    the end of the data stays unscored.
     """
 
     first_cutoff: str
     unit: str = "month"
-    every: int = 1
-    window: int = 1
+    step: int = 1
+    test_units: int = 1
     horizon: int = 1
     embargo_timestamps: int = 0
     end: str | None = None
@@ -87,22 +101,22 @@ class CalendarWalkForward:
 
     def folds(self, dataset: Dataset) -> list[Fold]:
         _require(
-            every=(self.every, 1),
-            window=(self.window, 1),
+            step=(self.step, 1),
+            test_units=(self.test_units, 1),
             embargo_timestamps=(self.embargo_timestamps, 0),
             horizon=(self.horizon, 1),
         )
         stop = dates.as_date(self.end) if self.end else dates.span(dataset)[1]
         at = self._boundaries(dataset, stop)
-        reach = self.horizon * self.window
+        reach = self.horizon * self.test_units
         out: list[Fold] = []
-        for c in range(0, len(at) - reach, self.every):
+        for c in range(0, len(at) - reach, self.step):
             cut = dataset.index_of(at[c])
             for _ in range(self.embargo_timestamps):
                 if cut:
                     cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
             test = (
-                dataset.index_of(at[c + reach - self.window]),
+                dataset.index_of(at[c + reach - self.test_units]),
                 dataset.index_of(at[c + reach]),
             )
             out.append(Fold(str(at[c]), ((0, cut),), test))
@@ -134,21 +148,28 @@ class CalendarWalkForward:
 
 @dataclasses.dataclass(frozen=True)
 class BlockedKFold:
-    """``k`` contiguous blocks over the first ``train_fraction`` of rows, the rows
-    ``Holdout(train_fraction)`` trains on; each is scored once with the rest as
-    train, minus ``embargo_rows`` on either side of it.
+    """``n_splits`` contiguous blocks over the first ``train_size`` of rows, the rows
+    ``Holdout(train_size)`` trains on; each is scored once with the rest as train.
+    ``embargo_rows`` cuts the train side: it drops that many train rows on either side
+    of the scored block. With ``group``, a column whose groups are contiguous, every
+    cut moves to the first row of its group, so no group is split.
     """
 
-    k: int
+    n_splits: int
     embargo_rows: int = 0
-    train_fraction: float = 1.0
+    train_size: float = 1.0
+    group: str | None = None
 
     def folds(self, dataset: Dataset) -> list[Fold]:
-        _require(k=(self.k, 2), embargo_rows=(self.embargo_rows, 0))
-        n = _snap(dataset, round(dataset.rows * self.train_fraction))
-        bounds = [_snap(dataset, round(i * n / self.k)) for i in range(self.k + 1)]
+        _require(n_splits=(self.n_splits, 2), embargo_rows=(self.embargo_rows, 0))
+        starts = _group_starts(dataset, self.group)
+        n = _snap(dataset, round(dataset.rows * self.train_size), starts)
+        bounds = [
+            _snap(dataset, round(i * n / self.n_splits), starts)
+            for i in range(self.n_splits + 1)
+        ]
         out = []
-        for i in range(self.k):
+        for i in range(self.n_splits):
             lo, hi = bounds[i], bounds[i + 1]
             train = tuple(
                 seg
@@ -161,26 +182,55 @@ class BlockedKFold:
 
 @dataclasses.dataclass(frozen=True)
 class Holdout:
-    """One fold: the first ``train_fraction`` of rows train, the rest after
-    ``embargo_rows`` is scored.
+    """One fold: the first ``train_size`` of rows train and the rest is scored.
+    ``embargo_rows`` cuts the test side: it drops that many rows after the cut from
+    the scored range. With ``group``, a column whose groups are contiguous, the cut
+    moves to the first row of its group.
     """
 
-    train_fraction: float = 0.7
+    train_size: float = 0.7
     embargo_rows: int = 0
+    group: str | None = None
 
     def folds(self, dataset: Dataset) -> list[Fold]:
         _require(embargo_rows=(self.embargo_rows, 0))
         n = dataset.rows
-        cut = _snap(dataset, round(n * self.train_fraction))
+        cut = _snap(
+            dataset, round(n * self.train_size), _group_starts(dataset, self.group)
+        )
         test = (min(cut + self.embargo_rows, n), n)
         return _at_least([Fold("holdout", ((0, cut),), test)], 1)
 
 
-def _snap(dataset: Dataset, row: int) -> int:
-    """The first row of ``row``'s timestamp, so a cut never splits a cross-section."""
-    if dataset.ts is None or not 0 < row < dataset.rows:
+def _snap(dataset: Dataset, row: int, groups: np.ndarray | None = None) -> int:
+    """The first row of ``row``'s group, when ``groups`` holds the groups' first rows,
+    then of its timestamp, so a cut never splits a group or a cross-section.
+    """
+    if not 0 < row < dataset.rows:
+        return row
+    if groups is not None:
+        row = int(groups[np.searchsorted(groups, row, "right") - 1])
+    if dataset.ts is None:
         return row
     return int(np.searchsorted(dataset.ts, dataset.ts[row], "left"))
+
+
+def _group_starts(dataset: Dataset, group: str | None) -> np.ndarray | None:
+    """The first row of each run of equal values in the ``group`` column; a group that
+    recurs after another is refused, naming the row.
+    """
+    if group is None:
+        return None
+    values = dataset.column(group)
+    starts = np.r_[0, np.flatnonzero(values[1:] != values[:-1]) + 1]
+    first = np.unique(values[starts], return_index=True)[1]
+    if len(first) < len(starts):
+        again = starts[np.setdiff1d(np.arange(len(starts)), first)[0]]
+        raise Refused(
+            f"group {group}={values[again]} recurs at row {again} after another "
+            "group; sort the rows so each group is contiguous"
+        )
+    return starts
 
 
 def _require(**fields: tuple[int, int]):

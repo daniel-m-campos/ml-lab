@@ -49,7 +49,7 @@ CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # Declarations =========================================================================
 
 
-def step_ref(func: Callable) -> str:
+def function_ref(func: Callable) -> str:
     """The ``module:qualname`` of a module-level function; refused for a callable its
     module does not hold under that name: a lambda, a closure, a method, a partial.
     """
@@ -70,7 +70,7 @@ def canonical(obj: Any) -> Any:
     if isinstance(obj, (np.integer, np.floating, np.bool_)):
         return obj.item()
     if callable(obj):
-        return {"__function__": step_ref(obj)}
+        return {"__function__": function_ref(obj)}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
         module = sys.modules.get(type(obj).__module__)
         sourced = str(getattr(module, "__file__", "")).endswith(".py")

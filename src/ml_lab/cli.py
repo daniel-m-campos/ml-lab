@@ -1,7 +1,7 @@
 """``lab``: the command line over the log, two verbs; reading is SQL over the views.
 
 Declarations are plain module attributes, so a project may organize them freely: one
-script, or ``dataset.py`` + ``steps.py`` + ``experiment.py``, or one file per idea.
+script, or ``dataset.py`` + ``functions.py`` + ``experiment.py``, or a file per idea.
 ``lab ingest`` reads ``dataset(ledger, *args)`` from a module. ``lab run`` takes one or
 more modules, reads ``pipelines`` (a list of ``Pipeline``) from each and
 ``evaluations`` (a list of ``Evaluation``, or a function of the dataset id returning
@@ -12,9 +12,9 @@ declares the evaluations; the modules themselves join no id, so adding a pipelin
 one refits nothing else. A module is a dotted name importable from the current
 directory or a ``.py`` path, imported without writing bytecode. The dataset defaults
 to the newest one recorded when the ledger holds one source. The ledger root comes
-from ``--root`` or ``ML_LAB_ROOT`` (default ``.ml-lab``); only ``lab ingest`` creates
-one, ``lab run`` refuses a root without a ledger. The actor comes from
-``ML_LAB_ACTOR``; both verbs refuse it unset.
+from ``--root``, before or after the verb, or ``ML_LAB_ROOT`` (default ``.ml-lab``);
+only ``lab ingest`` creates one, and ``lab run`` refuses a root without a ledger. The
+actor comes from ``ML_LAB_ACTOR``; both verbs refuse it unset.
 
 Examples
 --------
@@ -34,7 +34,7 @@ import pathlib
 import sys
 from typing import Any
 
-from ml_lab import identity, runs
+from ml_lab import dataset, identity, runs
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.ledger import Ledger, Refused, actor
 
@@ -44,16 +44,22 @@ DEFAULT_ROOT = ".ml-lab"
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="lab")
     parser.add_argument("--root", default=os.environ.get("ML_LAB_ROOT", DEFAULT_ROOT))
+    rooted = argparse.ArgumentParser(add_help=False)
+    rooted.add_argument("--root", default=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser(
-        "ingest", help="call the module's dataset(ledger, *args); prints the id"
+        "ingest",
+        parents=[rooted],
+        help="call the module's dataset(ledger, *args); prints the id",
     )
     p.add_argument("module", help="module name or .py path exposing dataset()")
     p.add_argument("args", nargs="*")
     p.set_defaults(handler=_ingest)
 
-    p = sub.add_parser("run", help="fit, predict and score every declared pipeline")
+    p = sub.add_parser(
+        "run", parents=[rooted], help="fit, predict and score every declared pipeline"
+    )
     p.add_argument(
         "experiments", nargs="+", help="modules or .py paths exposing pipelines"
     )
@@ -90,10 +96,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
-    dataset = getattr(_load(args.module), "dataset", None)
-    if dataset is None:
+    ingest = getattr(_load(args.module), "dataset", None)
+    if ingest is None:
         raise Refused(f"{args.module} declares no dataset(ledger, *args)")
-    print(dataset(ledger, *args.args))
+    print(ingest(ledger, *args.args))
     return 0
 
 
@@ -186,15 +192,18 @@ def _experiments(
     evaluations = found[0]
     if callable(evaluations):
         evaluations = evaluations(_dataset(ledger, args.dataset))
-    elif args.dataset:
+    evaluations = [
+        dataclasses.replace(e, dataset_id=dataset.resolve(ledger, e.dataset_id))
+        for e in evaluations
+    ]
+    if args.dataset and not callable(found[0]):
         chosen = _dataset(ledger, args.dataset)
-        off = [e.name or e.id for e in evaluations if e.dataset != chosen]
+        off = [e.name or e.id for e in evaluations if e.dataset_id != chosen]
         if off:
             raise Refused(
                 f"evaluations {off} are declared on another dataset than --dataset "
                 f"{args.dataset} ({chosen[:8]}); a list of evaluations fixes its own"
             )
-    evaluations = list(evaluations)
     names, ids = {e.name or e.id for e in evaluations}, {e.id for e in evaluations}
     if not (evaluations and len(names) == len(ids) == len(evaluations)):
         raise Refused(
@@ -223,14 +232,7 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
     if selector in by_source:
         return by_source[selector]
     if selector:
-        matches = [r["id"] for r in rows if r["id"].startswith(selector)]
-        if len(matches) != 1:
-            hint = "pass a longer prefix: " + ", ".join(matches)
-            raise Refused(
-                f"dataset {selector}: {len(matches)} matches in "
-                f"{ledger.root.resolve()}; {hint if matches else 'lab ingest first'}"
-            )
-        return matches[0]
+        return dataset.resolve(ledger, selector)
     if len(by_source) > 1:
         choices = ", ".join(f"{s} ({i[:8]})" for s, i in by_source.items())
         raise Refused(f"ledger holds several sources, pass --dataset: {choices}")

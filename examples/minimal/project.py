@@ -31,24 +31,23 @@ def dataset(ledger: Ledger, rows: str = "5000") -> str:
         Dataset({"x": x, "y": y}),
         source="toy",
         params={"rows": rows},
-        filters=(),
         targets=("y",),
     )
 
 
 @dataclasses.dataclass(frozen=True)
-class RidgeConfig:
+class RidgeParams:
     alpha: float = 1.0
 
 
-def ridge_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> np.ndarray:
+def ridge_fit(dataset: Dataset, train: Segments, params: RidgeParams) -> np.ndarray:
     x = dataset.column("x", train)
     y = dataset.column("y", train)
-    return np.array([x @ y / (x @ x + config.alpha)])
+    return np.array([x @ y / (x @ x + params.alpha)])
 
 
-def ridge_predict(model: np.ndarray, dataset: Dataset, rng: Range) -> np.ndarray:
-    return model[0] * dataset.column("x", rng)
+def ridge_predict(model: np.ndarray, dataset: Dataset, rows: Range) -> np.ndarray:
+    return model[0] * dataset.column("x", rows)
 
 
 def ridge_save(model: np.ndarray) -> bytes:
@@ -59,8 +58,10 @@ def ridge_load(payload: bytes) -> np.ndarray:
     return formats.arrays_load(payload)["slope"]
 
 
-def squared_error(pred: np.ndarray, dataset: Dataset, rng: Range, config) -> np.ndarray:
-    return (pred - dataset.column("y", rng)) ** 2
+def squared_error(
+    pred: np.ndarray, dataset: Dataset, rows: Range, params
+) -> np.ndarray:
+    return (pred - dataset.column("y", rows)) ** 2
 
 
 mse = Scorer(
@@ -76,18 +77,18 @@ ridge = Pipeline(
     predict=ridge_predict,
     save=ridge_save,
     load=ridge_load,
-    config=RidgeConfig(),
     format=formats.Format.ARROW_ARRAYS,
+    params=RidgeParams(),
 )
-pipelines = [ridge, ridge.with_config(alpha=100.0).named("ridge_shrunk")]
+pipelines = [ridge, ridge.with_params(alpha=100.0).named("ridge_shrunk")]
 
 
 def evaluations(dataset: str) -> list[Evaluation]:
     return [
         Evaluation(
             name="validation",
-            dataset=dataset,
-            split=WalkForward(first_cutoff_rows=2000, step_rows=1000, window_rows=1000),
+            dataset_id=dataset,
+            split=WalkForward(first_cutoff_rows=2000, step_rows=1000, test_rows=1000),
             scorer=mse,
         )
     ]

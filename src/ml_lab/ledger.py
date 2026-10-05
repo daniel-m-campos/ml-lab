@@ -66,7 +66,7 @@ CREATE VIEW event_dataset AS SELECT seq, id, at, actor,
 FROM event WHERE type='dataset_recorded';
 
 CREATE VIEW event_pipeline AS SELECT seq, key AS id, at, actor,
-  json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,
+  json_extract(payload,'$.name') AS name, json_extract(payload,'$.params') AS params,
   json_extract(payload,'$.declaration') AS declaration
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
       FROM event WHERE type='pipeline_declared') WHERE rn = 1;
@@ -75,7 +75,7 @@ CREATE VIEW event_evaluation AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name,
   json_extract(payload,'$.dataset') AS dataset,
   json_extract(payload,'$.metrics') AS directions,
-  json_extract(payload,'$.declaration.config') AS config,
+  json_extract(payload,'$.declaration.scorer_params') AS scorer_params,
   json_extract(payload,'$.declaration') AS declaration,
   json_extract(payload,'$.folds') AS folds
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
@@ -160,8 +160,7 @@ WHERE e.type='score_recorded';
 CREATE VIEW score_latest AS SELECT l.evaluation, e.name AS evaluation_name,
   l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq
 FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq,
-        ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline, actor ORDER BY seq DESC)
-          AS rn
+        ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM event_score) l
 JOIN event_pipeline p ON p.id = l.pipeline
 JOIN event_evaluation e ON e.id = l.evaluation
@@ -190,7 +189,7 @@ FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, l.actor, a.metric,
   a.direction,
   CASE WHEN a.direction IN ('max', 'min') AND a.fold_mean IS NOT NULL
-    THEN RANK() OVER (PARTITION BY l.evaluation, a.metric, l.actor
+    THEN RANK() OVER (PARTITION BY l.evaluation, a.metric
     ORDER BY CASE a.direction WHEN 'max' THEN -a.fold_mean ELSE a.fold_mean END
       NULLS LAST) END AS rank,
   a.fold_mean, a.fold_std, a.n_folds, a.pooled,
@@ -207,8 +206,8 @@ SELECT a.evaluation, a.evaluation_name, a.source, a.actor, a.metric, a.fold, a.l
   CASE a.direction WHEN 'max' THEN a.value > b.value
       WHEN 'min' THEN a.value < b.value END AS win,
   a.score, b.score AS reference_score
-FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.actor = a.actor
-  AND b.pipeline <> a.pipeline AND b.fold = a.fold AND b.metric = a.metric;
+FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
+  AND b.fold = a.fold AND b.metric = a.metric;
 
 CREATE VIEW head_to_head AS WITH d AS (
   SELECT *, AVG(delta) OVER (PARTITION BY score, reference_score, metric) AS mean

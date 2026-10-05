@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import inspect
 import json
 import os
@@ -32,7 +33,7 @@ from typing import Any
 import numpy as np
 
 from ml_lab import formats, identity
-from ml_lab.dataset import Dataset, Lag, Range, load, row_mask, rows_save
+from ml_lab.dataset import Dataset, Lag, Range, load, resolve, row_mask, rows_save
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.splits import Fold
@@ -55,6 +56,10 @@ class RunReport:
 
 
 PARQUET = formats.Format.PARQUET
+FIT_HINT = (
+    "targets and features are NaN outside the train segments; read them with "
+    "dataset.column(name, train)"
+)
 
 
 # Public Functions =====================================================================
@@ -87,13 +92,15 @@ def run(
     and, for a fit, which repo files moved against the newest earlier fit of the same
     pipeline and label. ``planned`` carries the ids a dry run would write across several
     calls, so shared work counts once. A declaration error (a function that is not
-    module-level, a slot holding something that is not a function, a config class at
-    any depth its function does not import, a blend whose ``fit`` arity disagrees with
-    ``in_sample``, ``in_sample`` without members), at any depth of blends inside blends,
-    is refused before anything is read or written, as is a reached module the memo
-    cannot see (``identity.refuse_unseen_code``) and an evaluation that validates on a
-    sealed tail without ``sealed=True``. ``code_root`` is where repo modules are hashed
-    from, the git root of the first pipeline's fit when not given.
+    module-level, a slot holding something that is not a function, a params class at
+    any depth its function does not import), at any depth of blends inside blends, is
+    refused before anything is read or written, as is a reached module the memo cannot
+    see (``identity.refuse_unseen_code``). A ``dataset_id`` prefix that matches no
+    recorded dataset or several, and an evaluation that validates on a sealed tail
+    without ``sealed=True``, are refused before anything is written. An error a fit,
+    predict or postprocess raises is recorded with the fold's label. ``code_root`` is
+    where repo modules are hashed from, the git root of the first pipeline's fit when
+    not given.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -103,11 +110,9 @@ def run(
         if names.setdefault(pipeline.id, name) != name:
             raise Refused(
                 f"pipelines {names[pipeline.id]} and {name} declare the same functions "
-                f"and config, one id {pipeline.id}; rename or change one"
+                f"and params, one id {pipeline.id}; rename or change one"
             )
         for p in _nested(pipeline):
-            if p.in_sample and not p.members:
-                raise Refused(f"pipeline {p.name or name}: in_sample needs members")
             for slot, held in [(s, getattr(p, s)) for s in _SLOTS] + [
                 ("features", f) for f in p.feature_functions
             ]:
@@ -116,13 +121,6 @@ def run(
                         f"pipeline {p.name or name}: {slot} holds a "
                         f"{type(held).__name__}, not a function"
                     )
-            if p.members and (_positional(p.fit) > 3) != p.in_sample:
-                raise Refused(
-                    f"pipeline {p.name or name}: fit takes {_positional(p.fit)} "
-                    f"positional parameters and in_sample={p.in_sample}; a blend fit "
-                    "reads its members' train-range predictions as a fourth parameter "
-                    "iff in_sample=True"
-                )
         if pipeline.format not in formats.KNOWN:
             raise Refused(
                 f"pipeline {name}: format {pipeline.format!r}, not one of "
@@ -148,14 +146,17 @@ def run(
     for pipeline in pipelines:
         for p in _nested(pipeline):
             shas = identity.import_shas((p.fit, p.save, p.load), root)
-            _refuse_unseen_class(p.config, shas, root, "fit")
+            _refuse_unseen_class(p.params, shas, root, "fit")
             if p.postprocess is not None:
                 shas = identity.import_shas((p.postprocess,), root)
                 _refuse_unseen_class(p.postprocess_config, shas, root, "postprocess")
     scorer_shas = identity.import_shas(scoring[:2], root)
-    _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
-    dataset = load(ledger, evaluation.dataset)
-    recorded = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]
+    _refuse_unseen_class(evaluation.scorer_params, scorer_shas, root, "scorer")
+    evaluation = dataclasses.replace(
+        evaluation, dataset_id=resolve(ledger, evaluation.dataset_id)
+    )
+    dataset = load(ledger, evaluation.dataset_id)
+    recorded = ledger.latest(Event.DATASET, evaluation.dataset_id)["payload"]
     targets = {name: _lag(lag) for name, lag in recorded["recipe"]["targets"].items()}
     schedule = evaluation.split.folds(dataset)
     _refuse_overlap(schedule)
@@ -209,7 +210,9 @@ def run(
             _run_pipeline(context, schedule, pipeline)
         except Exception as error:  # noqa: BLE001
             name = pipeline.name or pipeline.id
-            report.failed[name] = f"{type(error).__name__}: {error}"
+            report.failed[name] = "; ".join(
+                [f"{type(error).__name__}: {error}", *getattr(error, "__notes__", ())]
+            )
             context.stages.clear()
             if dry:
                 continue
@@ -307,7 +310,7 @@ class _Stage:
         self.feature_ids = [
             identity.content_hash(
                 {
-                    "dataset": self.evaluation.dataset,
+                    "dataset": self.evaluation.dataset_id,
                     "features": function,
                     "code_keys": identity.code_keys((function,), self.root),
                     "env_lock": identity.bytes_hash(
@@ -338,13 +341,13 @@ class _Stage:
         member_fits = [m.fit(fold, index) for m in self.members]
         train_preds = (
             self._train_predictions(member_fits, fold, index)
-            if self.pipeline.in_sample
+            if self.members and _positional(self.pipeline.fit) > 3
             else []
         )
         columns_id = self._feature_columns_id()
         fit_id = identity.content_hash(
             {
-                "dataset": self.evaluation.dataset,
+                "dataset": self.evaluation.dataset_id,
                 "pipeline": self.pipeline.fit_declaration,
                 "train": train,
                 "code_keys": self.stage_keys["fit"],
@@ -380,7 +383,14 @@ class _Stage:
         loaded = set(sys.modules)
         why = self._why(fold.label)
         started = time.perf_counter()
-        model = self.pipeline.fit(visible, fold.train, self.pipeline.config, *inputs)
+        model = _noted(
+            f"fit on fold {fold.label}; {FIT_HINT}",
+            self.pipeline.fit,
+            visible,
+            fold.train,
+            self.pipeline.params,
+            *inputs,
+        )
         duration = time.perf_counter() - started
         blob = self._model_blob(model)
         self.models[fit_id] = self.pipeline.load(self.ledger.get_blob(blob["sha"]))
@@ -408,20 +418,20 @@ class _Stage:
         return fit_id
 
     def predictions(
-        self, fit_id: str, fold: Fold, index: int, rng: Range, train: bool = False
+        self, fit_id: str, fold: Fold, index: int, rows: Range, train: bool = False
     ) -> str:
-        """The prediction id over ``rng``: the fold's test range, or with ``train`` one
+        """The prediction id over ``rows``: the fold's test range, or with ``train`` one
         of its train segments, seen through the fit's view, for an in-sample blend.
         """
         member_fits = [m.fit(fold, index) for m in self.members]
         member_preds = [
-            m.predictions(f, fold, index, rng, train)
+            m.predictions(f, fold, index, rows, train)
             for m, f in zip(self.members, member_fits, strict=True)
         ]
         raw_id = identity.content_hash(
             {
                 "fit": fit_id,
-                "range": list(rng),
+                "range": list(rows),
                 "predict": self.pipeline.predict,
                 "code_keys": self.stage_keys["predict"],
                 "env_lock": identity.bytes_hash(self.locks["predict"].encode()),
@@ -454,14 +464,14 @@ class _Stage:
             return pred_id
         where: dict[str, Any] = {
             "fit": fit_id,
-            "range": list(rng),
+            "range": list(rows),
             "fold": index,
             **({"members": member_preds} if self.members else {}),
         }
-        visible = self._visible(rng[1])
+        visible = self._visible(rows[1])
         if train:
             visible = visible.train_view(fold.train)
-        visible = visible.masked(self.targets, rng[0])
+        visible = visible.masked(self.targets, rows[0])
         self.start()
         if self.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
             raw = _load_predictions(self.ledger, raw_id)
@@ -469,55 +479,66 @@ class _Stage:
             inputs = [_load_predictions(self.ledger, p) for p in member_preds]
 
             def predict(model: Any, view: Dataset, part: Range) -> np.ndarray:
-                head = part[1] - rng[0]
+                head = part[1] - rows[0]
                 extra = [[a[:head] for a in inputs]] if self.members else []
-                return np.asarray(self.pipeline.predict(model, view, part, *extra))
+                return np.asarray(
+                    _noted(
+                        f"predict on fold {fold.label}",
+                        self.pipeline.predict,
+                        model,
+                        view,
+                        part,
+                        *extra,
+                    )
+                )
 
             loaded = set(sys.modules)
             model = self._model(fit_id)
             self._unchanged("predict")
-            raw = self._one_per_row("predict", predict(model, visible, rng), rng)
+            raw = self._one_per_row("predict", predict(model, visible, rows), rows)
             if fit_id in self.pending:
-                self._record_fit(fit_id, fold, raw, lambda m: predict(m, visible, rng))
+                self._record_fit(fit_id, fold, raw, lambda m: predict(m, visible, rows))
             self._probe(
-                "predict", raw, lambda v, part: predict(model, v, part), visible, rng
+                "predict", raw, lambda v, part: predict(model, v, part), visible, rows
             )
             self._check_imports("predict", loaded)
             if self.pipeline.postprocess is None and not train:
-                self._refuse_non_finite("predict", raw, fold, rng)
+                self._refuse_non_finite("predict", raw, fold, rows)
             raw = self._write(raw_id, raw, where)
-            self.log(f"predictions {self.name} rows {rng[0]}:{rng[1]}")
+            self.log(f"predictions {self.name} rows {rows[0]}:{rows[1]}")
         if self.pipeline.postprocess is not None:
-            postprocess = self.pipeline.postprocess
             config = self.pipeline.postprocess_config
+            postprocess = functools.partial(
+                _noted, f"postprocess on fold {fold.label}", self.pipeline.postprocess
+            )
             self._unchanged("postprocess")
             loaded = set(sys.modules)
             post = self._one_per_row(
-                "postprocess", postprocess(raw, visible, rng, config), rng
+                "postprocess", postprocess(raw, visible, rows, config), rows
             )
             self._probe(
                 "postprocess",
                 post,
                 lambda view, part: postprocess(
-                    raw[: part[1] - rng[0]], view, part, config
+                    raw[: part[1] - rows[0]], view, part, config
                 ),
                 visible,
-                rng,
+                rows,
             )
             self._check_imports("postprocess", loaded)
             if not train:
-                self._refuse_non_finite("postprocess", post, fold, rng)
+                self._refuse_non_finite("postprocess", post, fold, rows)
             self._write(
                 pred_id,
                 post,
                 {
                     **where,
                     "raw": raw_id,
-                    "postprocess": identity.canonical(postprocess),
+                    "postprocess": identity.canonical(self.pipeline.postprocess),
                     "postprocess_config": identity.canonical(config),
                 },
             )
-            self.log(f"postprocess {self.name} rows {rng[0]}:{rng[1]}")
+            self.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
         return pred_id
 
     def _record_fit(
@@ -528,16 +549,9 @@ class _Stage:
         """
         fitted, why, payload = self.pending.pop(fit_id)
         again = np.asarray(predict(fitted))
-        _refuse_changed(
-            f"{self.name}: fit {fold.label}: the model loaded from its saved bytes "
-            "predicts differently from the fitted one (save must keep what predict "
-            "reads, and predict must be deterministic)",
-            "prediction",
-            again,
-            loaded,
-        )
+        _refuse_changed(f"{self.name}: fit {fold.label}", "prediction", again, loaded)
         self.ledger.append(
-            Event.FIT, self.evaluation.dataset, fit_id, payload, id=fit_id
+            Event.FIT, self.evaluation.dataset_id, fit_id, payload, id=fit_id
         )
         self.log(f"fit {self.name} {fold.label} {payload['duration_s']:.1f}s: {why}")
 
@@ -683,7 +697,7 @@ class _Stage:
         sha = self.ledger.put_blob(rows_save(Dataset(columns, None)))
         self.ledger.append(
             Event.FEATURES,
-            self.evaluation.dataset,
+            self.evaluation.dataset_id,
             feature_id,
             {
                 "pipeline": self.pipeline.id,
@@ -731,15 +745,14 @@ class _Stage:
             "AND label = ? ORDER BY seq DESC LIMIT 1",
             (self.pipeline.id, label),
         )
-        moved = ["no earlier fit of this pipeline and label"]
-        if rows:
-            before, now = json.loads(rows[0]["code_keys"]), self.stage_keys["fit"]
-            moved = sorted(
-                k for k in set(before) | set(now) if before.get(k) != now.get(k)
-            )
-            if json.loads(rows[0]["env_lock"])["sha"] != self.env_lock["sha"]:
-                moved.append("environment lock")
-        return ", ".join(moved) or "train segments, members or feature columns changed"
+        if not rows:
+            return "no earlier fit of this pipeline and label"
+        before, now = json.loads(rows[0]["code_keys"]), self.stage_keys["fit"]
+        files = sorted(k for k in set(before) | set(now) if before.get(k) != now.get(k))
+        moved = [f"module changed: {', '.join(files)}"] if files else []
+        if json.loads(rows[0]["env_lock"])["sha"] != self.env_lock["sha"]:
+            moved.append("environment lock changed")
+        return "; ".join(moved) or "train segments, members or feature columns changed"
 
     def _probe(
         self,
@@ -747,7 +760,7 @@ class _Stage:
         output: np.ndarray,
         compute: Callable[[Dataset, Range], Any],
         visible: Dataset,
-        rng: Range,
+        rows: Range,
     ):
         """Rerun the function on the rows before each cut, with its array inputs cut
         there, and require the predictions before it to stand; every computed range,
@@ -755,7 +768,7 @@ class _Stage:
         date and one strictly inside its last date, when they exist, so a read of a
         later row of the same date is caught however the range meets the calendar.
         """
-        lo, hi = rng
+        lo, hi = rows
         starts = visible.date_starts(lo, hi)
         middle = len(starts) // 2 - 1
         cuts = {
@@ -768,33 +781,28 @@ class _Stage:
                 f"{self.name}: {stage}", "prediction", output, again, at=at, first=lo
             )
 
-    def _one_per_row(self, stage: str, output: Any, rng: Range) -> np.ndarray:
-        values = np.asarray(output)
-        rows = rng[1] - rng[0]
-        if values.ndim not in (1, 2) or values.shape[0] != rows:
-            raise Refused(
-                f"{self.name}: {stage} returned shape {values.shape}; it must return "
-                f"one row per row of the range, shape ({rows},) or ({rows}, k)"
-            )
+    def _one_per_row(self, stage: str, output: Any, rows: Range) -> np.ndarray:
+        values = _one_per_row(f"{self.name}: {stage} returned", output, rows)
+        n = rows[1] - rows[0]
         width = self.widths.setdefault(stage, values.shape[1:])
         if values.shape[1:] != width:
             raise Refused(
                 f"{self.name}: {stage} returned shape {values.shape} at rows "
-                f"{rng[0]}:{rng[1]} and shape ({rows}, {', '.join(map(str, width))}) "
+                f"{rows[0]}:{rows[1]} and shape ({n}, {', '.join(map(str, width))}) "
                 f"on an earlier fold; the width is a property of {stage}"
             )
         return values
 
     def _refuse_non_finite(
-        self, stage: str, values: np.ndarray, fold: Fold, rng: Range
+        self, stage: str, values: np.ndarray, fold: Fold, rows: Range
     ):
-        rows = ~np.isfinite(np.asarray(values, np.float64)).reshape(len(values), -1)
-        bad = np.flatnonzero(rows.any(axis=1))
+        bad = ~np.isfinite(np.asarray(values, np.float64)).reshape(len(values), -1)
+        bad = np.flatnonzero(bad.any(axis=1))
         if bad.size:
             raise Refused(
                 f"{self.name}: {stage} returned a non-finite value on {bad.size} of "
                 f"{len(values)} rows of fold {fold.label}, the first at row "
-                f"{rng[0] + bad[0]}; a scored prediction is finite, so fill or drop "
+                f"{rows[0] + bad[0]}; a scored prediction is finite, so fill or drop "
                 f"them in {stage}"
             )
 
@@ -820,7 +828,7 @@ class _Stage:
         }
         self.ledger.append(
             Event.PREDICTIONS,
-            self.evaluation.dataset,
+            self.evaluation.dataset_id,
             pred_id,
             {**payload, "blob": blob},
             id=pred_id,
@@ -861,9 +869,13 @@ def _score(
     for index, fold in enumerate(folds):
         pred = _load_predictions(ledger, predictions[str(index)])
         visible = context.dataset.upto(fold.test[1])
-        rows = np.asarray(scorer.score(pred, visible, fold.test, evaluation.config))
-        parts.append(rows)
-        metrics = _finite(name, evaluation.metrics(rows), f"fold {fold.label}")
+        series = _one_per_row(
+            f"{name}: the scorer's series on fold {fold.label} has",
+            scorer.series(pred, visible, fold.test, evaluation.scorer_params),
+            fold.test,
+        )
+        parts.append(series)
+        metrics = _finite(name, evaluation.metrics(series), f"fold {fold.label}")
         per_fold.append({"fold": index, "label": fold.label, "metrics": metrics})
     whole = np.concatenate(parts)
     aggregate = _finite(name, evaluation.metrics(whole), "the pooled folds")
@@ -902,6 +914,27 @@ def _score(
     )
 
 
+def _one_per_row(who: str, output: Any, rows: Range) -> np.ndarray:
+    """``output`` as an array with one row per row of ``rows``, else refused."""
+    values = np.asarray(output)
+    n = rows[1] - rows[0]
+    if values.ndim not in (1, 2) or values.shape[0] != n:
+        raise Refused(
+            f"{who} shape {values.shape}; it must have one row per row of the range, "
+            f"shape ({n},) or ({n}, k)"
+        )
+    return values
+
+
+def _noted(note: str, function: Callable, *args: Any) -> Any:
+    """``function(*args)``, with ``note`` added to what it raises."""
+    try:
+        return function(*args)
+    except Exception as error:
+        error.add_note(note)
+        raise
+
+
 def _finite(name: str, metrics: dict[str, Any], where: str) -> dict[str, Any]:
     bad = sorted(
         k
@@ -920,14 +953,14 @@ def _refuse_changed(
     who: str, name: str, full: Any, head: Any, at: int | None = None, first: int = 0
 ):
     """Refuse when ``head``, a function's output recomputed on the rows before ``at``
-    (or on another path to the same rows), differs from ``full`` by more than
-    rounding: ``1e-9`` of the largest finite value of ``full``, or 1024 ulps of a
-    narrower float dtype. Honest BLAS blocking and memory layout measure under 3e-12
-    of scale, the smallest leak 1e-7, so the band separates them without a
-    per-element ulp rule, which is unsound near zero. NaN positions must agree. The
-    message names the first row that moved, both values, how many rows moved and the
-    largest move as a fraction of scale, so rounding and a leak read differently in
-    one line.
+    (or, without ``at``, by the model reloaded from its saved bytes), differs from
+    ``full`` by more than rounding: ``1e-9`` of the largest finite value of ``full``,
+    or 1024 ulps of a narrower float dtype. Honest BLAS blocking and memory layout
+    measure under 3e-12 of scale, the smallest leak 1e-7, so the band separates them
+    without a per-element ulp rule, which is unsound near zero. NaN positions must
+    agree. The one-sentence message names the first row that moved, both values, how
+    many rows moved and the largest move as a fraction of scale, so rounding and a
+    leak read differently.
     """
     dtype = np.asarray(full).dtype
     rtol = 1e-9 if dtype.kind != "f" else max(1e-9, 1024 * np.finfo(dtype).eps)
@@ -938,18 +971,34 @@ def _refuse_changed(
     head = np.asarray(head, dtype=np.float64)
     close = np.isclose(full, head, rtol=0, atol=rtol * scale, equal_nan=True)
     moved = np.flatnonzero(~close.reshape(len(head), -1).all(axis=1))
-    if moved.size:
-        r = moved[0]
-        gap = np.abs(full[moved] - head[moved])
-        worst = float(np.max(gap[np.isfinite(gap)], initial=0.0))
-        where = f"read past row {at}" if at is not None else "is not stable"
-        before = f"on the rows before {at}" if at is not None else "the second time"
-        raise Refused(
-            f"{who} {where}: {name} at row {first + r} is {full[r]!r} on the whole "
-            f"input and {head[r]!r} {before}; {moved.size} of {len(head)} rows moved, "
-            f"by up to {worst:.3g}, {worst / scale if scale else np.inf:.3g} of the "
-            f"largest |{name}| {scale:.3g} (rounding is allowed up to {rtol:g})"
+    if not moved.size:
+        return
+    r = moved[0]
+    gap = np.abs(full[moved] - head[moved])
+    worst = float(np.max(gap[np.isfinite(gap)], initial=0.0))
+    row, fix = first + r, ""
+    if at is None:
+        where = (
+            f"{who}: the model reloaded from its saved bytes predicts {name} "
+            f"{_g(head[r])} at row {row} where the fitted one predicts {_g(full[r])}"
         )
+        fix = ", so save must keep what predict reads and predict must be deterministic"
+    else:
+        where = (
+            f"{who} read past row {at}: {name} at row {row} is {_g(full[r])} on the "
+            f"whole input and {_g(head[r])} on the rows before {at}"
+        )
+    raise Refused(
+        f"{where}, and {moved.size} of {len(head)} rows moved by up to {worst:.6g}, "
+        f"{worst / scale if scale else np.inf:.6g} of the largest |{name}| "
+        f"{scale:.6g} where rounding is allowed up to {rtol:.6g}{fix}"
+    )
+
+
+def _g(value: Any) -> str:
+    """A float, or a row of floats, to six significant digits."""
+    text = " ".join(f"{v:.6g}" for v in np.ravel(value))
+    return text if np.ndim(value) == 0 else f"[{text}]"
 
 
 def _refuse_overlap(folds: list[Fold]):
@@ -965,8 +1014,8 @@ def _refuse_overlap(folds: list[Fold]):
 
 def _refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fold]):
     """Refuse the folds that train on a row before their test range whose label is
-    not known at the range's start, naming the worst one, the lag, and the
-    embargo that clears every fold at once.
+    not known at the range's start, naming the worst one, the lag, and the purge
+    (train rows dropped before each test range) that clears every fold at once.
     """
     worst: tuple[int, int, str] = (0, 0, "")
     leaky = 0
@@ -995,8 +1044,9 @@ def _refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fo
         stamps, rows, where = worst
         raise Refused(
             f"{leaky} folds train on labels revealed after their test range starts; "
-            f"the worst: {where}; embargo {stamps} more timestamps ({rows} rows) than "
-            "the split drops now and they all clear; a label known at a later date's "
+            f"the worst: {where}; purge {stamps} more timestamps ({rows} rows) from "
+            "the end of each train range, by raising the split's embargo_rows or "
+            "embargo_timestamps, and they all clear; a label known at a later date's "
             "open takes an integer reveal lag, record(reveal={name: dates}), which is "
             "exact across holidays"
         )
@@ -1009,7 +1059,7 @@ def _refuse_sealed(evaluation: Evaluation, folds: list[Fold], sealed: int | None
     name = evaluation.name or evaluation.id
     if evaluation.sealed and sealed is None:
         raise Refused(
-            f"evaluation {name} is sealed and dataset {evaluation.dataset} has no "
+            f"evaluation {name} is sealed and dataset {evaluation.dataset_id} has no "
             "sealed tail; record the dataset with sealed_from"
         )
     late = [f for f in folds if sealed is not None and f.test[1] > sealed]
@@ -1074,7 +1124,7 @@ def _declare_pipeline(ledger: Ledger, pipeline: Pipeline):
         {
             "name": pipeline.name,
             "declaration": identity.canonical(pipeline),
-            "config": identity.canonical(pipeline.config),
+            "params": identity.canonical(pipeline.params),
         },
         id=identity.content_hash({"id": pipeline.id, "name": pipeline.name}),
     )
@@ -1113,7 +1163,7 @@ def _declare_evaluation(
         evaluation.id,
         {
             "name": evaluation.name,
-            "dataset": evaluation.dataset,
+            "dataset": evaluation.dataset_id,
             "declaration": identity.canonical(evaluation),
             "metrics": evaluation.directions,
             "folds": live,
@@ -1160,7 +1210,7 @@ def _held(config: Any) -> list[Any]:
 
 
 def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
-    """What each stage's memo hashes: its functions and what their configs hold."""
+    """What each stage's memo hashes: its functions and what their params hold."""
     post = pipeline.postprocess
     return {
         "features": pipeline.feature_functions,
@@ -1168,7 +1218,7 @@ def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
             pipeline.fit,
             pipeline.save,
             pipeline.load,
-            *_held(pipeline.config),
+            *_held(pipeline.params),
         ),
         "predict": (pipeline.predict,),
         "postprocess": (post, *_held(pipeline.postprocess_config)) if post else (),
@@ -1176,11 +1226,11 @@ def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
 
 
 def _scoring(evaluation: Evaluation) -> tuple[Any, ...]:
-    """What the score's memo hashes: the scorer's functions and what its config
-    holds.
+    """What the score's memo hashes: the scorer's functions and what its params
+    hold.
     """
     scorer = evaluation.scorer
-    return (scorer.score, scorer.metrics, *_held(evaluation.config))
+    return (scorer.series, scorer.metrics, *_held(evaluation.scorer_params))
 
 
 def _nested(pipeline: Pipeline) -> Iterator[Pipeline]:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import pathlib
+import pickle
 import tempfile
 import zipfile
 from collections.abc import Callable
@@ -143,6 +144,18 @@ def arrays_load(payload: bytes) -> dict[str, np.ndarray]:
         name: np.asarray(data, np.float64).reshape(shape)
         for name, shape, data in frame.iter_rows()
     }
+
+
+# Pickle ===============================================================================
+
+
+def pickle_save(obj: Any) -> bytes:
+    """Any object as pickle bytes, for a ``pickle`` model; not portable."""
+    return pickle.dumps(obj)
+
+
+def pickle_load(payload: bytes) -> Any:
+    return pickle.loads(payload)
 
 
 # Path-only libraries ==================================================================
