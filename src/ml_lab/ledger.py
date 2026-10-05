@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import sqlite3
 import time
 from typing import Any, Final
@@ -231,7 +232,7 @@ class Ledger:
         self.root = pathlib.Path(root)
         self.blobs = self.root / "blobs" / "sha256"
         self.blobs.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(self.root / "ml_lab.sqlite")
+        self._db = sqlite3.connect(self.root / "ml_lab.sqlite", isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         version = self._db.execute("PRAGMA user_version").fetchone()[0]
@@ -241,9 +242,11 @@ class Ledger:
                 "a cache of code plus data, delete the root and rerun"
             )
         views = self._db.execute("SELECT name FROM sqlite_master WHERE type='view'")
-        drops = "".join(f"DROP VIEW {name};" for (name,) in views.fetchall())
+        names = {n for (n,) in views.fetchall()} | set(re.findall(r"VIEW (\w+)", VIEWS))
+        drops = "".join(f"DROP VIEW IF EXISTS {n};" for n in sorted(names))
         self._db.executescript(
-            DDL + drops + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};"
+            f"BEGIN IMMEDIATE; {DDL} {drops} {VIEWS} "
+            f"PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
         )
 
     def __repr__(self) -> str:
@@ -281,7 +284,6 @@ class Ledger:
                 text,
             ),
         )
-        self._db.commit()
         return event_id
 
     def events(

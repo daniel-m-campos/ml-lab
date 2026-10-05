@@ -70,7 +70,7 @@ Fits and predictions live on the dataset stream because a scoring change reuses 
 
 ### Views
 
-Shipped as SQL in the same file so `sqlite3` shows them as tables. The names say the layer: `board` and `head_to_head` are for reading and carry no prefix; `raw_` is one event type as columns, for joins; `score_` is a building block over scores. `.tables raw%` lists a layer. The `raw_` views carry `seq`, so `WHERE seq <= N` reads the log as it stood, except `raw_pipeline` and `raw_evaluation` (latest name), `raw_failure` (dropped once a newer score exists) and `score_latest`, which read the whole log.
+Shipped as SQL in the same file so `sqlite3` shows them as tables; a connect drops and recreates them in one write transaction, so concurrent `lab run` processes never see a half-built set. The names say the layer: `board` and `head_to_head` are for reading and carry no prefix; `raw_` is one event type as columns, for joins; `score_` is a building block over scores. `.tables raw%` lists a layer. The `raw_` views carry `seq`, so `WHERE seq <= N` reads the log as it stood, except `raw_pipeline` and `raw_evaluation` (latest name), `raw_failure` (dropped once a newer score exists) and `score_latest`, which read the whole log.
 
 | view | definition |
 |---|---|

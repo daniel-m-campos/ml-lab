@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import types
 
 import numpy as np
@@ -1970,6 +1971,23 @@ def test_a_constant_per_fold_scores_auc_one_half_by_fold_mean_not_pooled(ledger)
 
 
 # Storage ==============================================================================
+
+
+def test_concurrent_connects_rebuild_the_views_whole(tmp_path):
+    failures = []
+
+    def connect():
+        try:
+            Ledger(tmp_path).sql("SELECT COUNT(*) FROM head_to_head")
+        except Exception as e:
+            failures.append(e)
+
+    workers = [threading.Thread(target=connect) for _ in range(8)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    assert failures == []
 
 
 def test_ulids_sort_and_do_not_collide():
