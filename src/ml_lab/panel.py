@@ -1,6 +1,6 @@
 """A dataset as a (time, key) grid, for cross-sectional features.
 
-Both Kaggle examples are panels: Optiver is (auction second, stock), JPX is (date,
+An order book is a panel over (auction second, stock), a daily universe over (date,
 security). Each features function used to rebuild the grid by hand; this does it once
 per dataset. Positions on the time axis are the dataset's distinct timestamps in order,
 so the time axis of a prefix view's grid is a prefix of the full one; a key first seen

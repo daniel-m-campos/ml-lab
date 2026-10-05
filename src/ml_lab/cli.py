@@ -15,9 +15,9 @@ ledger. The actor comes from ``ML_LAB_ACTOR``.
 
 Examples
 --------
-$ lab ingest examples/optiver/dataset.py 20
-$ lab run examples/optiver/experiment.py
-$ lab run examples/optiver/experiment.py ideas/agent7.py
+$ lab ingest project/dataset.py 20
+$ lab run project/experiment.py
+$ lab run project/experiment.py ideas/agent7.py
 $ sqlite3 -box .ml-lab/ml_lab.sqlite "SELECT * FROM score_latest"
 """
 

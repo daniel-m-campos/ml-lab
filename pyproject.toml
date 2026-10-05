@@ -29,4 +29,4 @@ target-version = "py312"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ml-lab", "optiver"]
+known-first-party = ["ml-lab"]

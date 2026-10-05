@@ -70,7 +70,7 @@ Every sha reference in a payload carries a `format` from `formats.KNOWN`, which 
 |---|---|---|
 | dataset rows | `parquet` | Parquet, `ts` as a nanosecond timestamp column plus one numeric, datetime or string column per field |
 | predictions | `parquet` | Parquet, one column `prediction`, or `prediction_0` to `prediction_{k-1}`; the row range is in the event |
-| model | the pipeline's `format` | `save(model) -> bytes` and `load(bytes) -> model` as module-level functions; `formats.py` ships `arrow-arrays` (a dict of arrays as an Arrow IPC file) and the temp-file round trip the Optiver example uses for `bonsai-msgpack`; a pipeline without them is refused at run |
+| model | the pipeline's `format` | `save(model) -> bytes` and `load(bytes) -> model` as module-level functions; `formats.py` ships `arrow-arrays` (a dict of arrays as an Arrow IPC file) and the temp-file round trip for a library that saves to a path, `bonsai-msgpack` among them; a pipeline without them is refused at run |
 | dirty diff | `text/x-diff` | the `git diff HEAD` text |
 | declarations | not a blob: the JSON payload, re-imported by dotted path |
 

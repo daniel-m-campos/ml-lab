@@ -162,7 +162,7 @@ What each piece is, in the order the file introduces it:
 - **Blends**: `Pipeline(members=(a, b), ...)`; `fit` and `predict` take the members' predictions as a fourth argument, and the members' fits are memoized on their own.
 - **A clock**: `Dataset(columns, ts)` with a sorted datetime array. It adds `CalendarWalkForward` (cutoffs every N months or trading days, named horizons, an embargo in whole timestamps), reveal lags on targets (`record(..., reveal={"y": timedelta(days=1)})`, or an integer count of trading dates), and the refusal of any fold that trains on labels revealed after its window starts.
 - **A test set**: a second `Evaluation` on `Holdout(train_fraction)` in its own module, `test.py`, run once after the pick is written down; `BlockedKFold(k, train_fraction)` validates on the same cut.
-- **The real-world template**: `examples/optiver/` adds a clock, three horizons, a per-stock taker simulation as the scorer and two model families (ridge, bonsai). `examples/optiver/launch.sh 20` runs it when the Kaggle "Trading at the Close" `train.csv` sits under `data/optiver/optiver-trading-at-the-close/`.
+- **Real studies**: the `ml-lab-exp` repository holds one directory per study over a shared ledger, each with a clock, horizons, a simulation or rank scorer, and several model families; its NOTES files are the template for a pre-registered pick rule and a test set scored once.
 
 ## Run
 
