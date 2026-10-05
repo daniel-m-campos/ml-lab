@@ -62,7 +62,7 @@ class Panel:
     ) -> np.ndarray:
         """One column as a (time, key) array; a missing (time, key) holds ``fill``."""
         out = np.full(self.shape, fill, dtype=dtype)
-        out[self.ti, self.ki] = self.session.columns[name]
+        out[self.ti, self.ki] = self.session.column(name, (0, self.session.rows))
         return out
 
     def rows(self, grid: np.ndarray) -> np.ndarray:

@@ -18,8 +18,10 @@ import json
 import os
 import pathlib
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from collections.abc import Callable
@@ -30,7 +32,7 @@ import numpy as np
 from ml_lab import dataset, formats, identity
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.ledger import Event, Ledger, Refused
-from ml_lab.session import Range, Session
+from ml_lab.session import Lag, Range, Session
 from ml_lab.splits import Fold
 
 
@@ -78,11 +80,13 @@ def run(
     refused, since the ledger keeps one name per id and would score the second as a
     duplicate. ``log`` receives one line per feature set, fit, prediction set and score
     as it is written. A ``dry`` run computes every id, looks each one up and writes
-    nothing; it logs what it would compute and, for a fit, which repo files moved
+    nothing; it computes features it would need, so every id is one a real run
+    would write, and logs what it would compute and, for a fit, which repo files moved
     against the newest earlier fit of the same pipeline and label. ``planned`` carries
     the ids a dry run would write across several calls, so shared work counts once.
-    A declaration error (an unregistered step, a config class its step does not
-    import) is refused before anything is read or written.
+    A declaration error (an unregistered step, a slot holding something that is not a
+    step, a config class its step does not import, a blend whose ``fit`` arity
+    disagrees with ``in_sample``) is refused before anything is read or written.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -94,6 +98,23 @@ def run(
                 f"pipelines {names[pipeline.id]} and {name} declare the same steps and "
                 f"config, one id {pipeline.id}; rename or change one"
             )
+        for p in (pipeline, *pipeline.members):
+            held_by = [(s, getattr(p, s)) for s in ("fit", "predict", "save", "load")]
+            held_by += [("postprocess", p.postprocess)]
+            held_by += [("features", f) for f in p.feature_steps]
+            for slot, held in held_by:
+                if held is not None and not callable(held):
+                    raise Refused(
+                        f"pipeline {p.name or name}: {slot} holds a "
+                        f"{type(held).__name__}, not a step"
+                    )
+            if p.members and (_positional(p.fit) > 3) != p.in_sample:
+                raise Refused(
+                    f"pipeline {p.name or name}: fit takes {_positional(p.fit)} "
+                    f"positional parameters and in_sample={p.in_sample}; a blend fit "
+                    "reads its members' train-range predictions as a fourth parameter "
+                    "iff in_sample=True"
+                )
         if pipeline.format not in formats.KNOWN:
             raise Refused(
                 f"pipeline {name}: save step declares format {pipeline.format!r}, "
@@ -110,10 +131,7 @@ def run(
     _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
     session = dataset.load(ledger, evaluation.dataset)
     recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
-    targets = {
-        name: None if lag is None else np.timedelta64(round(lag * 1e9), "ns")
-        for name, lag in recipe["targets"].items()
-    }
+    targets = {name: _lag(lag) for name, lag in recipe["targets"].items()}
     schedule = evaluation.split.folds(session)
     if not dry:
         _declare_evaluation(ledger, evaluation, schedule)
@@ -145,7 +163,6 @@ def run(
         report,
         start,
         log,
-        session.boundary(min(f.train[-1][1] for f in schedule)) or 0,
         dry,
         set() if planned is None else planned,
     )
@@ -183,15 +200,20 @@ class _Run:
 
     ledger: Ledger
     session: Session
-    targets: dict[str, np.timedelta64 | None]
+    targets: dict[str, Lag]
     evaluation: Evaluation
     root: pathlib.Path
     report: RunReport
     start: Callable[[], str]
     log: Callable[[str], None]
-    probe_at: int
     dry: bool
     planned: set[str]
+    features: dict[str, Features] = dataclasses.field(default_factory=dict)
+
+
+Features = tuple[tuple[str, ...], pathlib.Path | None, str]
+"""One computed feature set: its column names, the Parquet file they are read from
+(None in a dry run, which stores nothing) and the id of the ordered columns' bytes."""
 
 
 def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
@@ -217,19 +239,18 @@ class _Stage:
     member.
     """
 
-    def __init__(
-        self,
-        context: _Run,
-        pipeline: Pipeline,
-        loaded: dict[str, dict[str, np.ndarray]] | None = None,
-    ):
+    def __init__(self, context: _Run, pipeline: Pipeline):
         vars(self).update(vars(context))
         self.pipeline = pipeline
-        self.loaded = {} if loaded is None else loaded
         self.name = pipeline.name or pipeline.id
+        self.members = [_Stage(context, m) for m in pipeline.members]
+        self.feature_steps = pipeline.feature_steps
+        shared = {m.feature_steps for m in self.members}
+        if not self.feature_steps and len(shared) == 1:
+            self.feature_steps = shared.pop()
         self.shas = identity.import_shas(pipeline.steps, self.root)
         self.steps = {
-            "features": (pipeline.features,) if pipeline.features else (),
+            "features": self.feature_steps,
             "fit": (pipeline.fit, pipeline.save, pipeline.load),
             "predict": (pipeline.predict,),
             "postprocess": (pipeline.postprocess,) if pipeline.postprocess else (),
@@ -242,29 +263,29 @@ class _Stage:
             stage: identity.code_keys(steps, self.root)
             for stage, steps in self.steps.items()
         }
-        self.takes_members = bool(pipeline.members) and _positional(pipeline.fit) > 3
         self.dists = identity.imported_dists(pipeline.steps, self.root)
         self.lock_text = _lock_text(self.dists)
         self.env_lock = {
             "sha": identity.bytes_hash(self.lock_text.encode()),
             "format": formats.Format.TEXT,
         }
-        self.feature_id = None
-        if pipeline.features is not None:
-            lock = _lock_text(identity.imported_dists((pipeline.features,), self.root))
-            self.feature_id = identity.content_hash(
+        self.feature_ids = [
+            identity.content_hash(
                 {
                     "dataset": self.evaluation.dataset,
-                    "features": pipeline.features,
-                    "code_keys": self.stage_keys["features"],
-                    "env_lock": identity.bytes_hash(lock.encode()),
+                    "features": step,
+                    "code_keys": identity.code_keys((step,), self.root),
+                    "env_lock": identity.bytes_hash(
+                        _lock_text(identity.imported_dists((step,), self.root)).encode()
+                    ),
                 }
             )
+            for step in self.feature_steps
+        ]
         self.featured: Session | None = None
         self.models: dict[str, Any] = {}
         self.pending: dict[str, tuple[Any, dict[str, Any]]] = {}
         self.fits: dict[str, str] = {}
-        self.members = [_Stage(context, m, self.loaded) for m in pipeline.members]
 
     def fit(self, fold: Fold) -> str:
         if fold.label in self.fits:
@@ -284,13 +305,18 @@ class _Stage:
                 "code_keys": self.stage_keys["fit"],
                 "env_lock": self.env_lock["sha"],
                 **({"members": member_fits} if self.members else {}),
-                **({"features": columns_id} if self.feature_id else {}),
+                **({"features": columns_id} if columns_id else {}),
             }
         )
-        if fit_id in self.planned or self.ledger.latest(Event.FIT, fit_id) is not None:
-            self.report.fits_reused += 1
+        if fit_id in self.planned:
             return fit_id
-        inputs = self._member_inputs(member_fits, fold) if self.takes_members else []
+        if self.ledger.latest(Event.FIT, fit_id) is not None:
+            self.report.fits_reused += 1
+            self.planned.add(fit_id)
+            return fit_id
+        inputs = (
+            self._member_inputs(member_fits, fold) if self.pipeline.in_sample else []
+        )
         if self.dry:
             self.planned.add(fit_id)
             self.report.fits_computed += 1
@@ -318,7 +344,7 @@ class _Stage:
                 "duration_s": duration,
                 "model": blob,
                 **({"members": member_fits} if self.members else {}),
-                **({"features": columns_id} if self.feature_id else {}),
+                **({"features": columns_id} if columns_id else {}),
             },
         )
         self.report.fits_computed += 1
@@ -350,8 +376,11 @@ class _Stage:
                     "code_keys": self.stage_keys["postprocess"],
                 }
             )
-        if pred_id in self.planned or self.ledger.latest(Event.PREDICTIONS, pred_id):
+        if pred_id in self.planned:
+            return pred_id
+        if self.ledger.latest(Event.PREDICTIONS, pred_id):
             self.report.predictions_reused += 1
+            self.planned.add(pred_id)
             return pred_id
         if self.dry:
             raw_missing = raw_id not in self.planned and not self.ledger.latest(
@@ -377,8 +406,7 @@ class _Stage:
             def predict(model: Any, view: Session, part: Range) -> np.ndarray:
                 head = part[1] - rng[0]
                 extra = [[a[:head] for a in inputs]] if self.members else []
-                out = self.pipeline.predict(model, view, part, *extra)
-                return np.asarray(out, dtype=np.float64)
+                return np.asarray(self.pipeline.predict(model, view, part, *extra))
 
             model = self._model(fit_id)
             self._unchanged("predict")
@@ -388,13 +416,11 @@ class _Stage:
             self._probe(
                 "predict", raw, lambda v, part: predict(model, v, part), visible, rng
             )
-            self._write(raw_id, raw, where)
+            raw = self._write(raw_id, raw, where)
             self.log(f"predictions {self.name} {window} rows {rng[0]}:{rng[1]}")
         if self.pipeline.postprocess is not None:
             self._unchanged("postprocess")
-            post = np.asarray(
-                self.pipeline.postprocess(raw, visible, rng), dtype=np.float64
-            )
+            post = np.asarray(self.pipeline.postprocess(raw, visible, rng))
             self._probe(
                 "postprocess",
                 post,
@@ -423,13 +449,15 @@ class _Stage:
         fitted one did, so a save that drops state is refused, not recorded.
         """
         fitted, payload = self.pending.pop(fit_id)
-        again = np.asarray(predict(fitted), dtype=np.float64)
-        if not np.array_equal(loaded, again, equal_nan=True):
-            raise Refused(
-                f"{self.name}: fit {fold.label}: the model loaded from its saved "
-                "bytes predicts differently from the fitted one; save must keep "
-                "what predict reads, and predict must be deterministic"
-            )
+        again = np.asarray(predict(fitted))
+        _refuse_changed(
+            f"{self.name}: fit {fold.label}: the model loaded from its saved bytes "
+            "predicts differently from the fitted one (save must keep what predict "
+            "reads, and predict must be deterministic)",
+            "prediction",
+            again,
+            loaded,
+        )
         self.ledger.append(
             Event.FIT, self.evaluation.dataset, fit_id, payload, id=fit_id
         )
@@ -465,27 +493,31 @@ class _Stage:
             raise Refused(f"{self.name}: source changed during the run: {moved}; rerun")
 
     def _visible(self, cut: int) -> Session:
-        """The session's first ``cut`` rows, with the pipeline's feature columns."""
-        if self.pipeline.features is None:
+        """The session's first ``cut`` rows, with the pipeline's feature columns read
+        on demand from their stored files.
+        """
+        if not self.feature_steps:
             return self.session.upto(cut)
         if self.featured is None:
-            added = self._features()
+            sets = [self._features(step, fid) for step, fid in self._feature_pairs()]
+            names = tuple(n for columns, _, _ in sets for n in columns)
+            stores = {n: path for columns, path, _ in sets for n in columns}
             self.featured = Session(
-                {**self.session.columns, **added}, self.session.ts, tuple(added)
+                self.session.columns, self.session.ts, names, stores
             )
         return self.featured.upto(cut)
 
+    def _feature_pairs(self) -> list[tuple[Callable, str]]:
+        return list(zip(self.feature_steps, self.feature_ids, strict=True))
+
     def _feature_columns_id(self) -> str | None:
-        """The fit's feature input, the ordered columns' bytes; None in a dry run
-        before the features exist, so the fit id is one that was never recorded.
+        """The fit's feature input: the id of the ordered columns' bytes, computing the
+        features first when no run has, so a dry run's ids are the real ones.
         """
-        if self.feature_id is None:
-            return None
-        event = self.ledger.latest(Event.FEATURES, self.feature_id)
-        if event is None and not self.dry:
-            self._visible(0)
-            event = self.ledger.latest(Event.FEATURES, self.feature_id)
-        return event and event["payload"]["columns_id"]
+        ids = [self._features(step, fid)[2] for step, fid in self._feature_pairs()]
+        if len(ids) > 1:
+            return identity.content_hash(ids)
+        return ids[0] if ids else None
 
     def _model_blob(self, model: Any) -> dict[str, Any]:
         """The saved model; a zip is portable iff every member's format is."""
@@ -507,17 +539,20 @@ class _Stage:
             "portable": all(formats.KNOWN[f] for f in used.values()),
         }
 
-    def _features(self) -> dict[str, np.ndarray]:
-        """The feature step's columns, computed once per feature id over the session
-        without its targets and probed at the schedule's first cutoff.
+    def _features(self, step: Callable, feature_id: str) -> Features:
+        """One feature step's columns, computed once per feature id over the session
+        without its targets, probed on five prefixes and stored; a dry run computes
+        and stores nothing, so the names and id are known.
         """
-        if self.feature_id in self.loaded:
-            return self.loaded[self.feature_id]
-        event = self.ledger.latest(Event.FEATURES, self.feature_id)
+        if feature_id in self.features:
+            return self.features[feature_id]
+        event = self.ledger.latest(Event.FEATURES, feature_id)
         if event is not None:
-            path = self.ledger.blobs / event["payload"]["blob"]["sha"]
-            self.loaded[self.feature_id] = formats.session_load(path).columns
-            return self.loaded[self.feature_id]
+            payload = event["payload"]
+            path = self.ledger.blobs / payload["blob"]["sha"]
+            found = (tuple(payload["columns"]), path, payload["columns_id"])
+            self.features[feature_id] = found
+            return found
         revealed = {k: v for k, v in self.targets.items() if v is not None}
         bare = Session(
             {
@@ -528,46 +563,64 @@ class _Stage:
             self.session.ts,
         )
         started = time.perf_counter()
-        columns = self._feature_columns(bare)
+        columns = self._feature_columns(step, bare)
         duration = time.perf_counter() - started
         self._unchanged("features")
-        before = bare.boundary(max(self.probe_at - 1, 0))
-        probe_rows = sorted({before, self.probe_at} - {0, None})
+        columns_id = _columns_id(columns)
+        if self.dry:
+            self.features[feature_id] = (tuple(columns), None, columns_id)
+            return self.features[feature_id]
+        n = bare.rows
+        probe_rows = sorted(
+            {bare.boundary(j * n // 6) for j in range(1, 6)} - {0, None}
+        )
         for row in probe_rows:
-            head = self._feature_columns(bare.upto(row).masked(revealed, row - 1))
+            head = self._feature_columns(step, bare.upto(row).masked(revealed, row - 1))
             for name, values in columns.items():
-                _refuse_changed(f"{self.name}: features", name, row, values, head[name])
+                try:
+                    _refuse_changed(
+                        f"{self.name}: features", name, values, head[name], at=row
+                    )
+                except Refused as error:
+                    plain = self._feature_columns(step, bare.upto(row))[name]
+                    if np.array_equal(plain, values[:row], equal_nan=True):
+                        raise Refused(
+                            f"{self.name}: features read a revealed target before its "
+                            f"reveal lag: column {name} changes before row {row} when "
+                            f"labels not yet known at row {row - 1} are hidden"
+                        ) from error
+                    raise
             del head
         run_id = self.start()
+        sha = self.ledger.put_blob(formats.session_save(Session(columns, None)))
         self.ledger.append(
             Event.FEATURES,
             self.evaluation.dataset,
-            self.feature_id,
+            feature_id,
             {
                 "pipeline": self.pipeline.id,
                 "run": run_id,
-                "features": identity.canonical(self.pipeline.features),
-                "import_shas": self.stage_shas["features"],
-                "code_keys": self.stage_keys["features"],
+                "features": identity.canonical(step),
+                "import_shas": identity.import_shas((step,), self.root),
+                "code_keys": identity.code_keys((step,), self.root),
                 "columns": list(columns),
-                "columns_id": _columns_id(columns),
+                "columns_id": columns_id,
                 "probe_rows": probe_rows,
                 "duration_s": duration,
-                "blob": {
-                    "sha": self.ledger.put_blob(
-                        formats.session_save(Session(columns, None))
-                    ),
-                    "format": PARQUET,
-                },
+                "blob": {"sha": sha, "format": PARQUET},
             },
-            id=self.feature_id,
+            id=feature_id,
         )
         self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
-        self.loaded[self.feature_id] = columns
-        return columns
+        self.features[feature_id] = (
+            tuple(columns),
+            self.ledger.blobs / sha,
+            columns_id,
+        )
+        return self.features[feature_id]
 
-    def _feature_columns(self, bare: Session) -> dict[str, np.ndarray]:
-        out = self.pipeline.features(bare)
+    def _feature_columns(self, step: Callable, bare: Session) -> dict[str, np.ndarray]:
+        out = step(bare)
         clash = sorted(set(out) & set(self.session.columns))
         if clash:
             raise Refused(f"{self.name}: features redefine dataset columns {clash}")
@@ -599,9 +652,7 @@ class _Stage:
             )
             if json.loads(rows[0]["env_lock"])["sha"] != self.env_lock["sha"]:
                 moved.append("environment lock")
-        if self.feature_id and not self.ledger.latest(Event.FEATURES, self.feature_id):
-            moved.append("features not computed; reused if the columns are unchanged")
-        return ", ".join(moved) or "train segments or members changed"
+        return ", ".join(moved) or "train segments, members or feature columns changed"
 
     def _probe(
         self,
@@ -618,9 +669,9 @@ class _Stage:
         at = visible.boundary((rng[0] + rng[1]) // 2, rng[0])
         if at is None:
             return
-        again = np.asarray(compute(visible.upto(at), (rng[0], at)), dtype=np.float64)
+        again = np.asarray(compute(visible.upto(at), (rng[0], at)))
         _refuse_changed(
-            f"{self.name}: {stage}", "prediction", at, output, again, rng[0]
+            f"{self.name}: {stage}", "prediction", output, again, at=at, first=rng[0]
         )
 
     def _model(self, fit_id: str) -> Any:
@@ -729,20 +780,47 @@ def _score(
 
 
 def _refuse_changed(
-    who: str, name: str, row: int, full: Any, head: Any, first: int = 0
+    who: str, name: str, full: Any, head: Any, at: int | None = None, first: int = 0
 ):
-    """Refuse when a step's output before ``row`` moved once the rows from ``row``
-    were gone; name the first row that moved and both values.
+    """Refuse when ``head``, a step's output recomputed on the rows before ``at`` (or
+    on another path to the same rows), differs from ``full`` by more than rounding:
+    ``1e-9`` of the largest finite value of ``full``, or 1024 ulps of a narrower float
+    dtype. Honest BLAS blocking and memory layout measure under 3e-12 of scale, the
+    smallest leak 1e-7, so the band separates them without a per-element ulp rule,
+    which is unsound near zero. NaN positions must agree. The message names the first
+    row that moved, both values, how many rows moved and the largest move as a
+    fraction of scale, so rounding and a leak read differently in one line.
     """
-    full = np.asarray(full, dtype=np.float64)[: len(head)]
+    dtype = np.asarray(full).dtype
+    rtol = 1e-9 if dtype.kind != "f" else max(1e-9, 1024 * np.finfo(dtype).eps)
+    full = np.asarray(full, dtype=np.float64)
+    finite = np.abs(full[np.isfinite(full)])
+    scale = float(finite.max()) if finite.size else 0.0
+    full = full[: len(head)]
     head = np.asarray(head, dtype=np.float64)
-    moved = np.flatnonzero((full != head) & ~(np.isnan(full) & np.isnan(head)))
+    close = np.isclose(full, head, rtol=0, atol=rtol * scale, equal_nan=True)
+    moved = np.flatnonzero(~close)
     if moved.size:
         r = moved[0]
+        gap = np.abs(full[moved] - head[moved])
+        worst = float(np.nanmax(np.where(np.isfinite(gap), gap, np.nan), initial=0.0))
+        where = f"read past row {at}" if at is not None else "is not stable"
+        before = f"on the rows before {at}" if at is not None else "the second time"
         raise Refused(
-            f"{who} read past row {row}: {name} at row {first + r} is {full[r]} on "
-            f"the whole input and {head[r]} on the rows before {row}"
+            f"{who} {where}: {name} at row {first + r} is {full[r]!r} on the whole "
+            f"input and {head[r]!r} {before}; {moved.size} of {len(head)} rows moved, "
+            f"by up to {worst:.3g}, {worst / scale if scale else np.inf:.3g} of the "
+            f"largest |{name}| {scale:.3g} (rounding is allowed up to {rtol:g})"
         )
+
+
+def _lag(stored: Any) -> Lag:
+    """A recipe's reveal lag: seconds as a timedelta, ``{"dates": n}`` as an int."""
+    if stored is None:
+        return None
+    if isinstance(stored, dict):
+        return int(stored["dates"])
+    return np.timedelta64(round(stored * 1e9), "ns")
 
 
 def _columns_id(columns: dict[str, np.ndarray]) -> str:
@@ -841,11 +919,24 @@ def _positional(func: Callable) -> int:
     return sum(p.kind in kinds for p in inspect.signature(func).parameters.values())
 
 
+UNTRACKED_DIFF_CAP = 1 << 20
+
+
 def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
-    def git(*args: str) -> str | None:
+    """The commit, whether the tree is dirty, and one diff of every change against
+    HEAD, untracked files included through a temporary index so git runs once; an
+    untracked file over a mebibyte is named, not diffed.
+    """
+
+    def git(*args: str, env: dict[str, str] | None = None) -> str | None:
         try:
             return subprocess.run(
-                ["git", *args], cwd=root, capture_output=True, text=True, check=True
+                ["git", *args],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=True,
+                env=env,
             ).stdout
         except (OSError, subprocess.CalledProcessError):
             return None
@@ -856,16 +947,24 @@ def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
     dirty = bool((git("status", "--porcelain") or "").strip())
     diff = None
     if dirty:
-        untracked = (git("ls-files", "--others", "--exclude-standard") or "").split()
-        text = (git("diff", "HEAD") or "") + "".join(
-            subprocess.run(
-                ["git", "diff", "--no-index", "--", os.devnull, path],
-                cwd=root,
-                capture_output=True,
-                text=True,
-            ).stdout
-            for path in untracked
+        paths = (git("ls-files", "-z", "--others", "--exclude-standard") or "").split(
+            "\0"
         )
+        paths = [p for p in paths if p]
+        big = [p for p in paths if (root / p).stat().st_size > UNTRACKED_DIFF_CAP]
+        small = [p for p in paths if p not in set(big)]
+        with tempfile.TemporaryDirectory() as tmp:
+            index = pathlib.Path(tmp) / "index"
+            current = root / (git("rev-parse", "--git-path", "index") or "").strip()
+            if current.is_file():
+                shutil.copy(current, index)
+            env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+            for at in range(0, len(small), 1000):
+                git("add", "-N", "--", *small[at : at + 1000], env=env)
+            text = (git("diff", "HEAD", env=env) or "") + "".join(
+                f"# untracked, over {UNTRACKED_DIFF_CAP >> 20} MiB, not diffed: {p}\n"
+                for p in big
+            )
         diff = {"sha": ledger.put_blob(text.encode()), "format": formats.Format.DIFF}
     return {"commit": commit.strip(), "dirty": dirty, "diff": diff}
 

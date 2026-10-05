@@ -110,6 +110,12 @@ class CalendarWalkForward:
             f"{max(len(at) - 1, 0)} {self.unit}s from the first cutoff "
             f"{self.first_cutoff} to {stop}, {reach} needed per fold"
         )
+        if self.unit == "month" and not self.end:
+            first = dates.add_months(dates.as_date(self.first_cutoff), reach)
+            why += (
+                f"; a month is whole or dropped, so set end={first} or later to score "
+                "a window that runs to the data's end, or use unit='day'"
+            )
         return _at_least(out, self.min_folds, why)
 
     def _boundaries(self, session: Session, stop: datetime.date) -> list[datetime.date]:

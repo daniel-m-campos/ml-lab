@@ -218,15 +218,15 @@ def code_keys(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, s
 
 @functools.cache
 def code_key(source: bytes) -> str:
-    """The code as compiled: ``ast.dump`` of the parsed source, every docstring with
-    its lines stripped. Comments, whitespace, quote style and line numbers are out, so a
-    step whose output reads its own source text or line numbers is outside the memo.
+    """The code as compiled: ``ast.dump`` of the parsed source with every docstring
+    removed. Comments, layout, quote style, line numbers and docstrings are out, so a
+    step whose output reads its own source text, ``__doc__`` or line numbers is
+    outside the memo, as under ``python -OO``.
     """
     tree = ast.parse(source)
     for node in ast.walk(tree):
         if isinstance(node, _DOC_OWNERS) and ast.get_docstring(node, clean=False):
-            doc = node.body[0].value
-            doc.value = "\n".join(s.strip() for s in doc.value.splitlines()).strip()
+            del node.body[0]
     return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:HASH_LEN]
 
 

@@ -23,6 +23,7 @@ $ sqlite3 -box .ml-lab/ml_lab.sqlite "SELECT * FROM score_latest"
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import importlib
 import os
 import pathlib
@@ -87,18 +88,37 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _run(args: argparse.Namespace, ledger: Ledger) -> int:
+    """Every evaluation in turn, one shared plan; a pipeline that fails in one is
+    skipped in the rest of this run and named once at the end, since failures are
+    not memoized and a rerun retries it.
+    """
     pipelines, evaluations = _experiments(args, ledger)
-    failed, planned = False, set()
+    failed: dict[str, str] = {}
+    planned: set[str] = set()
+    total = runs.RunReport()
     for evaluation in evaluations:
         print(f"evaluation {evaluation.id} {evaluation.name}".rstrip())
+        live = [p for p in pipelines if (p.name or p.id) not in failed]
+        if not live:
+            print("skipped: every pipeline failed above")
+            continue
         report = runs.run(
             ledger,
-            pipelines,
+            live,
             evaluation,
             log=lambda line: print(line, flush=True),
             dry=args.dry_run,
             planned=planned,
         )
+        for name, error in report.failed.items():
+            print(f"lab run: {name} failed: {error}")
+        failed |= report.failed
+        for field in dataclasses.fields(runs.RunReport)[1:7]:
+            setattr(
+                total,
+                field.name,
+                getattr(total, field.name) + getattr(report, field.name),
+            )
         if args.dry_run:
             print(
                 f"dry run: would compute fits {report.fits_computed}, predictions "
@@ -106,20 +126,26 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
                 f"reuse {report.fits_reused}, {report.predictions_reused}, "
                 f"{report.scores_reused}"
             )
-            continue
-        if not report.run:
+        elif not report.run:
             print(
                 f"up to date: {report.scores_reused} scores; {report.fits_reused} fits "
                 f"and {report.predictions_reused} predictions reused, nothing written"
             )
-            continue
+        else:
+            print(
+                f"run {report.run}: fits {report.fits_computed}, predictions "
+                f"{report.predictions_computed}, scores {report.scores_recorded}"
+            )
+    if len(evaluations) > 1:
+        verb = "would compute" if args.dry_run else "computed"
         print(
-            f"run {report.run}: fits {report.fits_computed}, predictions "
-            f"{report.predictions_computed}, scores {report.scores_recorded}"
+            f"total over {len(evaluations)} evaluations: {verb} fits "
+            f"{total.fits_computed}, predictions {total.predictions_computed}, scores "
+            f"{total.scores_recorded}; reuse {total.fits_reused}, "
+            f"{total.predictions_reused}, {total.scores_reused}"
         )
-        for name, error in report.failed.items():
-            print(f"lab run: {name} failed: {error}")
-        failed = failed or bool(report.failed)
+    if failed:
+        print(f"failed, skipped in later evaluations: {', '.join(failed)}")
     return 1 if failed else 0
 
 
@@ -155,10 +181,20 @@ def _experiments(
 
 def _dataset(ledger: Ledger, selector: str | None) -> str:
     """The dataset named by an id prefix or a source; with no selector, the newest,
-    provided every dataset in the ledger shares one source.
+    provided every dataset in the ledger shares one source. A source resolves to its
+    newest dataset only while one actor wrote it: two studies under one source name
+    are refused with their ids, since the newest would silently be someone else's.
     """
-    rows = ledger.sql("SELECT id, source FROM raw_dataset ORDER BY seq")
+    rows = ledger.sql("SELECT id, source, actor FROM raw_dataset ORDER BY seq")
     by_source: dict[str, str] = {r["source"]: r["id"] for r in rows}
+    if selector is None and len(by_source) == 1:
+        selector = rows[-1]["source"]
+    named = [r for r in rows if r["source"] == selector]
+    if len({r["actor"] for r in named}) > 1:
+        raise Refused(
+            f"source {selector} names datasets by several actors, pass an id: "
+            + ", ".join(f"{r['id'][:8]} ({r['actor']})" for r in named)
+        )
     if selector in by_source:
         return by_source[selector]
     if selector:

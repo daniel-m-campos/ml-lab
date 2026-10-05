@@ -239,6 +239,7 @@ def blend(*members: Pipeline, shrink: float = 1.0) -> Pipeline:
         load=blend_load,
         config=BlendConfig(shrink),
         members=members,
+        in_sample=True,
     )
 
 
@@ -407,3 +408,33 @@ def label_two_minutes_back(session: Session) -> dict[str, np.ndarray]:
 @step
 def label_one_minute_back(session: Session) -> dict[str, np.ndarray]:
     return {"f0_lag": np.r_[np.full(2, np.nan), session.columns[TARGET][:-2]]}
+
+
+@step
+def lagged_f1(session: Session) -> dict[str, np.ndarray]:
+    return {"f1_lag": np.concatenate([[np.nan], session.columns["f1"][:-1]])}
+
+
+@step
+def jittery_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+    """Ridge plus a rounding-sized wobble that depends on how many rows it sees."""
+    p = ridge_predict(model, session, rng)
+    return p + 1e-12 * np.abs(p).max() * (session.rows % 3)
+
+
+@step
+def add_f0_lag(pred: np.ndarray, session: Session, rng: Range) -> np.ndarray:
+    """Reads a feature column from the postprocess: inherited from the members."""
+    return pred + np.nan_to_num(session.column("f0_lag", rng))
+
+
+@step
+def label_one_date_back(session: Session) -> dict[str, np.ndarray]:
+    """The previous trading date's label at the same slot: known from the next date."""
+    return {"f0_lag": np.r_[np.full(20, np.nan), session.columns[TARGET][:-20]]}
+
+
+@step
+def label_one_row_back(session: Session) -> dict[str, np.ndarray]:
+    """The previous row's label: same date, so not yet known under a one-date lag."""
+    return {"f0_lag": np.r_[np.nan, session.columns[TARGET][:-1]]}

@@ -86,15 +86,23 @@ class Pipeline:
 
     ``save(model) -> bytes`` and ``load(bytes) -> model`` declare a format from
     ``formats.KNOWN``. ``features(session) -> {name: array}`` adds one column per
-    array. ``postprocess(predictions, session, range)`` is the cheap stateless stage
-    after ``predict``: neutralise, clip, rank. Its knobs are bound with
+    array; a tuple of steps adds each step's columns in order, every step memoized,
+    probed and shared on its own, and the steps' names must not collide. The added
+    columns are read through ``session.column`` and ``session.matrix`` by the names in
+    ``session.feature_columns``; they are not in ``session.columns``, and a column no
+    step reads is never loaded, so a learned selection lives in ``fit`` and costs only
+    the columns it keeps. ``postprocess(predictions, session, range)`` is the cheap
+    stateless stage after ``predict``: neutralise, clip, rank. Its knobs are bound with
     ``step.configured(**kwargs)`` so they enter the prediction's identity and not the
     fit's. A pipeline with ``members`` is a blend: its ``fit`` and ``predict`` take a
-    fourth argument, the members' predictions as a list of arrays: over the window for
-    ``predict``, and over the train segments for ``fit`` only when ``fit`` declares a
-    fourth positional parameter. Those are in-sample, so a weight learned on them
-    overfits; a three-argument ``fit`` sets fixed weights and computes no train-range
-    predictions. The members' fits and predictions are memoized on their own.
+    fourth argument, the members' predictions as a list of arrays, over the window for
+    ``predict`` and, only when ``in_sample=True``, over the train segments for ``fit``.
+    Those are in-sample, so a weight learned on them overfits; a blend with fixed
+    weights leaves ``in_sample`` off and computes no train-range predictions, and a
+    ``fit`` whose arity disagrees with ``in_sample`` is refused before anything runs.
+    A blend without its own ``features`` sees its members' feature columns when every
+    member declares the same steps. The members' fits and predictions are memoized on
+    their own.
 
     Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip.configured(
     at=3.0), name="gbt_clip")`` shares every fit and raw prediction with ``p``, since
@@ -108,9 +116,10 @@ class Pipeline:
     save: Callable
     load: Callable
     config: Any
-    features: Callable | None = None
+    features: Callable | tuple[Callable, ...] | None = None
     postprocess: Callable | None = None
     members: tuple[Pipeline, ...] = ()
+    in_sample: bool = False
     name: str = dataclasses.field(default="", metadata={"label": True})
 
     @property
@@ -122,9 +131,16 @@ class Pipeline:
         return self.save.__ml_lab_meta__.get("format")
 
     @property
+    def feature_steps(self) -> tuple[Callable, ...]:
+        """The features steps as a tuple, however declared."""
+        if self.features is None:
+            return ()
+        return self.features if isinstance(self.features, tuple) else (self.features,)
+
+    @property
     def steps(self) -> tuple[Callable, ...]:
         stages = (
-            self.features,
+            *self.feature_steps,
             self.fit,
             self.predict,
             self.save,

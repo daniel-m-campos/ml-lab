@@ -32,13 +32,15 @@ def record(
     params: Mapping[str, Any],
     filters: Sequence[Callable],
     targets: Sequence[str],
-    reveal: Mapping[str, datetime.timedelta] | None = None,
+    reveal: Mapping[str, datetime.timedelta | int] | None = None,
 ) -> str:
     """Apply the filters, check the targets, store the rows; returns the dataset id.
 
-    ``reveal`` maps a target to how long after its row's timestamp its label is
-    known; a features step may read a revealed target, probed against that lag.
-    Targets and their lags are part of the dataset id.
+    ``reveal`` maps a target to when its label is known: a ``timedelta`` after its
+    row's timestamp, or an ``int`` of later dates with rows (``1`` is the next
+    trading day's open, ``2`` two trading dates later whatever the calendar gap). A
+    features step may read a revealed target, probed against that lag. Targets and
+    their lags are part of the dataset id.
     """
     has_clock = session.ts is not None
     reveal = dict(reveal or {})
@@ -48,7 +50,7 @@ def record(
         raise KeyError(
             f"reveal names non-targets: {sorted(set(reveal) - set(targets))}"
         )
-    labels = {t: reveal[t].total_seconds() if t in reveal else None for t in targets}
+    labels = {t: _lag(reveal[t]) if t in reveal else None for t in targets}
     window = [str(d) for d in dates.span(session)] if has_clock else None
     recipe = {
         "source": source,
@@ -77,7 +79,14 @@ def record(
     return dataset_id
 
 
-def data_id(session: Session, targets: Mapping[str, float | None] | None = None) -> str:
+def _lag(reveal: datetime.timedelta | int) -> float | dict[str, int]:
+    """Seconds for a time lag, ``{"dates": n}`` for a count of later dates."""
+    if isinstance(reveal, datetime.timedelta):
+        return reveal.total_seconds()
+    return {"dates": int(reveal)}
+
+
+def data_id(session: Session, targets: Mapping[str, Any] | None = None) -> str:
     """The content id of a session: its column names, dtypes and bytes, and which
     columns are targets with their reveal lags in seconds.
     """
