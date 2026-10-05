@@ -370,7 +370,7 @@ def panel(ledger: Ledger, reveal: Any = None) -> str:
 
 
 def label_two_minutes_back(dataset: Dataset) -> dict[str, np.ndarray]:
-    return {"f0_lag": np.r_[np.full(4, np.nan), dataset.columns[TARGET][:-4]]}
+    return {"f0_lag": np.r_[np.zeros(4), dataset.columns[TARGET][:-4]]}
 
 
 def label_one_minute_back(dataset: Dataset) -> dict[str, np.ndarray]:
@@ -410,8 +410,8 @@ def label_memory_fit(
 
 
 def label_replay_predict(model: RidgeModel, dataset: Dataset, rng: Range) -> np.ndarray:
-    """Replays the memorized labels over ``rng``, zero past them."""
+    """Replays the memorized labels over ``rng``, zero past them or where blank."""
     seen = np.zeros(rng[1] - rng[0])
     known = model.weights[rng[0] : rng[1]]
-    seen[: len(known)] = known
+    seen[: len(known)] = np.nan_to_num(known)
     return seen

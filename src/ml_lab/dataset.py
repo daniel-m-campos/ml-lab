@@ -62,6 +62,7 @@ class Dataset:
         self.feature_columns = feature_columns
         self.stores = stores or {}
         self.cut: int | None = None
+        self.keep: np.ndarray | None = None
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.isnat(self.ts).any():
             raise ValueError("timestamps must not contain NaT")
@@ -95,6 +96,7 @@ class Dataset:
         view.feature_columns = self.feature_columns
         view.stores = self.stores
         view.cut = min(row, self.rows)
+        view.keep = None if self.keep is None else self.keep[:row]
         return view
 
     def masked(self, reveal: dict[str, Lag], at: int) -> Dataset:
@@ -119,12 +121,14 @@ class Dataset:
             view.columns[name] = values
         return view
 
-    def train_view(self, targets: tuple[str, ...], train: tuple[Range, ...]) -> Dataset:
-        """The view a fit sees: target columns NaN outside ``train``."""
+    def train_view(self, train: Segments) -> Dataset:
+        """The view a fit sees: every column, feature columns included, blank outside
+        ``train``, so a fit reads no row of a range it is scored on. A blank is NaN, NaT
+        or None by dtype; an integer or boolean column becomes float.
+        """
         view = self.upto(self.rows)
-        keep = row_mask(self.rows, train)
-        for name in targets:
-            view.columns[name] = np.where(keep, view.columns[name], np.nan)
+        view.keep = row_mask(self.rows, train)
+        view.columns = {n: _blank(a, view.keep) for n, a in view.columns.items()}
         return view
 
     def boundary(self, row: int, lo: int = 0) -> int | None:
@@ -140,6 +144,21 @@ class Dataset:
             return first
         after = int(np.searchsorted(self.ts, self.ts[row], "right"))
         return after if after < self.rows else None
+
+    def date_starts(self, lo: int, hi: int) -> np.ndarray:
+        """The first row of each date among rows ``lo`` to ``hi``, then ``hi``; without
+        a clock the rows are one date.
+        """
+        if self.ts is None:
+            return np.array([lo, hi])
+        day = self.ts[lo:hi].astype("datetime64[D]")
+        return np.r_[lo + np.flatnonzero(np.r_[True, day[1:] != day[:-1]]), hi]
+
+    def middle(self, lo: int, hi: int) -> int:
+        """The first row of the middle timestamp among rows ``lo`` to ``hi``."""
+        stamps = np.arange(lo, hi) if self.ts is None else self.ts[lo:hi]
+        first = np.unique(stamps, return_index=True)[1]
+        return lo + int(first[len(first) // 2])
 
     def matrix(self, rows: Rows, cols: tuple[str, ...]) -> np.ndarray:
         """Column-stacked features over a range or segments, shape (rows, len(cols)),
@@ -173,15 +192,21 @@ class Dataset:
                 f"feature columns {list(self.feature_columns)}"
             )
         scan = pl.scan_parquet(self.stores[name]).select(name)
-        return np.concatenate(
+        values = np.concatenate(
             [scan.slice(lo, hi - lo).collect()[name].to_numpy() for lo, hi in parts]
         )
+        if self.keep is None:
+            return values
+        return _blank(values, np.concatenate([self.keep[lo:hi] for lo, hi in parts]))
 
     def _dtype(self, name: str) -> np.dtype:
         if name in self.columns:
             return self.columns[name].dtype
         schema = pl.read_parquet_schema(self.stores[name])
-        return pl.Series([], dtype=schema[name]).to_numpy().dtype
+        dtype = pl.Series([], dtype=schema[name]).to_numpy().dtype
+        if self.keep is None:
+            return dtype
+        return _blank(np.empty(0, dtype), np.empty(0, bool)).dtype
 
     def _clock(self) -> np.ndarray:
         if self.ts is None:
@@ -202,6 +227,16 @@ def row_mask(size: int, rows: Rows) -> np.ndarray:
     return mask
 
 
+def _blank(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
+    """A copy of ``values`` blank where ``keep`` is False."""
+    kind = values.dtype.kind
+    text, clock = kind in "OSU", kind in "mM"
+    dtype = object if text else values.dtype if clock or kind in "fc" else np.float64
+    out = values.astype(dtype, copy=True)
+    out[~keep] = None if text else "NaT" if clock else np.nan
+    return out
+
+
 # Recording ============================================================================
 
 
@@ -214,6 +249,7 @@ def record(
     filters: Sequence[Callable],
     targets: Sequence[str],
     reveal: Mapping[str, datetime.timedelta | np.timedelta64 | int] | None = None,
+    sealed_from: int | str | None = None,
 ) -> str:
     """Apply the filters, check the targets, store the rows; returns the dataset id.
 
@@ -221,8 +257,15 @@ def record(
     ``numpy.timedelta64`` after its row's timestamp, or an ``int`` of later dates with
     rows (``1`` is the next trading day's open, ``2`` two trading dates later whatever
     the calendar gap). A features function may read a revealed target, probed against
-    that lag. Targets and their lags are part of the dataset id.
+    that lag. ``sealed_from``, a row or a date (its first row at or after it), starts
+    the sealed tail that only an ``Evaluation(sealed=True)`` validates on, each pipeline
+    once. Targets, their lags and the sealed tail's first row are part of the dataset
+    id.
     """
+    if not targets:
+        raise Refused(
+            "a dataset declares at least one target; without one nothing is masked"
+        )
     if dataset.rows == 0:
         raise ValueError("a dataset needs at least one row")
     has_clock = dataset.ts is not None
@@ -253,7 +296,14 @@ def record(
             f"targets {text} are not numeric; targets are masked with NaN, so encode "
             "labels as numbers"
         )
-    dataset_id = data_id(dataset, labels)
+    wide = {n: a.shape for n, a in dataset.columns.items() if a.ndim != 1}
+    if wide:
+        raise Refused(
+            f"columns of shape {wide}; a column is 1-D, one value per row, so split a "
+            "2-D array into named columns"
+        )
+    sealed = _sealed(dataset, sealed_from)
+    dataset_id = data_id(dataset, labels, sealed)
     if ledger.latest(Event.DATASET, dataset_id) is not None:
         return dataset_id
     sha = ledger.put_blob(rows_save(dataset))
@@ -262,6 +312,7 @@ def record(
         "window": window,
         "recipe": identity.canonical(recipe),
         "rows": dataset.rows,
+        "sealed_from": sealed,
         "blob": {"sha": sha, "format": formats.Format.PARQUET},
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
@@ -272,6 +323,21 @@ def _numeric(dtype: np.dtype) -> bool:
     return np.issubdtype(dtype, np.number) or np.issubdtype(dtype, np.bool_)
 
 
+def _sealed(dataset: Dataset, sealed_from: int | str | None) -> int | None:
+    """The row the sealed tail starts at, inside the dataset."""
+    if sealed_from is None:
+        return None
+    row = sealed_from
+    if not isinstance(row, (int, np.integer)):
+        row = dataset.index_of(sealed_from)
+    if not 0 < row < dataset.rows:
+        raise Refused(
+            f"sealed_from {sealed_from!r} is row {row} of {dataset.rows}; a sealed "
+            "tail starts after the first row and before the last"
+        )
+    return int(row)
+
+
 def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str, int]:
     """Seconds for a time lag, ``{"dates": n}`` for a count of later dates."""
     time = isinstance(reveal, (datetime.timedelta, np.timedelta64))
@@ -279,23 +345,35 @@ def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str,
         raise TypeError(
             f"a reveal lag is a timedelta or an int, not {type(reveal).__name__}"
         )
+    if not time and reveal < 1:
+        raise Refused(
+            "an integer lag counts later dates and starts at 1; a same-date reveal is "
+            "a timedelta"
+        )
     lag = reveal / np.timedelta64(1, "s") if time else reveal
     if lag < 0:
         raise ValueError(f"a reveal lag cannot be negative: {reveal!r}")
     return lag if time else {"dates": lag}
 
 
-def data_id(dataset: Dataset, targets: Mapping[str, Any] | None = None) -> str:
+def data_id(
+    dataset: Dataset,
+    targets: Mapping[str, Any] | None = None,
+    sealed_from: int | None = None,
+) -> str:
     """The content id of a dataset: its ``ts`` bytes, column names, dtypes and values
-    (a string column by its strings), and which columns are targets with their reveal
-    lags in seconds or a count of dates.
+    (a string column by its strings), which columns are targets with their reveal lags
+    in seconds or a count of dates, and the sealed tail's first row when it has one.
     """
     ts = None if dataset.ts is None else identity.bytes_hash(dataset.ts.tobytes())
     columns = {
         name: [str(a.dtype), identity.array_hash(a)]
         for name, a in dataset.columns.items()
     }
-    return identity.content_hash({"ts": ts, "columns": columns, "targets": targets})
+    sealed = {} if sealed_from is None else {"sealed_from": sealed_from}
+    return identity.content_hash(
+        {"ts": ts, "columns": columns, "targets": targets, **sealed}
+    )
 
 
 def load(ledger: Ledger, dataset_id: str) -> Dataset:

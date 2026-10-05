@@ -1,6 +1,8 @@
 """Splits: how a dataset becomes folds. Row-based splits need no clock; with one,
-every cut lands on the first row of its timestamp. The calendar walk-forward reads the
-dataset's ``ts``.
+every cut lands on the first row of its timestamp. An embargo edge is a count of rows
+from a cut and does not snap, so ``embargo_rows`` can end a train segment inside a
+timestamp; the calendar walk-forward reads the dataset's ``ts`` and embargoes whole
+timestamps.
 
 A fold trains on contiguous segments and scores one validation range. A splitter is a
 frozen dataclass, so it hashes into the evaluation id like any declaration, and a
@@ -203,4 +205,9 @@ def _at_least(folds: list[Fold], minimum: int, why: str = "") -> list[Fold]:
     bare = [f.label for f in folds if all(lo >= hi for lo, hi in f.train)]
     if bare:
         raise Refused(f"split yields folds with no train rows: {bare}; start later")
+    twice = sorted(
+        {f.label for f in folds if [g.label for g in folds].count(f.label) > 1}
+    )
+    if twice:
+        raise Refused(f"split yields fold labels {twice} twice; label each fold once")
     return folds

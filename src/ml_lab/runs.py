@@ -25,8 +25,9 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import numpy as np
@@ -66,6 +67,7 @@ def run(
     evaluation: Evaluation,
     *,
     code_root: pathlib.Path | None = None,
+    experiments: Sequence[types.ModuleType] = (),
     log: Callable[[str], None] = lambda line: None,
     dry: bool = False,
     planned: set[str] | None = None,
@@ -82,15 +84,20 @@ def run(
     declaration are refused, since the ledger keeps one name per id and would score the
     second as a duplicate. ``log`` receives one line per feature set, fit, prediction
     set and score as it is written. A ``dry`` run computes every id, looks each one up
-    and writes nothing; it computes features it would need without the five-prefix
+    and writes nothing; it computes features it would need without the features
     probe, so every id is one a real run would write, and logs what it would compute
     and, for a fit, which repo files moved against the newest earlier fit of the same
     pipeline and label. ``planned`` carries the ids a dry run would write across several
     calls, so shared work counts once. A declaration error (a function that is not
-    module-level, a slot holding something that is not a function, a config class its
-    function does not import, a blend whose ``fit`` arity disagrees with ``in_sample``,
-    ``in_sample`` without members), at any depth of blends inside blends, is refused
-    before anything is read or written.
+    module-level, a slot holding something that is not a function, a config class at
+    any depth its function does not import, a blend whose ``fit`` arity disagrees with
+    ``in_sample``, ``in_sample`` without members), at any depth of blends inside blends,
+    is refused before anything is read or written, as is a reached module the memo
+    cannot see (``identity.refuse_unseen_code``) and an evaluation that validates on a
+    sealed tail without ``sealed=True``. ``code_root`` is where repo modules are hashed
+    from, the git root of the first pipeline's fit when not given; the code keys of
+    ``experiments``, the modules ``lab run`` imported, join every id, since a module
+    that sets a global a function reads is code the function runs.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -128,6 +135,21 @@ def run(
     root = code_root or identity.repo_root(
         pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
     )
+    scoring = _scoring(evaluation)
+    identity.refuse_unseen_code(
+        [
+            *scoring,
+            *experiments,
+            *(
+                f
+                for pipeline in pipelines
+                for p in _nested(pipeline)
+                for stage in _stages(p).values()
+                for f in stage
+            ),
+        ],
+        root,
+    )
     for pipeline in pipelines:
         for p in _nested(pipeline):
             shas = identity.import_shas((p.fit, p.save, p.load), root)
@@ -135,15 +157,15 @@ def run(
             if p.postprocess is not None:
                 shas = identity.import_shas((p.postprocess,), root)
                 _refuse_unseen_class(p.postprocess_config, shas, root, "postprocess")
-    scoring = (evaluation.scorer.score, evaluation.scorer.metrics)
-    scorer_shas = identity.import_shas(scoring, root)
+    scorer_shas = identity.import_shas(scoring[:2], root)
     _refuse_unseen_class(evaluation.config, scorer_shas, root, "scorer")
     dataset = load(ledger, evaluation.dataset)
-    recipe = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]["recipe"]
-    targets = {name: _lag(lag) for name, lag in recipe["targets"].items()}
+    recorded = ledger.latest(Event.DATASET, evaluation.dataset)["payload"]
+    targets = {name: _lag(lag) for name, lag in recorded["recipe"]["targets"].items()}
     schedule = evaluation.split.folds(dataset)
     _refuse_overlap(schedule)
     _refuse_unrevealed(dataset, targets, schedule)
+    _refuse_sealed(evaluation, schedule, recorded["sealed_from"])
     _declare_evaluation(ledger, evaluation, schedule, dry)
     report = RunReport()
 
@@ -183,6 +205,7 @@ def run(
         log,
         dry,
         set() if planned is None else planned,
+        identity.own_keys(experiments, root),
     )
     for pipeline in pipelines:
         if not dry:
@@ -227,6 +250,7 @@ class _Run:
     log: Callable[[str], None]
     dry: bool
     planned: set[str]
+    experiment_keys: dict[str, str]
     features: dict[str, Features] = dataclasses.field(default_factory=dict)
     stages: dict[str, _Stage] = dataclasses.field(default_factory=dict)
 
@@ -267,23 +291,23 @@ class _Stage:
             self.feature_functions = shared.pop()
         self.shas = identity.import_shas(pipeline.functions, self.root)
         self.functions = {
+            **_stages(pipeline),
             "features": self.feature_functions,
-            "fit": (pipeline.fit, pipeline.save, pipeline.load),
-            "predict": (pipeline.predict,),
-            "postprocess": (pipeline.postprocess,) if pipeline.postprocess else (),
         }
         self.stage_shas = {
             stage: identity.import_shas(functions, self.root)
             for stage, functions in self.functions.items()
         }
         self.stage_keys = {
-            stage: identity.code_keys(functions, self.root)
-            for stage, functions in self.functions.items()
+            stage: self._keys(functions) for stage, functions in self.functions.items()
         }
         self.dists = identity.imported_dists(pipeline.functions, self.root)
-        self.lock_text = _lock_text(self.dists)
+        self.locks = {
+            stage: _lock_text(identity.imported_dists(functions, self.root))
+            for stage, functions in self.functions.items()
+        }
         self.env_lock = {
-            "sha": identity.bytes_hash(self.lock_text.encode()),
+            "sha": identity.bytes_hash(self.locks["fit"].encode()),
             "format": formats.Format.TEXT,
         }
         self.feature_ids = [
@@ -291,7 +315,7 @@ class _Stage:
                 {
                     "dataset": self.evaluation.dataset,
                     "features": function,
-                    "code_keys": identity.code_keys((function,), self.root),
+                    "code_keys": self._keys((function,)),
                     "env_lock": identity.bytes_hash(
                         _lock_text(
                             identity.imported_dists((function,), self.root)
@@ -304,15 +328,22 @@ class _Stage:
         self.featured: Dataset | None = None
         self.models: dict[str, Any] = {}
         self.pending: dict[str, tuple[Any, str, dict[str, Any]]] = {}
-        self.fits: dict[str, str] = {}
+        self.fits: dict[tuple[tuple[int, int], ...], str] = {}
         self.checked: set[str] = set()
         self.widths: dict[str, tuple[int, ...]] = {}
 
     def fit(self, fold: Fold, index: int) -> str:
-        if fold.label in self.fits:
-            return self.fits[fold.label]
-        self.fits[fold.label] = fit_id = self._fit(fold, index)
-        return fit_id
+        """The fit id of the fold's train segments, computed once per run."""
+        train = tuple(tuple(segment) for segment in fold.train)
+        if train not in self.fits:
+            self.fits[train] = self._fit(fold, index)
+        return self.fits[train]
+
+    def _keys(self, functions: tuple[Callable, ...]) -> dict[str, str]:
+        return {
+            **identity.code_keys(functions, self.root),
+            **self.experiment_keys,
+        }
 
     def _fit(self, fold: Fold, index: int) -> str:
         train = [list(seg) for seg in fold.train]
@@ -346,9 +377,7 @@ class _Stage:
             self.report.fits_computed += 1
             self.log(f"would fit {self.name} {fold.label}: {self._why(fold.label)}")
             return fit_id
-        visible = self._visible(max(hi for _, hi in fold.train)).train_view(
-            tuple(self.targets), fold.train
-        )
+        visible = self._visible(max(hi for _, hi in fold.train)).train_view(fold.train)
         inputs = (
             [
                 [
@@ -369,7 +398,7 @@ class _Stage:
         self.models[fit_id] = self.pipeline.load(self.ledger.get_blob(blob["sha"]))
         self._check_imports("fit", loaded)
         self._unchanged("fit")
-        self.ledger.put_blob(self.lock_text.encode())
+        self.ledger.put_blob(self.locks["fit"].encode())
         self.pending[fit_id] = (
             model,
             why,
@@ -390,10 +419,15 @@ class _Stage:
         self.report.fits_computed += 1
         return fit_id
 
-    def predictions(self, fit_id: str, fold: Fold, index: int, rng: Range) -> str:
+    def predictions(
+        self, fit_id: str, fold: Fold, index: int, rng: Range, train: bool = False
+    ) -> str:
+        """The prediction id over ``rng``: the fold's test range, or with ``train`` one
+        of its train segments, seen through the fit's view, for an in-sample blend.
+        """
         member_fits = [m.fit(fold, index) for m in self.members]
         member_preds = [
-            m.predictions(f, fold, index, rng)
+            m.predictions(f, fold, index, rng, train)
             for m, f in zip(self.members, member_fits, strict=True)
         ]
         raw_id = identity.content_hash(
@@ -402,6 +436,7 @@ class _Stage:
                 "range": list(rng),
                 "predict": self.pipeline.predict,
                 "code_keys": self.stage_keys["predict"],
+                "env_lock": identity.bytes_hash(self.locks["predict"].encode()),
                 **({"members": member_preds} if self.members else {}),
             }
         )
@@ -413,6 +448,7 @@ class _Stage:
                     "postprocess": self.pipeline.postprocess,
                     "postprocess_config": self.pipeline.postprocess_config,
                     "code_keys": self.stage_keys["postprocess"],
+                    "env_lock": identity.bytes_hash(self.locks["postprocess"].encode()),
                 }
             )
         if pred_id in self.planned:
@@ -434,7 +470,10 @@ class _Stage:
             "fold": index,
             **({"members": member_preds} if self.members else {}),
         }
-        visible = self._visible(rng[1]).masked(self.targets, rng[0])
+        visible = self._visible(rng[1])
+        if train:
+            visible = visible.train_view(fold.train)
+        visible = visible.masked(self.targets, rng[0])
         self.start()
         if self.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
             raw = _load_predictions(self.ledger, raw_id)
@@ -456,6 +495,8 @@ class _Stage:
                 "predict", raw, lambda v, part: predict(model, v, part), visible, rng
             )
             self._check_imports("predict", loaded)
+            if self.pipeline.postprocess is None and not train:
+                self._refuse_non_finite("predict", raw, fold, rng)
             raw = self._write(raw_id, raw, where)
             self.log(f"predictions {self.name} rows {rng[0]}:{rng[1]}")
         if self.pipeline.postprocess is not None:
@@ -476,6 +517,8 @@ class _Stage:
                 rng,
             )
             self._check_imports("postprocess", loaded)
+            if not train:
+                self._refuse_non_finite("postprocess", post, fold, rng)
             self._write(
                 pred_id,
                 post,
@@ -514,7 +557,7 @@ class _Stage:
         self, member_fits: list[str], fold: Fold, index: int
     ) -> list[list[str]]:
         return [
-            [member.predictions(fit_id, fold, index, seg) for seg in fold.train]
+            [member.predictions(fit_id, fold, index, seg, True) for seg in fold.train]
             for member, fit_id in zip(self.members, member_fits, strict=True)
         ]
 
@@ -585,8 +628,10 @@ class _Stage:
 
     def _features(self, function: Callable, feature_id: str) -> Features:
         """One features function's columns, computed once per feature id over the
-        dataset without its targets, probed on five prefixes and stored; a dry run
-        computes and stores nothing, so the names and id are known.
+        dataset without its targets, probed and stored; a dry run computes and stores
+        nothing, so the names and id are known. The probe cuts at each sixth of the
+        rows and at the middle timestamp of the date each sixth falls in, so a cut
+        lands inside a date even when the sixths fall on date opens.
         """
         if feature_id in self.features:
             return self.features[feature_id]
@@ -617,9 +662,11 @@ class _Stage:
                 feature_id, (tuple(columns), None, columns_id)
             )
         n = bare.rows
-        probe_rows = sorted(
-            {bare.boundary(j * n // 6) for j in range(1, 6)} - {0, None}
-        )
+        sixths = [j * n // 6 for j in range(1, 6)]
+        starts = bare.date_starts(0, n)
+        days = np.searchsorted(starts, sixths, "right") - 1
+        middles = {bare.middle(starts[d], starts[d + 1]) for d in days}
+        probe_rows = sorted(({bare.boundary(r) for r in sixths} | middles) - {0, None})
         for row in probe_rows:
             head = self._feature_columns(
                 function, bare.upto(row).masked(revealed, row - 1)
@@ -655,7 +702,7 @@ class _Stage:
                 "run": run_id,
                 "features": identity.canonical(function),
                 "import_shas": identity.import_shas((function,), self.root),
-                "code_keys": identity.code_keys((function,), self.root),
+                "code_keys": self._keys((function,)),
                 "columns": list(columns),
                 "columns_id": columns_id,
                 "probe_rows": probe_rows,
@@ -714,17 +761,24 @@ class _Stage:
         visible: Dataset,
         rng: Range,
     ):
-        """Rerun the function on the rows before the first row of the range's middle
-        timestamp, with its array inputs cut there, and require the predictions
-        before it to stand; every computed range, before it is written.
+        """Rerun the function on the rows before each cut, with its array inputs cut
+        there, and require the predictions before it to stand; every computed range,
+        before it is written. The cuts are the middle timestamp of the range's middle
+        date and one strictly inside its last date, when they exist, so a read of a
+        later row of the same date is caught however the range meets the calendar.
         """
-        at = visible.boundary((rng[0] + rng[1]) // 2, rng[0])
-        if at is None:
-            return
-        again = np.asarray(compute(visible.upto(at), (rng[0], at)))
-        _refuse_changed(
-            f"{self.name}: {stage}", "prediction", output, again, at=at, first=rng[0]
-        )
+        lo, hi = rng
+        starts = visible.date_starts(lo, hi)
+        middle = len(starts) // 2 - 1
+        cuts = {
+            visible.middle(starts[d], starts[d + 1]): floor
+            for d, floor in ((middle, lo), (len(starts) - 2, starts[-2]))
+        }
+        for at in sorted(at for at, floor in cuts.items() if at > floor):
+            again = np.asarray(compute(visible.upto(at), (lo, at)))
+            _refuse_changed(
+                f"{self.name}: {stage}", "prediction", output, again, at=at, first=lo
+            )
 
     def _one_per_row(self, stage: str, output: Any, rng: Range) -> np.ndarray:
         values = np.asarray(output)
@@ -742,6 +796,19 @@ class _Stage:
                 f"on an earlier fold; the width is a property of {stage}"
             )
         return values
+
+    def _refuse_non_finite(
+        self, stage: str, values: np.ndarray, fold: Fold, rng: Range
+    ):
+        rows = ~np.isfinite(np.asarray(values, np.float64)).reshape(len(values), -1)
+        bad = np.flatnonzero(rows.any(axis=1))
+        if bad.size:
+            raise Refused(
+                f"{self.name}: {stage} returned a non-finite value on {bad.size} of "
+                f"{len(values)} rows of fold {fold.label}, the first at row "
+                f"{rng[0] + bad[0]}; a scored prediction is finite, so fill or drop "
+                f"them in {stage}"
+            )
 
     def _check_imports(self, stage: str, loaded: set[str]):
         """Check each stage once, on its first computation, before its write."""
@@ -780,19 +847,27 @@ def _score(
     ledger, evaluation, report = context.ledger, context.evaluation, context.report
     name = pipeline.name or pipeline.id
     scorer = evaluation.scorer
-    scoring = (scorer.score, scorer.metrics)
+    scoring = _scoring(evaluation)
     scorer_shas = identity.import_shas(scoring, context.root)
+    lock = _lock_text(identity.imported_dists(scoring, context.root))
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
             "pipeline": pipeline.id,
             "predictions": sorted(predictions.values()),
-            "scorer_keys": identity.code_keys(scoring, context.root),
+            "scorer_keys": {
+                **identity.code_keys(scoring, context.root),
+                **context.experiment_keys,
+            },
+            "env_lock": identity.bytes_hash(lock.encode()),
+            "directions": evaluation.directions,
         }
     )
     if ledger.latest(Event.SCORE, score_id) is not None:
         report.scores_reused += 1
         return
+    if evaluation.sealed:
+        _refuse_rescoring(ledger, evaluation, pipeline)
     if context.dry:
         report.scores_recorded += 1
         context.log(f"would score {name}")
@@ -803,11 +878,10 @@ def _score(
         visible = context.dataset.upto(fold.test[1])
         rows = np.asarray(scorer.score(pred, visible, fold.test, evaluation.config))
         parts.append(rows)
-        per_fold.append(
-            {"fold": index, "label": fold.label, "metrics": evaluation.metrics(rows)}
-        )
+        metrics = _finite(name, evaluation.metrics(rows), f"fold {fold.label}")
+        per_fold.append({"fold": index, "label": fold.label, "metrics": metrics})
     whole = np.concatenate(parts)
-    aggregate = evaluation.metrics(whole)
+    aggregate = _finite(name, evaluation.metrics(whole), "the pooled folds")
     columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
     names = scorer.columns or [str(i) for i in range(columns.shape[1])]
     if len(names) != columns.shape[1]:
@@ -841,6 +915,20 @@ def _score(
     context.log(
         f"score {name} " + " ".join(f"{k}={v:.4g}" for k, v in aggregate.items())
     )
+
+
+def _finite(name: str, metrics: dict[str, Any], where: str) -> dict[str, Any]:
+    bad = sorted(
+        k
+        for k, v in metrics.items()
+        if not isinstance(v, (int, float, np.number)) or not np.isfinite(v)
+    )
+    if bad:
+        raise Refused(
+            f"{name}: metrics {bad} are not finite on {where}; a metric is a finite "
+            "number, so return one for an empty or constant series too"
+        )
+    return metrics
 
 
 def _refuse_changed(
@@ -926,6 +1014,39 @@ def _refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fo
             "the split drops now and they all clear; a label known at a later date's "
             "open takes an integer reveal lag, record(reveal={name: dates}), which is "
             "exact across holidays"
+        )
+
+
+def _refuse_sealed(evaluation: Evaluation, folds: list[Fold], sealed: int | None):
+    """A sealed tail is validated only by a sealed evaluation, and a sealed evaluation
+    needs one.
+    """
+    name = evaluation.name or evaluation.id
+    if evaluation.sealed and sealed is None:
+        raise Refused(
+            f"evaluation {name} is sealed and dataset {evaluation.dataset} has no "
+            "sealed tail; record the dataset with sealed_from"
+        )
+    late = [f for f in folds if sealed is not None and f.test[1] > sealed]
+    if late and not evaluation.sealed:
+        lo, hi = late[0].test
+        raise Refused(
+            f"evaluation {name} is not sealed and fold {late[0].label} validates rows "
+            f"{lo} to {hi}, past row {sealed} where the dataset's sealed tail starts; "
+            f"end its folds by row {sealed}, or declare Evaluation(sealed=True)"
+        )
+
+
+def _refuse_rescoring(ledger: Ledger, evaluation: Evaluation, pipeline: Pipeline):
+    held = ledger.sql(
+        "SELECT id FROM raw_score WHERE evaluation = ? AND pipeline = ?",
+        (evaluation.id, pipeline.id),
+    )
+    if held:
+        raise Refused(
+            f"sealed evaluation {evaluation.name or evaluation.id} already scored "
+            f"pipeline {pipeline.name or pipeline.id} as score {held[0]['id']}; a "
+            "sealed evaluation scores each pipeline once"
         )
 
 
@@ -1017,23 +1138,64 @@ def _declare_evaluation(
 
 
 def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by: str):
-    """A dataclass config defined in a repo module its consumer does not import would
-    let an edited default reuse a stale fit; refuse and say where to define it.
+    """A dataclass in a config, at any depth, defined in a repo module its consumer
+    does not import would let an edited default reuse a stale fit; refuse and say
+    where to define it.
     """
-    if not dataclasses.is_dataclass(obj) or isinstance(obj, type):
-        return
-    module = sys.modules.get(type(obj).__module__)
-    file = getattr(module, "__file__", None)
-    if not file:
-        return
-    file, root = pathlib.Path(file).resolve(), root.resolve()
-    rel = file.relative_to(root).as_posix() if root in file.parents else None
-    if rel is not None and rel not in shas:
-        raise Refused(
-            f"{type(obj).__name__} is defined in {rel}, which the {by} function does "
-            "not import, so a default edited there would not refit; define it beside "
-            f"the {by} function"
-        )
+    root = root.resolve()
+    for held in _held(obj):
+        if not dataclasses.is_dataclass(held) or isinstance(held, type):
+            continue
+        file = getattr(sys.modules.get(type(held).__module__), "__file__", None)
+        if not file:
+            continue
+        file = pathlib.Path(file).resolve()
+        rel = file.relative_to(root).as_posix() if root in file.parents else None
+        if rel is not None and rel not in shas:
+            raise Refused(
+                f"{type(held).__name__} is defined in {rel}, which the {by} function "
+                "does not import, so a default edited there would not refit; define "
+                f"it beside the {by} function"
+            )
+
+
+def _held(config: Any) -> list[Any]:
+    """The dataclass instances and callables a config holds at any depth, in dataclass
+    fields, dict values, lists and tuples; their modules join the closure of the
+    function that reads the config.
+    """
+    if dataclasses.is_dataclass(config) and not isinstance(config, type):
+        values = [getattr(config, f.name) for f in dataclasses.fields(config)]
+        return [config, *(h for v in values for h in _held(v))]
+    if isinstance(config, dict):
+        return [h for v in config.values() for h in _held(v)]
+    if isinstance(config, (list, tuple)):
+        return [h for v in config for h in _held(v)]
+    return [config] if callable(config) else []
+
+
+def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
+    """What each stage's memo hashes: its functions and what their configs hold."""
+    post = pipeline.postprocess
+    return {
+        "features": pipeline.feature_functions,
+        "fit": (
+            pipeline.fit,
+            pipeline.save,
+            pipeline.load,
+            *_held(pipeline.config),
+        ),
+        "predict": (pipeline.predict,),
+        "postprocess": (post, *_held(pipeline.postprocess_config)) if post else (),
+    }
+
+
+def _scoring(evaluation: Evaluation) -> tuple[Any, ...]:
+    """What the score's memo hashes: the scorer's functions and what its config
+    holds.
+    """
+    scorer = evaluation.scorer
+    return (scorer.score, scorer.metrics, *_held(evaluation.config))
 
 
 def _nested(pipeline: Pipeline) -> Iterator[Pipeline]:

@@ -13,14 +13,18 @@ import importlib
 import io
 import json
 import math
+import os
 import pathlib
+import py_compile
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import textwrap
 import threading
 import types
+from collections.abc import Iterator
 
 import numpy as np
 import polars as pl
@@ -59,6 +63,16 @@ def dataset(ledger: Ledger) -> str:
 @pytest.fixture
 def evaluation(dataset: str):
     return synthetic.evaluation(dataset)
+
+
+@pytest.fixture
+def scratch(request) -> Iterator[pathlib.Path]:
+    """A directory under the repo, so inside a run's code root, that git ignores."""
+    path = REPO / ".scratch" / re.sub(r"\W", "_", request.node.name)
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True)
+    yield path
+    shutil.rmtree(path)
 
 
 def _run(ledger, evaluation, *pipelines, **kwargs):
@@ -105,17 +119,23 @@ def _repo(
 
 
 def _editable(
-    tmp_path: pathlib.Path, monkeypatch, name: str, single: bool = False
+    tmp_path: pathlib.Path,
+    monkeypatch,
+    name: str,
+    single: bool = False,
+    study: pathlib.Path | None = None,
 ) -> pathlib.Path:
     """An editable install ``name`` of a git repo, and a study module ``<name>_steps``
-    whose fit reads ``a.SCALE``; returns the module or package the install serves.
+    in ``study`` whose fit reads ``a.SCALE``; returns the module or package the install
+    serves.
 
     A package holds modules ``a`` and ``b``; a ``single`` module install is ``a``.
     """
-    site, repo, study = tmp_path / "site", tmp_path / "tool", tmp_path / "study"
+    site, repo = tmp_path / "site", tmp_path / "tool"
+    study = study or tmp_path / "study"
     info = site / f"{name}-0.1.dist-info"
     for directory in (info, study):
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, exist_ok=True)
     (info / "METADATA").write_text(
         f"Metadata-Version: 2.1\nName: {name}\nVersion: 0.1\n"
     )
@@ -206,10 +226,10 @@ def lazy_predict(model, dataset, rng):
 """
 
 
-def _lazy_steps(tmp_path, tag: str):
+def _lazy_steps(scratch, tag: str):
     helper = f"lazy_helper_{tag}"
-    (tmp_path / f"{helper}.py").write_text("K = 1\n")
-    code = tmp_path / f"lazy_steps_{tag}.py"
+    (scratch / f"{helper}.py").write_text("K = 1\n")
+    code = scratch / f"lazy_steps_{tag}.py"
     code.write_text(LAZY_STEPS.format(helper=helper))
     return cli._load(str(code)), helper
 
@@ -288,15 +308,61 @@ def test_record_refuses_zero_rows(ledger):
         _record(ledger, _dataset(0))
 
 
-def test_a_reveal_lag_is_a_timedelta_or_a_non_negative_int(ledger):
+def test_a_reveal_lag_is_a_non_negative_timedelta_or_an_int_from_one(ledger):
     dataset_id = _record(ledger, _dataset(), y=np.timedelta64(3600 * 10**9, "ns"))
     payload = ledger.latest(Event.DATASET, dataset_id)["payload"]
     assert payload["recipe"]["targets"]["y"] == 3600.0
     with pytest.raises(TypeError, match="float"):
         _record(ledger, _dataset(), y=1.5)
-    for lag in (-1, datetime.timedelta(hours=-1), np.timedelta64(-1, "h")):
+    for lag in (datetime.timedelta(hours=-1), np.timedelta64(-1, "h")):
         with pytest.raises(ValueError, match="negative"):
             _record(ledger, _dataset(), y=lag)
+    for lag in (0, -1):
+        with pytest.raises(Refused, match="starts at 1; a same-date reveal is a"):
+            _record(ledger, _dataset(), y=lag)
+
+
+def test_record_refuses_no_targets_and_a_column_that_is_not_1d(ledger):
+    with pytest.raises(Refused, match="at least one target; without one nothing"):
+        record(ledger, _dataset(), source="s", params={}, filters=(), targets=())
+    wide = _dataset(4, w=np.zeros((4, 2)))
+    with pytest.raises(Refused, match=r"\{'w': \(4, 2\)\}; a column is 1-D"):
+        _record(ledger, wide)
+
+
+def test_a_sealed_tail_starts_at_a_row_kept_in_the_payload_and_the_id(ledger):
+    open_id = _record(ledger, _dataset())
+    by_row = record(
+        ledger,
+        _dataset(),
+        source="s",
+        params={},
+        filters=(),
+        targets=("y",),
+        sealed_from=40,
+    )
+    by_date = record(
+        ledger,
+        _dataset(),
+        source="s",
+        params={},
+        filters=(),
+        targets=("y",),
+        sealed_from="2025-01-02T15:30",
+    )
+    assert by_row == by_date != open_id
+    assert ledger.latest(Event.DATASET, by_row)["payload"]["sealed_from"] == 40
+    assert ledger.latest(Event.DATASET, open_id)["payload"]["sealed_from"] is None
+    with pytest.raises(Refused, match="a sealed tail starts after the first row"):
+        record(
+            ledger,
+            _dataset(),
+            source="s",
+            params={},
+            filters=(),
+            targets=("y",),
+            sealed_from="2026-01-01",
+        )
 
 
 def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
@@ -366,6 +432,11 @@ def test_a_config_class_its_function_does_not_import_is_refused(ledger, evaluati
     far = dataclasses.replace(synthetic.ridge(3), config=Far())
     with pytest.raises(Refused, match="define it beside the fit function"):
         _run(ledger, evaluation, synthetic.ridge(1), far)
+    deep = dataclasses.replace(
+        synthetic.ridge(3), config=synthetic.RidgeConfig(3, 1.0, ({"far": Far()},))
+    )
+    with pytest.raises(Refused, match="Far is defined in tests/test_ledger_story.py"):
+        _run(ledger, evaluation, deep)
     with pytest.raises(Refused, match="define it beside the scorer function"):
         _run(ledger, dataclasses.replace(evaluation, config=Far()), synthetic.ridge(1))
     scaled = dataclasses.replace(
@@ -374,6 +445,54 @@ def test_a_config_class_its_function_does_not_import_is_refused(ledger, evaluati
     with pytest.raises(Refused, match="define it beside the postprocess function"):
         _run(ledger, evaluation, scaled)
     assert _types(ledger) == {Event.DATASET: 1}
+
+
+HELD_STEPS = """
+import dataclasses
+
+from tests import synthetic
+
+
+@dataclasses.dataclass(frozen=True)
+class Cfg:
+    knobs: tuple = ()
+
+
+def fit(dataset, train, config):
+    model = synthetic.ridge_fit(dataset, train, synthetic.RidgeConfig(1, 1.0))
+    return synthetic.RidgeModel(model.weights * config.knobs[0]["by"](), model.bias)
+"""
+
+HELD_KNOBS = """
+import dataclasses
+
+
+def scale():
+    return 1.0
+
+
+@dataclasses.dataclass(frozen=True)
+class Inner:
+    scale: float = 1.0
+"""
+
+
+def test_a_function_a_config_holds_at_any_depth_joins_the_fit_closure(
+    ledger, evaluation, scratch
+):
+    (scratch / "steps_held.py").write_text(HELD_STEPS)
+    (scratch / "knobs_held.py").write_text(HELD_KNOBS)
+    steps = cli._load(str(scratch / "steps_held.py"))
+    knobs = cli._load(str(scratch / "knobs_held.py"))
+    config = steps.Cfg(({"by": knobs.scale},))
+    held = dataclasses.replace(synthetic.ridge(1), fit=steps.fit, config=config)
+    first = _run(ledger, evaluation, held)
+    assert first.fits_computed > 0 and _run(ledger, evaluation, held).run == ""
+    (scratch / "knobs_held.py").write_text(HELD_KNOBS.replace("1.0", "-1.0", 1))
+    assert _run(ledger, evaluation, held).fits_computed == first.fits_computed
+    inner = dataclasses.replace(held, config=steps.Cfg((knobs.Inner(),)))
+    with pytest.raises(Refused, match="Inner is defined in .*knobs_held.py, which the"):
+        _run(ledger, evaluation, inner)
 
 
 @pytest.mark.parametrize(
@@ -453,9 +572,9 @@ def test_in_sample_without_members_is_refused_before_anything_is_written(
 
 
 def test_a_dry_run_counts_shared_work_once_as_the_run_does(
-    ledger, dataset, tmp_path, capsys
+    ledger, dataset, scratch, capsys
 ):
-    shared = tmp_path / "shared.py"
+    shared = scratch / "shared.py"
     shared.write_text(
         "import dataclasses\nfrom tests import synthetic\n"
         "one, three = synthetic.ridge(1), synthetic.ridge(3)\n"
@@ -493,9 +612,9 @@ def test_lab_run_refuses_a_lambda_once(ledger, dataset, tmp_path, capsys):
 
 
 def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
-    ledger, dataset, tmp_path, capsys
+    ledger, dataset, scratch, capsys
 ):
-    sweep = tmp_path / "sweep.py"
+    sweep = scratch / "sweep.py"
     sweep.write_text(
         "import dataclasses\nfrom tests import synthetic\n"
         "pipelines = synthetic.pipelines[:2]\n"
@@ -725,7 +844,61 @@ def test_two_dataclasses_with_one_qualname_in_two_modules_differ():
 
 def test_dict_keys_keep_their_type():
     assert identity.content_hash({1: 0.5}) != identity.content_hash({"1": 0.5})
-    assert identity.canonical({1: "a", "1": "b"}) == {"1": "b", "int:1": "a"}
+    assert identity.content_hash({1: 0.5}) != identity.content_hash({"int:1": 0.5})
+    assert identity.canonical({1: "a", "1": "b"}) == {"1": "b", '["int", 1]': "a"}
+
+
+def test_signature_annotations_and_import_order_keep_the_code_key():
+    source = b"import os\nimport re\n\ndef f(x: int) -> int:\n    return x\n"
+    reworded = b"import re\nimport os\n\ndef f(x: 'float') -> float:\n    return x\n"
+    assert identity.code_key(source) == identity.code_key(reworded)
+    assert identity.code_key(source) != identity.code_key(
+        source.replace(b"return x", b"return x + 1")
+    )
+
+
+def test_a_default_the_memo_cannot_see_stays_in_the_id():
+    source = """
+        import dataclasses
+        @dataclasses.dataclass(frozen=True)
+        class Knob:
+            scale: float = 1.0
+    """
+    knob = _module("sourceless_knob", source).Knob()
+    assert identity.canonical(knob) == {
+        "__type__": "sourceless_knob:Knob",
+        "scale": 1.0,
+    }
+    assert identity.canonical(synthetic.BlendConfig()) == {
+        "__type__": "tests.synthetic:BlendConfig"
+    }
+
+
+def test_a_reached_module_the_memo_cannot_see_is_refused(tmp_path, monkeypatch):
+    for directory in ("lib", "root"):
+        (tmp_path / directory).mkdir()
+        monkeypatch.syspath_prepend(tmp_path / directory)
+    (tmp_path / "lib" / "far_lib.py").write_text("K = 1\n")
+    (tmp_path / "root" / "near_steps.py").write_text(
+        "import numpy\nimport far_lib\n\ndef fit(dataset, train, config):\n"
+        "    return far_lib.K\n"
+    )
+    fit = importlib.import_module("near_steps").fit
+    with pytest.raises(
+        Refused, match=r"far_lib.py is reached .* outside the code root"
+    ):
+        identity.refuse_unseen_code((fit,), tmp_path / "root")
+    identity.refuse_unseen_code((fit,), tmp_path)
+    source = tmp_path / "root" / "stale_steps.py"
+    source.write_text("def fit(dataset, train, config):\n    return +1.0\n")
+    py_compile.compile(str(source), importlib.util.cache_from_source(str(source)))
+    stat = source.stat()
+    source.write_text("def fit(dataset, train, config):\n    return -1.0\n")
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    stale = importlib.import_module("stale_steps").fit
+    assert stale(None, None, None) == 1.0
+    with pytest.raises(Refused, match="ran from bytecode .* that is not its source"):
+        identity.refuse_unseen_code((stale,), tmp_path)
 
 
 def test_a_numpy_bool_is_a_bool():
@@ -786,9 +959,9 @@ def test_an_editable_lock_covers_the_modules_the_steps_reach(tmp_path, monkeypat
 
 
 def test_one_process_fits_under_one_lock_and_records_the_tool_commit(
-    ledger, tmp_path, monkeypatch
+    ledger, tmp_path, monkeypatch, scratch
 ):
-    package = _editable(tmp_path, monkeypatch, "run_tool")
+    package = _editable(tmp_path, monkeypatch, "run_tool", study=scratch)
     fit = importlib.import_module("run_tool_steps").fit
     head = subprocess.run(
         ["git", "-C", package.parent, "rev-parse", "HEAD"],
@@ -801,7 +974,7 @@ def test_one_process_fits_under_one_lock_and_records_the_tool_commit(
     pipeline = dataclasses.replace(synthetic.ridge(1), fit=fit, name="tool")
 
     def run() -> runs.RunReport:
-        return runs.run(ledger, [pipeline], evaluation, code_root=tmp_path / "study")
+        return runs.run(ledger, [pipeline], evaluation, code_root=REPO)
 
     first = run()
     assert not first.failed and first.fits_computed > 0
@@ -837,6 +1010,21 @@ def test_feature_columns_are_read_from_their_store_not_memory(tmp_path):
         view.column("f0_lag", (8, 11))
     with pytest.raises(KeyError, match=r"feature columns \['f0_lag'\]"):
         dataset.column("f9", (0, 1))
+
+
+def test_a_fit_view_blanks_every_column_outside_its_train_segments(tmp_path):
+    store = tmp_path / "f.parquet"
+    pl.DataFrame({"lag": np.arange(6, dtype=np.int32)}).write_parquet(store)
+    clock = np.datetime64("2025-01-01", "ns") + np.arange(6).astype("timedelta64[h]")
+    columns = {"x": np.arange(6), "s": _strings(*"abcdef"), "t": clock}
+    full = Dataset(columns, clock, ("lag",), {"lag": store})
+    view = full.train_view(((0, 2), (4, 6)))
+    assert np.isnan(view.columns["x"][2:4]).all() and view.columns["x"][4] == 4.0
+    assert view.columns["s"].tolist() == ["a", "b", None, None, "e", "f"]
+    assert np.isnat(view.columns["t"][2:4]).all() and view.ts[3] == clock[3]
+    lag = view.matrix((0, 6), ("x", "lag"))[:, 1]
+    assert np.isnan(lag[2:4]).all() and lag[5] == 5.0
+    assert np.isnan(view.upto(3).column("lag", (2, 3))).all()
 
 
 @pytest.mark.parametrize("segment", [(-1, 0), (-3, 10), (5, 4)])
@@ -905,9 +1093,40 @@ def test_steps_see_only_the_rows_before_their_cutoff(ledger, dataset, evaluation
 
 def test_targets_are_hidden_inside_the_test_range(ledger, dataset, evaluation):
     cheat = dataclasses.replace(synthetic.ridge(1), predict=synthetic.cheating_predict)
-    _run(ledger, evaluation, cheat)
-    pred = _load_predictions(ledger, ledger.events(Event.PREDICTIONS)[0]["id"])
-    assert np.isnan(pred).all()
+    error = _run(ledger, evaluation, cheat).failed["ridge_1m"]
+    assert re.search(r"non-finite value on (\d+) of \1 rows of fold 2025-05-01", error)
+    assert not ledger.events(Event.PREDICTIONS)
+
+
+def memorised_f0_fit(dataset: Dataset, train, config) -> synthetic.RidgeModel:
+    return synthetic.RidgeModel(dataset.column("f0", (0, dataset.rows)), 0.0)
+
+
+def rows_known_predict(model, dataset: Dataset, rng: Range) -> np.ndarray:
+    """How many f0 values the view shows before the range."""
+    known = np.isfinite(dataset.column("f0", (0, rng[0]))).sum()
+    return np.full(rng[1] - rng[0], float(known))
+
+
+def test_a_fit_and_an_in_sample_member_see_no_column_outside_the_train_segments(
+    ledger, dataset
+):
+    evaluation = synthetic.evaluation(dataset, split=splits.BlockedKFold(k=3))
+    (lo, hi) = evaluation.split.folds(load(ledger, dataset))[1].test
+    memo = dataclasses.replace(
+        synthetic.ridge(0), fit=memorised_f0_fit, predict=rows_known_predict
+    )
+    assert not _run(ledger, evaluation, synthetic.blend(memo)).failed
+    (fit,) = ledger.sql(
+        "SELECT model FROM raw_fit WHERE pipeline = ? AND label = 'block 1'",
+        (memo.id,),
+    )
+    f0 = memo.load(ledger.get_blob(fit["model"])).weights
+    assert np.isnan(f0[lo:hi]).all() and not np.isnan(np.r_[f0[:lo], f0[hi:]]).any()
+    (member,) = ledger.sql(
+        "SELECT id FROM raw_prediction WHERE fold = 1 AND range_start = ?", (hi,)
+    )
+    assert (_load_predictions(ledger, member["id"]) == lo).all()
 
 
 def test_a_kfold_fit_that_memorizes_labels_replays_none(ledger, dataset):
@@ -964,6 +1183,34 @@ def test_a_predict_that_reads_the_future_inside_its_range_is_refused(
     report = _run(ledger, evaluation, peek)
     assert "predict read past row" in report.failed["ridge_1m"]
     assert ledger.events(Event.SCORE) == []
+
+
+def day_mean_predict(model, dataset: Dataset, rng: Range) -> np.ndarray:
+    """Each row's f0 mean over its date in the range: reads later rows of the date."""
+    day = dataset.ts[rng[0] : rng[1]].astype("datetime64[D]")
+    _, at = np.unique(day, return_inverse=True)
+    x = dataset.column("f0", rng)
+    return (np.bincount(at, x) / np.bincount(at))[at]
+
+
+def test_the_probes_cut_inside_a_date_however_the_calendar_falls(ledger):
+    rows = synthetic.generate(
+        start="2025-01-01", months=3, rows_per_day=20, seed=7, drift_at="2025-02-01"
+    )
+    dataset = record(
+        ledger, rows, source="s", params={}, filters=(), targets=(synthetic.TARGET,)
+    )
+    two_days = splits.CalendarWalkForward(
+        "2025-02-01", unit="day", every=20, window=2, embargo_timestamps=1
+    )
+    evaluation = synthetic.evaluation(dataset, split=two_days)
+    sixths = synthetic.featured(synthetic.ridge(1), synthetic.day_mean, "sixths")
+    window = dataclasses.replace(
+        synthetic.ridge(1), predict=day_mean_predict, name="window"
+    )
+    report = _run(ledger, evaluation, sixths, window)
+    assert "features read past row 310" in report.failed["sixths"]
+    assert "predict read past row" in report.failed["window"]
 
 
 def test_rounding_passes_the_probe_and_a_leak_is_sized(ledger, evaluation):
@@ -1078,7 +1325,8 @@ def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     b = synthetic.featured(synthetic.ridge(3))
     report = _run(ledger, evaluation, a, b)
     n = load(ledger, evaluation.dataset).rows
-    cuts = [j * n // 6 for j in range(1, 6)]
+    sixths = [j * n // 6 for j in range(1, 6)]
+    cuts = sorted({*sixths, *(row // 20 * 20 + 10 for row in sixths)})
     assert not report.failed and synthetic.FEATURE_CALLS[1:] == cuts
     rows = ledger.sql("SELECT columns, probe_rows FROM raw_feature")
     assert len(rows) == 1 and json.loads(rows[0]["columns"]) == ["f0_lag"]
@@ -1372,9 +1620,9 @@ def test_a_formatter_pass_keeps_every_fit_and_a_code_edit_refits(ledger, tmp_pat
 
 
 def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
-    ledger, evaluation, tmp_path
+    ledger, evaluation, scratch
 ):
-    code = tmp_path / "feat_k.py"
+    code = scratch / "feat_k.py"
     code.write_text(
         "import numpy as np\n\n\n"
         "def lag(dataset):\n    f0 = dataset.columns['f0']\n"
@@ -1382,7 +1630,7 @@ def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
     )
     module = cli._load(str(code))
     featured = synthetic.featured(synthetic.ridge(3), module.lag)
-    runs.run(ledger, [featured], evaluation, code_root=tmp_path)
+    _run(ledger, evaluation, featured)
     code.write_text(
         code.read_text().replace(
             "np.concatenate([[np.nan], f0[:-1]])", "np.r_[np.nan, f0[:-1]]"
@@ -1390,7 +1638,7 @@ def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
     )
     module = importlib.reload(module)
     featured = synthetic.featured(synthetic.ridge(3), module.lag)
-    report = runs.run(ledger, [featured], evaluation, code_root=tmp_path)
+    report = _run(ledger, evaluation, featured)
     assert _count(ledger, "raw_feature") == 2
     assert report.fits_computed == report.predictions_computed == 0
     rows = ledger.sql("SELECT DISTINCT features FROM raw_fit")
@@ -1423,6 +1671,95 @@ def test_a_scoring_change_refits_nothing_and_writes_a_new_score(
     report = _run(ledger, synthetic.evaluation(dataset, cost=0.01), synthetic.ridge(3))
     assert report.fits_computed == 0 and report.scores_recorded == 1
     assert len(ledger.events(Event.SCORE)) == 2
+    directions = {"pnl": "min", "turnover": "min"}
+    scorer = dataclasses.replace(evaluation.scorer, directions=directions)
+    flipped = dataclasses.replace(evaluation, scorer=scorer)
+    report = _run(ledger, flipped, synthetic.ridge(3))
+    assert flipped.id == evaluation.id and report.scores_recorded == 1
+
+
+def doubled(pred: np.ndarray, dataset: Dataset, rng: Range, config) -> np.ndarray:
+    return 2 * pred
+
+
+def test_a_postprocess_reaching_another_distribution_shares_the_fits(
+    ledger, evaluation
+):
+    first = _run(ledger, evaluation, synthetic.ridge(1))
+    post = dataclasses.replace(
+        synthetic.ridge(1), postprocess=doubled, postprocess_config=0, name="x2"
+    )
+    report = _run(ledger, evaluation, post)
+    assert report.fits_computed == 0 and report.fits_reused == first.fits_computed
+
+
+@dataclasses.dataclass(frozen=True)
+class TwinLabelSplit:
+    def folds(self, dataset):
+        return [splits.Fold("twin", ((0, c),), (c, c + 500)) for c in (2000, 3000)]
+
+
+def test_folds_sharing_a_label_fit_apart_and_a_split_refuses_them(ledger, dataset):
+    evaluation = synthetic.evaluation(dataset, split=TwinLabelSplit())
+    report = _run(ledger, evaluation, synthetic.ridge(1))
+    assert report.fits_computed == 2 and not report.failed
+    with pytest.raises(Refused, match=r"fold labels \['twin'\] twice"):
+        splits._at_least(TwinLabelSplit().folds(None), 1)
+
+
+def test_the_modules_lab_run_imports_join_every_id(ledger, evaluation, scratch):
+    code = scratch / "exp_j.py"
+    code.write_text("SEED = 1\n")
+    module = cli._load(str(code))
+    first = _run(ledger, evaluation, synthetic.ridge(1), experiments=[module])
+    assert _run(ledger, evaluation, synthetic.ridge(1), experiments=[module]).run == ""
+    code.write_text("SEED = 2\n")
+    again = _run(ledger, evaluation, synthetic.ridge(1), experiments=[module])
+    assert again.fits_computed == first.fits_computed and again.scores_recorded == 1
+    keys = ledger.events(Event.FIT)[-1]["payload"]["code_keys"]
+    assert any(path.endswith("/exp_j.py") for path in keys)
+
+
+def test_a_sealed_tail_is_validated_by_a_sealed_evaluation_once(ledger):
+    rows = synthetic.generate(
+        start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
+    )
+    dataset = record(
+        ledger,
+        rows,
+        source="sealed",
+        params={},
+        filters=(),
+        targets=(synthetic.TARGET,),
+        sealed_from="2025-11-01",
+    )
+    tail = load(ledger, dataset).index_of("2025-11-01")
+    with pytest.raises(
+        Refused,
+        match=rf"not sealed and fold 2025-11-01 validates rows {tail} to \d+, past "
+        rf"row {tail}",
+    ):
+        _run(ledger, synthetic.evaluation(dataset), synthetic.ridge(1))
+    month = splits.CalendarWalkForward("2025-05-01", embargo_timestamps=1)
+    ended = dataclasses.replace(month, end="2025-11-01")
+    validation = synthetic.evaluation(dataset, split=ended)
+    assert _run(ledger, validation, synthetic.ridge(1)).scores_recorded == 1
+    after = dataclasses.replace(month, first_cutoff="2025-11-01", min_folds=2)
+    test = dataclasses.replace(synthetic.evaluation(dataset, split=after), sealed=True)
+    assert _run(ledger, test, synthetic.ridge(1)).scores_recorded == 1
+    assert _run(ledger, test, synthetic.ridge(1)).scores_reused == 1
+    scorer = dataclasses.replace(test.scorer, directions={"pnl": "min"})
+    again = dataclasses.replace(test, scorer=scorer)
+    for dry in (True, False):
+        error = _run(ledger, again, synthetic.ridge(1), dry=dry).failed["ridge_1m"]
+        assert re.search(
+            rf"sealed evaluation {test.id} already scored pipeline ridge_1m as score "
+            r"\w+; a sealed evaluation scores each pipeline once",
+            error,
+        )
+    unsealed = synthetic.evaluation(synthetic.dataset(ledger))
+    with pytest.raises(Refused, match="is sealed and dataset .* has no sealed tail"):
+        _run(ledger, dataclasses.replace(unsealed, sealed=True), synthetic.ridge(1))
 
 
 def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
@@ -1529,25 +1866,25 @@ def test_a_fit_that_imports_a_distribution_lazily_is_refused():
 
 @pytest.mark.parametrize("stage", ["fit", "predict"])
 def test_a_step_that_imports_a_repo_module_lazily_is_refused(
-    ledger, evaluation, tmp_path, stage
+    ledger, evaluation, scratch, stage
 ):
-    module, helper = _lazy_steps(tmp_path, stage)
+    module, helper = _lazy_steps(scratch, stage)
     lazy = getattr(module, f"lazy_{stage}")
     p = dataclasses.replace(synthetic.ridge(1), **{stage: lazy}, name="lazy")
-    report = runs.run(ledger, [p], evaluation, code_root=tmp_path)
+    report = _run(ledger, evaluation, p)
     assert f"{stage} imported lazily" in report.failed["lazy"]
     assert helper in report.failed["lazy"]
     assert _count(ledger, "raw_prediction") == 0
 
 
 def test_a_lazy_import_of_an_installed_submodule_is_not_a_repo_module(
-    ledger, evaluation, tmp_path
+    ledger, evaluation, scratch
 ):
-    code = tmp_path / "lazy_venv_steps.py"
+    code = scratch / "lazy_venv_steps.py"
     code.write_text(LAZY_STEPS.format(helper="numpy.ma"))
     module = cli._load(str(code))
     p = dataclasses.replace(synthetic.ridge(1), predict=module.lazy_predict, name="pt")
-    report = runs.run(ledger, [p], evaluation, code_root=tmp_path)
+    report = _run(ledger, evaluation, p)
     assert not report.failed and "pt" in _latest(ledger, evaluation)
 
 
@@ -1618,9 +1955,9 @@ def test_a_failing_git_leaves_no_fit_under_an_unrecorded_run(
 
 
 def test_fy_run_merges_pipelines_from_several_modules_and_defaults_the_dataset(
-    ledger, dataset, evaluation, tmp_path, capsys
+    ledger, dataset, evaluation, scratch, capsys
 ):
-    extra = tmp_path / "agent7.py"
+    extra = scratch / "agent7.py"
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     by_path = str(REPO / "tests" / "synthetic.py")
     assert cli.main(["--root", str(ledger.root), "run", by_path, str(extra)]) == 0
@@ -1632,10 +1969,8 @@ def test_fy_run_merges_pipelines_from_several_modules_and_defaults_the_dataset(
         "ridge_6m",
         "ridge_12m",
     }
-    assert (
-        cli.main(["--root", str(ledger.root), "run", by_path, "--dataset", dataset[:6]])
-        == 0
-    )
+    again = ["--root", str(ledger.root), "run", by_path, str(extra)]
+    assert cli.main([*again, "--dataset", dataset[:6]]) == 0
     assert "up to date" in capsys.readouterr().out
 
 
@@ -1727,10 +2062,35 @@ def test_a_source_written_by_two_actors_needs_an_id(
     assert "several actors" in capsys.readouterr().err
 
 
-def test_lab_run_skips_a_failed_pipeline_in_later_evaluations(
-    ledger, dataset, tmp_path, capsys
+def test_lab_run_hashes_from_the_git_root_of_the_evaluations_module(
+    ledger, dataset, tmp_path, monkeypatch
 ):
-    sweep = tmp_path / "skip.py"
+    seen = {}
+
+    def fake(ledger, pipelines, evaluation, **kwargs):
+        seen.update(kwargs)
+        return runs.RunReport()
+
+    monkeypatch.setattr(runs, "run", fake)
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    agent = tmp_path / "agent_root.py"
+    agent.write_text(
+        "import dataclasses\nfrom tests import synthetic\n\n"
+        "def fit(dataset, train, config):\n"
+        "    return synthetic.ridge_fit(dataset, train, config)\n\n"
+        "pipelines = [dataclasses.replace(synthetic.ridge(12), fit=fit)]\n"
+    )
+    run = ["--root", str(ledger.root), "run", str(agent), "tests.synthetic"]
+    assert cli.main(run) == 0 and sys.dont_write_bytecode
+    assert seen["code_root"] == REPO
+    names = [m.__name__ for m in seen["experiments"]]
+    assert names == ["agent_root", "tests.synthetic"]
+
+
+def test_lab_run_skips_a_failed_pipeline_in_later_evaluations(
+    ledger, dataset, scratch, capsys
+):
+    sweep = scratch / "skip.py"
     sweep.write_text(
         "import dataclasses\nfrom tests import synthetic\n"
         "pipelines = [synthetic.ridge(1), dataclasses.replace(synthetic.ridge(3), "
@@ -1930,11 +2290,11 @@ def nan_score(pred, dataset, rng, config):
 nan_scorer = Scorer(nan_score, _nan_metrics, {"ic": "max"})
 
 
-def test_a_nan_metric_records_a_score_whose_value_is_null(ledger, evaluation):
+def test_a_non_finite_metric_fails_the_pipeline_naming_the_fold(ledger, evaluation):
     nan_evaluation = dataclasses.replace(evaluation, scorer=nan_scorer, config=None)
-    assert _run(ledger, nan_evaluation, synthetic.ridge(3)).scores_recorded == 1
-    values = {r["value"] for r in ledger.sql("SELECT value FROM score_aggregate")}
-    assert values == {None}
+    error = _run(ledger, nan_evaluation, synthetic.ridge(3)).failed["ridge_3m"]
+    assert "metrics ['ic'] are not finite on fold 2025-05-01" in error
+    assert not ledger.events(Event.SCORE) and _count(ledger, "raw_failure") == 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2176,9 +2536,7 @@ def test_a_revealed_target_is_a_feature_no_earlier_than_its_lag(ledger):
     assert synthetic.TARGET in _run(ledger, unrevealed, known).failed["known"]
 
 
-def test_the_features_probe_reruns_on_five_prefixes_and_catches_a_day_lookahead(
-    ledger, dataset
-):
+def test_the_features_probe_catches_a_day_lookahead(ledger, dataset):
     no_embargo = splits.CalendarWalkForward(first_cutoff="2025-05-01")
     evaluation = synthetic.evaluation(dataset, split=no_embargo)
     day = synthetic.featured(synthetic.ridge(1), synthetic.day_mean, "day_mean")

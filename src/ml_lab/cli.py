@@ -7,11 +7,13 @@ more modules, reads ``pipelines`` (a list of ``Pipeline``) from each and
 ``evaluations`` (a list of ``Evaluation``, or a function of the dataset id returning
 one) from exactly one of them, so a file an agent wrote holding only new pipelines
 runs beside the project's declarations; every pipeline is scored under every
-evaluation. A module is a dotted name importable from the current directory or a
-``.py`` path. The dataset defaults to the newest one recorded when the ledger holds
-one source. The ledger root comes from ``--root`` or ``ML_LAB_ROOT`` (default
-``.ml-lab``); only ``lab ingest`` creates one, ``lab run`` refuses a root without a
-ledger. The actor comes from ``ML_LAB_ACTOR``.
+evaluation. The code root the memo hashes from is the git root of the module that
+declares the evaluations, and the code keys of every module given join every id. A
+module is a dotted name importable from the current directory or a ``.py`` path,
+imported without writing bytecode. The dataset defaults to the newest one recorded
+when the ledger holds one source. The ledger root comes from ``--root`` or
+``ML_LAB_ROOT`` (default ``.ml-lab``); only ``lab ingest`` creates one, ``lab run``
+refuses a root without a ledger. The actor comes from ``ML_LAB_ACTOR``.
 
 Examples
 --------
@@ -31,7 +33,7 @@ import pathlib
 import sys
 from typing import Any
 
-from ml_lab import runs
+from ml_lab import identity, runs
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.ledger import Ledger, Refused
 
@@ -98,7 +100,9 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     skipped in the rest of this run and named once at the end, since failures are
     not memoized and a rerun retries it.
     """
-    pipelines, evaluations = _experiments(args, ledger)
+    pipelines, evaluations, modules = _experiments(args, ledger)
+    home = next(m for m in modules if hasattr(m, "evaluations"))
+    root = identity.repo_root(pathlib.Path(home.__file__))
     failed: dict[str, str] = {}
     planned: set[str] = set()
     total = runs.RunReport()
@@ -112,6 +116,8 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
             ledger,
             live,
             evaluation,
+            code_root=root,
+            experiments=modules,
             log=lambda line: print(line, flush=True),
             dry=args.dry_run,
             planned=planned,
@@ -156,9 +162,10 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
 
 def _experiments(
     args: argparse.Namespace, ledger: Ledger
-) -> tuple[list[Pipeline], list[Evaluation]]:
+) -> tuple[list[Pipeline], list[Evaluation], list[Any]]:
     """Pipelines from every module named; the evaluations from the one module that
-    declares them. Two names on one evaluation, or one name on two, are refused.
+    declares them; the modules. Two names on one evaluation, or one name on two, are
+    refused.
     """
     modules = [_load(spec) for spec in args.experiments]
     for m in modules:
@@ -193,7 +200,7 @@ def _experiments(
             f"{len(evaluations)} evaluations, {len(names)} names, {len(ids)} ids; one "
             "name per evaluation and one evaluation per name"
         )
-    return pipelines, evaluations
+    return pipelines, evaluations, modules
 
 
 def _dataset(ledger: Ledger, selector: str | None) -> str:
@@ -235,8 +242,9 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
 
 def _load(spec: str) -> Any:
     """Import a dotted name from the current directory, or a .py path by its package
-    name.
+    name, writing no bytecode, so a later run never reads a stale cache.
     """
+    sys.dont_write_bytecode = True
     if spec.endswith(".py"):
         path = spec_path = pathlib.Path(spec).resolve()
         parts = [path.stem]

@@ -170,13 +170,16 @@ class Evaluation:
     config. Splits live in ``ml_lab.splits``; any frozen dataclass with
     ``folds(dataset) -> list[Fold]`` works. ``name`` is a label. A sweep is a list of
     ``dataclasses.replace(base, config=SimConfig(t), name=f"cost{t}")``; the scorer's
-    config class must live in a module the scorer imports.
+    config class must live in a module the scorer imports. Only a ``sealed``
+    evaluation validates on the dataset's sealed tail (``record(sealed_from=...)``),
+    and it scores each pipeline once.
     """
 
     dataset: str
     split: Any
     scorer: Scorer
     config: Any = None
+    sealed: bool = False
     name: str = dataclasses.field(default="", metadata={"label": True})
 
     @property

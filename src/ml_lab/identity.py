@@ -24,6 +24,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import marshal
 import os
 import pathlib
 import re
@@ -71,16 +72,19 @@ def canonical(obj: Any) -> Any:
     if callable(obj):
         return {"__function__": step_ref(obj)}
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        module = sys.modules.get(type(obj).__module__)
+        sourced = str(getattr(module, "__file__", "")).endswith(".py")
         fields = {
             f.name: canonical(getattr(obj, f.name))
             for f in dataclasses.fields(obj)
-            if not f.metadata.get("label") and not _at_default(f, getattr(obj, f.name))
+            if not f.metadata.get("label")
+            and not (sourced and _at_default(f, getattr(obj, f.name)))
         }
         kind = f"{type(obj).__module__}:{type(obj).__qualname__}"
         return {"__type__": kind, **fields}
     if isinstance(obj, dict):
         keys = {
-            k if isinstance(k, str) else f"{type(k).__name__}:{k}": v
+            k if isinstance(k, str) else json.dumps([type(k).__name__, canonical(k)]): v
             for k, v in obj.items()
         }
         return {k: canonical(keys[k]) for k in sorted(keys)}
@@ -91,7 +95,9 @@ def canonical(obj: Any) -> Any:
 
 def _at_default(field: dataclasses.Field, value: Any) -> bool:
     """A field holding its default is left out, so adding a defaulted field to a
-    declaration keeps every existing id.
+    declaration keeps every existing id; only for a class whose module has a ``.py``
+    source, which the memo hashes or a distribution's lock covers, so a default edited
+    where the memo cannot see stays in the id.
     """
     if field.default is not dataclasses.MISSING:
         default = field.default
@@ -171,14 +177,19 @@ def repo_root(start: pathlib.Path) -> pathlib.Path:
 def imports(
     funcs: Iterable[Callable], code_root: pathlib.Path
 ) -> list[types.ModuleType]:
-    """Every module reachable from the functions' modules through module-level names.
+    """Every module reachable from the functions' modules (or the modules given)
+    through module-level names.
 
     Modules outside ``code_root`` are reached but not expanded, so a third-party package
     appears once and its internals are never walked, except an editable install's
     modules, which are expanded as the repo's are, their sources read once per process.
     """
     root = code_root.resolve()
-    queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
+    queue = [
+        f if isinstance(f, types.ModuleType) else sys.modules.get(f.__module__)
+        for f in funcs
+    ]
+    queue = [m for m in queue if m is not None]
     seen: dict[str, types.ModuleType] = {}
     while queue:
         module = queue.pop()
@@ -218,12 +229,53 @@ def code_keys(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, s
     return {p: code_key(b) for p, b in _sources(funcs, code_root).items()}
 
 
+def own_keys(
+    modules: Iterable[types.ModuleType], code_root: pathlib.Path
+) -> dict[str, str]:
+    """Code keys of the modules under ``code_root`` themselves, not of what they
+    import.
+    """
+    root = code_root.resolve()
+    paths = [p for m in modules if (p := _module_path(m, root))]
+    return {p.relative_to(root).as_posix(): code_key(p.read_bytes()) for p in paths}
+
+
+def refuse_unseen_code(funcs: Iterable[Any], code_root: pathlib.Path):
+    """Refuse a reached module whose code the memo cannot see: a ``.py`` file outside
+    ``code_root`` that no installed distribution owns, whose edit would not refit, or a
+    module under it that ran from cached bytecode other than its source.
+    """
+    root = code_root.resolve()
+    for module in imports(funcs, root):
+        file = str(getattr(module, "__file__", None) or "")
+        top = module.__name__.partition(".")[0]
+        if _module_path(module, root) and _stale(module):
+            raise Refused(
+                f"{file} ran from bytecode {module.__cached__} that is not its "
+                "source, as after an edit inside one mtime second; delete the bytecode "
+                "and rerun"
+            )
+        if (
+            file.endswith(".py")
+            and not pathlib.Path(file).resolve().is_relative_to(root)
+            and top not in sys.stdlib_module_names
+            and not _owned(top)
+        ):
+            raise Refused(
+                f"{file} is reached from the declared functions but lies outside the "
+                f"code root {root} and no installed distribution owns it, so an edit "
+                f"to it would not refit; move it under {root} or install it"
+            )
+
+
 @functools.cache
 def code_key(source: bytes) -> str:
-    """The code as compiled: ``ast.dump`` of the parsed source with every docstring
-    removed. Comments, layout, quote style, line numbers and docstrings are out, so a
-    function whose output reads its own source text, ``__doc__`` or line numbers is
-    outside the memo, as under ``python -OO``.
+    """The code as compiled: ``ast.dump`` of the parsed source with every docstring,
+    every function argument and return annotation removed and the leading import
+    block sorted. Comments, layout, quote style, line numbers, docstrings, signature
+    annotations and import order are out, so a function whose output reads its own
+    source text, ``__doc__``, ``__annotations__`` or line numbers is outside the memo,
+    as under ``python -OO``.
     """
     tree = ast.parse(source)
     for node in ast.walk(tree):
@@ -231,6 +283,17 @@ def code_key(source: bytes) -> str:
             ast.get_docstring(node, clean=False) is not None
         ):
             del node.body[0]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.returns = None
+            for arg in ast.walk(node.args):
+                if isinstance(arg, ast.arg):
+                    arg.annotation = None
+    imported = (ast.Import, ast.ImportFrom)
+    head = next(
+        (i for i, n in enumerate(tree.body) if not isinstance(n, imported)),
+        len(tree.body),
+    )
+    tree.body[:head] = sorted(tree.body[:head], key=ast.dump)
     return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:HASH_LEN]
 
 
@@ -329,6 +392,36 @@ def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path |
 @functools.cache
 def distribution_owners() -> dict[str, list[str]]:
     return importlib.metadata.packages_distributions()
+
+
+@functools.cache
+def _owned(top: str) -> bool:
+    for name in distribution_owners().get(top, (top,)):
+        try:
+            importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        return True
+    return False
+
+
+def _stale(module: types.ModuleType) -> bool:
+    """Whether the module ran from cached bytecode that the importer took as fresh (its
+    header matches the source's mtime and size) but that is not the source compiled.
+    """
+    try:
+        data = pathlib.Path(module.__cached__).read_bytes()
+        stat = pathlib.Path(module.__file__).stat()
+    except (AttributeError, TypeError, OSError):
+        return False
+    header = [int.from_bytes(data[i : i + 4], "little") for i in (4, 8, 12)]
+    fresh = [0, int(stat.st_mtime) & 0xFFFFFFFF, stat.st_size & 0xFFFFFFFF]
+    if data[:4] != importlib.util.MAGIC_NUMBER or header != fresh:
+        return False
+    source = pathlib.Path(module.__file__).read_bytes()
+    return marshal.loads(data[16:]) != compile(
+        source, module.__file__, "exec", dont_inherit=True
+    )
 
 
 def _editable(module: types.ModuleType) -> tuple[str, pathlib.Path] | None:
