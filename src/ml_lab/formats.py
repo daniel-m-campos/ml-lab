@@ -15,8 +15,10 @@ array([0., 1., 2.])
 from __future__ import annotations
 
 import io
+import json
 import pathlib
 import tempfile
+import zipfile
 from collections.abc import Callable
 from typing import Any
 
@@ -36,6 +38,7 @@ class Format:
     DIFF = "text/x-diff"
     TEXT = "text/plain"
     PICKLE = "pickle"
+    ZIP = "zip"
 
 
 KNOWN: dict[str, bool] = {
@@ -45,9 +48,44 @@ KNOWN: dict[str, bool] = {
     Format.DIFF: True,
     Format.TEXT: True,
     Format.PICKLE: False,
+    Format.ZIP: True,
 }
 """Format name to whether it opens without this Python environment. A save step must
-declare one of these; add an entry to admit a new format."""
+declare one of these; add an entry to admit a new format. A ``zip`` model is portable
+iff every member is; see ``zip_save``."""
+
+MANIFEST = "formats.json"
+
+
+# Zip containers =======================================================================
+
+
+def zip_save(parts: dict[str, tuple[str, bytes]]) -> bytes:
+    """Named byte members, each with its format from ``KNOWN``, as one deterministic
+    zip with a ``formats.json`` manifest: a model that is a foreign file plus a few
+    numbers.
+    """
+    manifest = json.dumps({n: f for n, (f, _) in parts.items()}, sort_keys=True)
+    members = [
+        (MANIFEST, manifest.encode()),
+        *sorted((n, d) for n, (_, d) in parts.items()),
+    ]
+    sink = io.BytesIO()
+    with zipfile.ZipFile(sink, "w") as archive:
+        for name, data in members:
+            archive.writestr(zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0)), data)
+    return sink.getvalue()
+
+
+def zip_load(payload: bytes) -> dict[str, bytes]:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        return {n: archive.read(n) for n in archive.namelist() if n != MANIFEST}
+
+
+def zip_formats(payload: bytes) -> dict[str, str]:
+    """Member name to declared format, from the manifest."""
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        return json.loads(archive.read(MANIFEST))
 
 
 # Sessions =============================================================================

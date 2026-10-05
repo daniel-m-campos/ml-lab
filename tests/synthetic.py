@@ -105,7 +105,7 @@ def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeMo
 
 @step
 def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
-    columns = FEATURES + ("f0_lag",) if "f0_lag" in session.columns else FEATURES
+    columns = FEATURES + session.feature_columns
     return session.matrix(rng, columns) @ model.weights + model.bias
 
 
@@ -262,9 +262,30 @@ def self_editing_fit(session: Session, train: Segments, config: RidgeConfig):
     return ridge_fit(session, train, config)
 
 
-@step(format="zip")
-def zip_save(model: RidgeModel) -> bytes:
+@step(format="tar")
+def tar_save(model: RidgeModel) -> bytes:
     return b""
+
+
+@step(format=formats.Format.ZIP)
+def zip_save(model: RidgeModel) -> bytes:
+    """A portable zip: the arrow-arrays model plus a text note."""
+    return formats.zip_save(
+        {
+            "model.arrow": (formats.Format.ARROW_ARRAYS, ridge_save(model)),
+            "note.txt": (formats.Format.TEXT, b"ridge"),
+        }
+    )
+
+
+@step(format=formats.Format.ZIP)
+def zip_pickle_save(model: RidgeModel) -> bytes:
+    return formats.zip_save({"model.pkl": (formats.Format.PICKLE, pickle_save(model))})
+
+
+@step
+def zip_load(payload: bytes) -> RidgeModel:
+    return ridge_load(formats.zip_load(payload)["model.arrow"])
 
 
 @dataclasses.dataclass(frozen=True)

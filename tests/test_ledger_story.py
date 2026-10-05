@@ -6,6 +6,7 @@ Mirrors docs/user-stories.md; every event type in docs/spec.md is written and re
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import io
 import json
 import pathlib
@@ -483,9 +484,7 @@ def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
     assert len(plain) == folds and all(line.endswith(": steps_d.py") for line in plain)
     lag = [line for line in would if "ridge_3m_lag" in line]
     assert all(
-        line.endswith(
-            "no earlier fit of this pipeline and label, features not computed"
-        )
+        line.endswith("features not computed; reused if the columns are unchanged")
         for line in lag
     )
     assert ledger.sql("SELECT max(seq) AS m FROM event")[0]["m"] == seq
@@ -550,8 +549,88 @@ def test_pickle_is_marked_not_portable_and_an_unknown_format_is_refused(
     )
     _run(ledger, evaluation, pickled)
     assert ledger.sql("SELECT portable FROM fit")[0]["portable"] == 0
-    with pytest.raises(Refused, match="'zip', not one of"):
-        _run(ledger, evaluation, dataclasses.replace(pickled, save=synthetic.zip_save))
+    with pytest.raises(Refused, match="'tar', not one of"):
+        _run(ledger, evaluation, dataclasses.replace(pickled, save=synthetic.tar_save))
+
+
+def test_a_zip_model_is_portable_only_if_every_member_is(ledger, evaluation):
+    zipped = dataclasses.replace(
+        synthetic.ridge(1), save=synthetic.zip_save, load=synthetic.zip_load
+    )
+    pickled = dataclasses.replace(zipped, save=synthetic.zip_pickle_save, name="zp")
+    _run(ledger, evaluation, zipped, pickled)
+    rows = ledger.sql("SELECT pipeline, format, portable, model FROM fit")
+    assert {(r["pipeline"], r["format"], r["portable"]) for r in rows} == {
+        (zipped.id, "zip", 1),
+        (pickled.id, "zip", 0),
+    }
+    sha = next(r["model"] for r in rows if r["pipeline"] == zipped.id)
+    assert zipped.load(ledger.get_blob(sha)).weights.shape == (3,)
+    assert formats.zip_load(ledger.get_blob(sha))["note.txt"] == b"ridge"
+
+
+def test_a_formatter_pass_keeps_every_fit_and_a_code_edit_refits(ledger, tmp_path):
+    code = tmp_path / "steps_f.py"
+    code.write_text((REPO / "tests" / "synthetic.py").read_text())
+    module = cli._load(str(code))
+    evaluation = module.evaluation(module.dataset(ledger))
+    runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    sha = ledger.events(Event.FIT)[0]["payload"]["import_shas"]["steps_f.py"]
+    code.write_text(
+        code.read_text()
+        .replace('"""Yesterday', '"""   Yesterday')
+        .replace("Xc = X - x_mean", "Xc = (X - x_mean)  # centred")
+        + "\n# noop\n"
+    )
+    report = runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    assert report.run == "" and report.fits_computed == report.predictions_computed == 0
+    assert ledger.events(Event.FIT)[0]["payload"]["import_shas"]["steps_f.py"] == sha
+    code.write_text(
+        code.read_text().replace("Xc = (X - x_mean)", "Xc = X - 2 * x_mean")
+    )
+    module = importlib.reload(module)
+    assert (
+        runs.run(
+            ledger, [module.ridge(3)], evaluation, code_root=tmp_path
+        ).fits_computed
+        > 0
+    )
+
+
+def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
+    ledger, evaluation, tmp_path
+):
+    code = tmp_path / "feat_k.py"
+    code.write_text(
+        "import numpy as np\nfrom ml_lab.experiment import step\n\n\n@step\n"
+        "def lag(session):\n    f0 = session.columns['f0']\n"
+        "    return {'f0_lag': np.concatenate([[np.nan], f0[:-1]])}\n"
+    )
+    module = cli._load(str(code))
+    featured = synthetic.featured(synthetic.ridge(3), module.lag)
+    runs.run(ledger, [featured], evaluation, code_root=tmp_path)
+    code.write_text(
+        code.read_text().replace(
+            "np.concatenate([[np.nan], f0[:-1]])", "np.r_[np.nan, f0[:-1]]"
+        )
+    )
+    module = importlib.reload(module)
+    featured = synthetic.featured(synthetic.ridge(3), module.lag)
+    report = runs.run(ledger, [featured], evaluation, code_root=tmp_path)
+    assert ledger.sql("SELECT COUNT(*) AS n FROM feature")[0]["n"] == 2
+    assert report.fits_computed == report.predictions_computed == 0
+    rows = ledger.sql("SELECT DISTINCT features FROM fit")
+    assert len(rows) == 1 and rows[0]["features"]
+
+
+def test_fit_and_predict_read_the_feature_columns_in_step_order(ledger, evaluation):
+    a = synthetic.featured(synthetic.ridge(3))
+    _run(ledger, evaluation, a, synthetic.ridge(1))
+    weights = {
+        r["pipeline"]: a.load(ledger.get_blob(r["model"])).weights.shape
+        for r in ledger.sql("SELECT pipeline, model FROM fit")
+    }
+    assert weights[a.id] == (4,) and weights[synthetic.ridge(1).id] == (3,)
 
 
 def test_fits_land_on_the_dataset_stream_and_scores_on_the_evaluation_stream(

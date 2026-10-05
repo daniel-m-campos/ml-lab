@@ -17,6 +17,7 @@ True
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import functools
 import hashlib
@@ -197,14 +198,42 @@ def imports(
 
 def import_shas(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
     """Git blob shas of every module under ``code_root`` reachable from the steps'
-    modules.
+    modules: what ran, as the log records it.
     """
+    return {p: git_blob_sha(b) for p, b in _sources(funcs, code_root).items()}
+
+
+def code_keys(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, str]:
+    """Per module in the steps' closure, a hash of its syntax tree without positions,
+    comments or layout: what the memo keys on, so a formatter pass keeps every id.
+    """
+    return {p: code_key(b) for p, b in _sources(funcs, code_root).items()}
+
+
+@functools.cache
+def code_key(source: bytes) -> str:
+    """The code as compiled: ``ast.dump`` of the parsed source, every docstring with
+    its lines stripped. Comments, whitespace, quote style and line numbers are out, so a
+    step whose output reads its own source text or line numbers is outside the memo.
+    """
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, _DOC_OWNERS) and ast.get_docstring(node, clean=False):
+            doc = node.body[0].value
+            doc.value = "\n".join(s.strip() for s in doc.value.splitlines()).strip()
+    return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:HASH_LEN]
+
+
+_DOC_OWNERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _sources(funcs: Iterable[Callable], code_root: pathlib.Path) -> dict[str, bytes]:
     root = code_root.resolve()
-    seen: dict[str, str] = {}
+    seen: dict[str, bytes] = {}
     for module in imports(funcs, root):
         path = _module_path(module, root)
         if path is not None:
-            seen[path.relative_to(root).as_posix()] = git_blob_sha(path.read_bytes())
+            seen[path.relative_to(root).as_posix()] = path.read_bytes()
     return dict(sorted(seen.items()))
 
 
@@ -265,7 +294,7 @@ def _editable_suffix(dist: importlib.metadata.Distribution) -> str:
             continue
         for location in spec.submodule_search_locations or [spec.origin]:
             for f in sorted(pathlib.Path(location).rglob("*.py")):
-                files[f"{top}/{f.relative_to(location).as_posix()}"] = git_blob_sha(
+                files[f"{top}/{f.relative_to(location).as_posix()}"] = code_key(
                     f.read_bytes()
                 )
     return "+" + content_hash(files)

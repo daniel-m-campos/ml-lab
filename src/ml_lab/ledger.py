@@ -25,7 +25,7 @@ from typing import Any, Final
 
 from ml_lab import identity
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 ACTOR_ENV = "ML_LAB_ACTOR"
 
 
@@ -98,7 +98,9 @@ DROP VIEW IF EXISTS feature;
 CREATE VIEW feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.columns') AS columns,
+  json_extract(payload,'$.columns_id') AS columns_id,
   json_extract(payload,'$.import_shas') AS import_shas,
+  json_extract(payload,'$.code_keys') AS code_keys,
   json_extract(payload,'$.probe_at') AS probe_at,
   json_extract(payload,'$.blob.sha') AS blob,
   json_extract(payload,'$.duration_s') AS duration_s
@@ -110,6 +112,8 @@ CREATE VIEW fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.train') AS train, json_extract(payload,'$.label') AS label,
   json_extract(payload,'$.env_lock') AS env_lock,
   json_extract(payload,'$.import_shas') AS import_shas,
+  json_extract(payload,'$.code_keys') AS code_keys,
+  json_extract(payload,'$.features') AS features,
   json_extract(payload,'$.model.sha') AS model,
   json_extract(payload,'$.model.format') AS format,
   json_extract(payload,'$.model.portable') AS portable,

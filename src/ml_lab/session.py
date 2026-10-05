@@ -20,10 +20,19 @@ Rows = Range | tuple[Range, ...]
 
 
 class Session:
-    """Columns over rows in a fixed order, with date lookups when ``ts`` is given."""
+    """Columns over rows in a fixed order, with date lookups when ``ts`` is given.
+    ``feature_columns`` names the columns a pipeline's features step added, in the
+    step's order; ``()`` without one.
+    """
 
-    def __init__(self, columns: dict[str, np.ndarray], ts: np.ndarray | None = None):
+    def __init__(
+        self,
+        columns: dict[str, np.ndarray],
+        ts: np.ndarray | None = None,
+        feature_columns: tuple[str, ...] = (),
+    ):
         self.columns = columns
+        self.feature_columns = feature_columns
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.any(self.ts[1:] < self.ts[:-1]):
             raise ValueError("timestamps must be sorted")
@@ -50,6 +59,7 @@ class Session:
         view = Session.__new__(Session)
         view.columns = {k: v[:row] for k, v in self.columns.items()}
         view.ts = None if self.ts is None else self.ts[:row]
+        view.feature_columns = self.feature_columns
         return view
 
     def masked(self, columns: tuple[str, ...], start: int) -> Session:

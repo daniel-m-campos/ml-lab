@@ -217,6 +217,10 @@ class _Stage:
             stage: identity.import_shas(steps, self.root)
             for stage, steps in self.steps.items()
         }
+        self.stage_keys = {
+            stage: identity.code_keys(steps, self.root)
+            for stage, steps in self.steps.items()
+        }
         self.takes_members = bool(pipeline.members) and _positional(pipeline.fit) > 3
         _refuse_unseen_class(pipeline.config, self.stage_shas["fit"], self.root, "fit")
         self.dists = identity.imported_dists(pipeline.steps, self.root)
@@ -232,7 +236,7 @@ class _Stage:
                 {
                     "dataset": self.evaluation.dataset,
                     "features": pipeline.features,
-                    "import_shas": self.stage_shas["features"],
+                    "code_keys": self.stage_keys["features"],
                     "env_lock": identity.bytes_hash(lock.encode()),
                 }
             )
@@ -251,15 +255,16 @@ class _Stage:
     def _fit(self, fold: Fold) -> str:
         train = [list(seg) for seg in fold.train]
         member_fits = [m.fit(fold) for m in self.members]
+        columns_id = self._feature_columns_id()
         fit_id = identity.content_hash(
             {
                 "dataset": self.evaluation.dataset,
                 "pipeline": self.pipeline.fit_declaration,
                 "train": train,
-                "import_shas": self.stage_shas["fit"],
+                "code_keys": self.stage_keys["fit"],
                 "env_lock": self.env_lock["sha"],
                 **({"members": member_fits} if self.members else {}),
-                **({"features": self.feature_id} if self.feature_id else {}),
+                **({"features": columns_id} if self.feature_id else {}),
             }
         )
         if self.ledger.latest(Event.FIT, fit_id) is not None:
@@ -288,14 +293,12 @@ class _Stage:
                 "train": train,
                 "label": fold.label,
                 "import_shas": self.shas,
+                "code_keys": self.stage_keys["fit"],
                 "env_lock": self.env_lock,
                 "duration_s": duration,
-                "model": {
-                    "sha": self.ledger.put_blob(self.pipeline.save(model)),
-                    "format": self.pipeline.format,
-                    "portable": formats.KNOWN[self.pipeline.format],
-                },
+                "model": self._model_blob(model),
                 **({"members": member_fits} if self.members else {}),
+                **({"features": columns_id} if self.feature_id else {}),
             },
             id=fit_id,
         )
@@ -316,7 +319,7 @@ class _Stage:
                 "fit": fit_id,
                 "range": list(rng),
                 "predict": self.pipeline.predict,
-                "import_shas": self.stage_shas["predict"],
+                "code_keys": self.stage_keys["predict"],
                 **({"members": member_preds} if self.members else {}),
             }
         )
@@ -326,7 +329,7 @@ class _Stage:
                 {
                     "raw": raw_id,
                     "postprocess": self.pipeline.postprocess,
-                    "import_shas": self.stage_shas["postprocess"],
+                    "code_keys": self.stage_keys["postprocess"],
                 }
             )
         if self.ledger.latest(Event.PREDICTIONS, pred_id) is not None:
@@ -418,10 +421,43 @@ class _Stage:
         if self.pipeline.features is None:
             return self.session.upto(cut)
         if self.featured is None:
+            added = self._features()
             self.featured = Session(
-                {**self.session.columns, **self._features()}, self.session.ts
+                {**self.session.columns, **added}, self.session.ts, tuple(added)
             )
         return self.featured.upto(cut)
+
+    def _feature_columns_id(self) -> str | None:
+        """The fit's feature input, the ordered columns' bytes; None in a dry run
+        before the features exist, so the fit id is one that was never recorded.
+        """
+        if self.feature_id is None:
+            return None
+        event = self.ledger.latest(Event.FEATURES, self.feature_id)
+        if event is None and not self.dry:
+            self._visible(0)
+            event = self.ledger.latest(Event.FEATURES, self.feature_id)
+        return event and event["payload"]["columns_id"]
+
+    def _model_blob(self, model: Any) -> dict[str, Any]:
+        """The saved model; a zip is portable iff every member's format is."""
+        payload = self.pipeline.save(model)
+        used = {"model": self.pipeline.format}
+        if self.pipeline.format == formats.Format.ZIP:
+            used = formats.zip_formats(payload)
+            bad = sorted(
+                f for f in used.values() if f not in formats.KNOWN or f == "zip"
+            )
+            if bad:
+                raise Refused(
+                    f"{self.name}: zip members declare formats {bad}; each must be "
+                    "one of formats.KNOWN other than zip"
+                )
+        return {
+            "sha": self.ledger.put_blob(payload),
+            "format": self.pipeline.format,
+            "portable": all(formats.KNOWN[f] for f in used.values()),
+        }
 
     def _features(self) -> dict[str, np.ndarray]:
         """The feature step's columns, computed once per feature id over the session
@@ -457,7 +493,9 @@ class _Stage:
                 "run": run_id,
                 "features": identity.canonical(self.pipeline.features),
                 "import_shas": self.stage_shas["features"],
+                "code_keys": self.stage_keys["features"],
                 "columns": list(columns),
+                "columns_id": _columns_id(columns),
                 "probe_at": at,
                 "duration_s": duration,
                 "blob": {
@@ -493,22 +531,20 @@ class _Stage:
         newest earlier fit of this pipeline and label.
         """
         rows = self.ledger.sql(
-            "SELECT import_shas, env_lock FROM fit WHERE pipeline = ? AND label = ? "
+            "SELECT code_keys, env_lock FROM fit WHERE pipeline = ? AND label = ? "
             "ORDER BY seq DESC LIMIT 1",
             (self.pipeline.id, label),
         )
         moved = ["no earlier fit of this pipeline and label"]
         if rows:
-            before = json.loads(rows[0]["import_shas"])
+            before, now = json.loads(rows[0]["code_keys"]), self.stage_keys["fit"]
             moved = sorted(
-                k
-                for k in set(before) | set(self.shas)
-                if before.get(k) != self.shas.get(k)
+                k for k in set(before) | set(now) if before.get(k) != now.get(k)
             )
             if json.loads(rows[0]["env_lock"])["sha"] != self.env_lock["sha"]:
                 moved.append("environment lock")
         if self.feature_id and not self.ledger.latest(Event.FEATURES, self.feature_id):
-            moved.append("features not computed")
+            moved.append("features not computed; reused if the columns are unchanged")
         return ", ".join(moved) or "train segments or members changed"
 
     def _probe(
@@ -571,7 +607,7 @@ def _score(
             "evaluation": evaluation.id,
             "pipeline": pipeline.id,
             "predictions": sorted(predictions.values()),
-            "scorer_shas": scorer_shas,
+            "scorer_keys": identity.code_keys((evaluation.scorer,), context.root),
         }
     )
     if ledger.latest(Event.SCORE, score_id) is not None:
@@ -638,6 +674,16 @@ def _score(
             f"score {name} {window} "
             + " ".join(f"{k}={v:.4g}" for k, v in metrics.items())
         )
+
+
+def _columns_id(columns: dict[str, np.ndarray]) -> str:
+    """The ordered columns' names, dtypes and bytes: what a fit consumes."""
+    return identity.content_hash(
+        [
+            [n, str(v.dtype), identity.bytes_hash(np.ascontiguousarray(v).tobytes())]
+            for n, v in columns.items()
+        ]
+    )
 
 
 def _load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
