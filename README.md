@@ -23,96 +23,140 @@ Editable is the point: the environment lock hashes the tool's code, so a `git pu
 
 For development: `uv venv .venv && uv pip install -e ".[dev]"` then `.venv/bin/python -m pytest`. The suite is the ledger story on synthetic data, `tests/test_ledger_story.py`, and every refusal the tool makes is pinned there.
 
-## A project
+## A project, from the smallest one
 
-A project is a git repository exposing three things, in one file or several. The Optiver example under `examples/optiver/` is the template; `examples/optiver/launch.sh 20` runs it end to end on twenty stocks when the Kaggle "Trading at the Close" `train.csv` sits under `data/optiver/optiver-trading-at-the-close/`.
+`examples/minimal/project.py` is a whole project in one file: synthetic rows, one ridge pipeline in two variants, one evaluation. Run it before reading it:
 
-**`dataset.py`: how the raw data becomes a session.** A `Session` is a dict of equal-length numpy columns plus an optional sorted `ts` clock. `record` applies the filters, stores the rows as Parquet and returns the dataset id, which is the data: a loader fix that changes rows is a new dataset, and a re-ingest of identical rows writes nothing.
-
-```python
-from ml_lab.dataset import record
-from ml_lab.experiment import step
-from ml_lab.session import Session
-
-@step
-def drop_null_target(session: Session) -> Session:
-    keep = ~np.isnan(session.columns["target"])
-    return Session({k: v[keep] for k, v in session.columns.items()}, session.ts[keep])
-
-def dataset(ledger, stocks: str = "all") -> str:
-    return record(ledger, load(stocks), source="optiver", params={"stocks": stocks},
-                  filters=(drop_null_target,), targets=("target",),
-                  reveal={"target": datetime.timedelta(seconds=60)})
+```
+export ML_LAB_ROOT=$PWD/.ml-lab-minimal
+lab ingest examples/minimal/project.py                  # 289160eafabf965b
+lab run examples/minimal/project.py
+sqlite3 -box $ML_LAB_ROOT/ml_lab.sqlite "SELECT name, metric, fold_mean, fold_std, folds FROM board"
 ```
 
-`targets` names the label columns, which the tool masks where a step may not see them. `reveal` says when a label is known: a `timedelta` after its row, or an integer `n` meaning the first row of the n-th later date with rows (`1` is the next trading day's open). Without it a label is known right after its own timestamp. Targets must be numeric or boolean.
+```
+fit ridge row 2000 0.0s: no earlier fit of this pipeline and label
+predictions ridge test rows 2000:3000
+...
+score ridge test mse=0.9933
+run 01M4692Z3DXSDNNRQ5HC8JZQQ3: fits 6, predictions 6, scores 2
+┌──────────────┬────────┬───────────┬──────────┬───────┐
+│     name     │ metric │ fold_mean │ fold_std │ folds │
+├──────────────┼────────┼───────────┼──────────┼───────┤
+│ ridge_shrunk │ mse    │ 0.9941    │ 0.0607   │ 3     │
+│ ridge        │ mse    │ 0.9933    │ 0.0591   │ 3     │
+└──────────────┴────────┴───────────┴──────────┴───────┘
+```
 
-**`steps.py`: features, models and scorers.** A `Pipeline` has slots, each a function registered with `@step`, and the slots are scopes: `features` sees the whole dataset without its targets, `fit` sees the rows up to the end of its train range, `predict` and `postprocess` see the rows up to the end of their window. A step belongs in the broadest scope of what it reads.
+Run it a second time and it prints `nothing written`: every fit, prediction and score is already in the log. The file, top to bottom:
 
 ```python
+from __future__ import annotations
+
+import dataclasses
+
+import numpy as np
+
 from ml_lab import formats
-from ml_lab.experiment import scorer, step
+from ml_lab.dataset import record
+from ml_lab.experiment import Evaluation, Pipeline, scorer, step
+from ml_lab.ledger import Ledger
 from ml_lab.session import Range, Session
-from ml_lab.splits import Segments
+from ml_lab.splits import Segments, WalkForward
+
+
+def dataset(ledger: Ledger, rows: str = "5000") -> str:
+    """Rows of one feature and one noisy target, in a fixed order; prints the id."""
+    random = np.random.default_rng(0)
+    x = random.normal(size=int(rows))
+    y = 0.5 * x + random.normal(size=int(rows))
+    session = Session({"x": x, "y": y})
+    return record(
+        ledger, session, source="toy", params={"rows": rows}, filters=(), targets=("y",)
+    )
+
 
 @dataclasses.dataclass(frozen=True)
 class RidgeConfig:
-    train_window_months: int
-    alpha: float
+    alpha: float = 1.0
+
 
 @step
-def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> RidgeModel:
-    rng = last_months(session, train, config.train_window_months)
-    X, y = features(session, rng), session.column("target", rng)
-    ...
-    return RidgeModel(weights, bias)
+def ridge_fit(session: Session, train: Segments, config: RidgeConfig) -> np.ndarray:
+    x = session.column("x", train)
+    y = session.column("y", train)
+    return np.array([x @ y / (x @ x + config.alpha)])
+
 
 @step
-def ridge_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
-    return features(session, rng) @ model.weights + model.bias      # (rows,) or (rows, k)
+def ridge_predict(model: np.ndarray, session: Session, rng: Range) -> np.ndarray:
+    return model[0] * session.column("x", rng)
+
 
 @step(format=formats.Format.ARROW_ARRAYS)
-def ridge_save(model: RidgeModel) -> bytes:
-    return formats.arrays_save({"weights": model.weights, "bias": np.array([model.bias])})
+def ridge_save(model: np.ndarray) -> bytes:
+    return formats.arrays_save({"slope": model})
+
 
 @step
-def ridge_load(payload: bytes) -> RidgeModel:
-    arrays = formats.arrays_load(payload)
-    return RidgeModel(arrays["weights"], float(arrays["bias"][0]))
+def ridge_load(payload: bytes) -> np.ndarray:
+    return formats.arrays_load(payload)["slope"]
 
-@scorer(metrics=sim_metrics, directions={"pnl": "max", "max_dd": "min"}, columns=("pnl", "flips"))
-def taker_sim(pred: np.ndarray, session: Session, rng: Range, config: SimConfig) -> np.ndarray:
-    truth = session.column("target", rng)
-    position = np.sign(pred) * (np.abs(pred) > config.threshold_bps)
-    flips = np.abs(np.diff(position, prepend=0.0))
-    return np.column_stack([position * truth - config.cost_bps * flips, flips])
-```
 
-`session.column(name, rng)` and `session.matrix(rng, names)` read a row range; a read past the step's prefix raises. A `fit` sees its targets as NaN outside its train segments, so a k-fold fit cannot read its validation block. `save` declares a format from `formats.KNOWN`: `arrow-arrays` and `zip` open without Python, `pickle` is admitted for scikit-learn and marked non-portable, and `bonsai-msgpack` goes through a temp-file round trip. `predict` returns one row per window row, `(rows,)` or `(rows, k)` for a multi-class model, and the stored blob and the scorer carry that width. A scorer returns a series with one row per scoring unit and `metrics(series)` reduces it, per fold and over the concatenated folds; the series is stored, so a later analysis (a paired test, a bootstrap) reads it without the scorer's code.
+@scorer(metrics=lambda series: {"mse": float(series.mean())}, directions={"mse": "min"})
+def squared_error(pred: np.ndarray, session: Session, rng: Range, config) -> np.ndarray:
+    return (pred - session.column("y", rng)) ** 2
 
-The optional slots: `features(session) -> {name: array}` adds columns computed once per dataset and shared by every pipeline that declares the step, read by the names in `session.feature_columns`; `postprocess(predictions, session, rng)` is the cheap stateless stage after `predict` (neutralise, clip, rank), whose knobs are bound with `step.configured(at=3.0)` so they enter the prediction's identity and not the fit's. A pipeline with `members` is a blend: its `fit` and `predict` take the members' predictions as a fourth argument.
 
-A config is a frozen dataclass defined in a module its step imports, so an edited default is caught by the memo. Keep each model family, the baselines, the feature step and the scorer in their own modules: the unit of invalidation is a step's module and everything it imports.
+ridge = Pipeline(
+    name="ridge",
+    fit=ridge_fit,
+    predict=ridge_predict,
+    save=ridge_save,
+    load=ridge_load,
+    config=RidgeConfig(),
+)
+pipelines = [ridge, ridge.with_config(alpha=100.0).named("ridge_shrunk")]
 
-**`experiment.py`: the pipelines and the evaluations.**
-
-```python
-from ml_lab.experiment import Evaluation, Pipeline
-from ml_lab.splits import CalendarWalkForward
-
-ridge = Pipeline(name="ridge_3m", fit=steps.ridge_fit, predict=steps.ridge_predict,
-                 save=steps.ridge_save, load=steps.ridge_load,
-                 config=steps.RidgeConfig(train_window_months=3, alpha=1.0))
-pipelines = [ridge.with_config(train_window_months=m).named(f"ridge_{m}m") for m in (1, 3, 6)]
 
 def evaluations(dataset: str) -> list[Evaluation]:
-    return [Evaluation(name="validation", dataset=dataset,
-                       split=CalendarWalkForward(first_cutoff="2021-05-04", horizons=(1, 2, 3),
-                                                 embargo_timestamps=1, min_folds=3),
-                       scorer=steps.taker_sim, config=steps.SimConfig(cost_bps=0.5))]
+    return [
+        Evaluation(
+            name="validation",
+            dataset=dataset,
+            split=WalkForward(first_cutoff_rows=2000, step_rows=1000, window_rows=1000),
+            scorer=squared_error,
+        )
+    ]
 ```
 
-Variants are `dataclasses.replace` (or `with_config` and `named`): a pipeline that differs only in `postprocess` shares every fit and raw prediction with its parent. A split is any frozen dataclass with `folds(session)`; the shipped ones are `CalendarWalkForward` (cutoffs every N months or trading days on the clock, named horizons, an embargo in whole timestamps), `WalkForward` by rows, and `Holdout(train_fraction)` with `BlockedKFold(k, train_fraction)` over the rows it trains on, so a validation and a test evaluation share one cut. Folds are contiguous ranges in the stored row order, so the order chosen at ingest is the split's design: a shuffle in a filter step makes `BlockedKFold` a random k-fold, an interleave by class makes it stratified, and a sort by group with the cut snapped to the group's boundary makes it grouped. Every step sees the rows before where it may look, with or without a clock; a clock adds reveal lags, calendar cutoffs and embargoes in whole timestamps. Keep the test evaluation in its own module (`test.py`), so running the validation module never scores it. Every pipeline is scored under every evaluation in the run.
+What each piece is, in the order the file introduces it:
+
+**The dataset** is a `Session`, a dict of equal-length numpy columns in a fixed order, with an optional sorted `ts` clock (none here). `record` stores the rows as Parquet and returns the dataset id, which is a hash of the rows themselves, so a loader fix that changes a value is a new dataset and re-ingesting identical rows writes nothing. `targets` names the label columns, because the tool has to know which columns to hide from a step that must not see them. `lab ingest` calls `dataset(ledger, *args)` and prints the id.
+
+**`fit`** receives the session, its train rows as `Segments` (a tuple of row ranges), and the config. It reads columns with `session.column(name, rows)`; the session it sees ends at the last train row, and a read past that raises, so a fit cannot touch its scoring window by accident. Its targets are NaN outside the train segments, so a k-fold fit with a validation block in the middle cannot read that block's labels either. It returns the model as any Python object.
+
+**`predict`** receives the model, the session and the window's row range, and returns one row per window row: a `(rows,)` array, or `(rows, k)` for a multi-class model. The session it sees ends at the window's end, and inside the window every label not yet known is NaN. Before the predictions are written, the tool recomputes them on a shorter prefix of the window and refuses the step if the earlier rows changed, which is how a feature that reads later rows, or a non-deterministic model, is caught with the first row that moved.
+
+**`save` and `load`** turn the model into bytes and back. `save` declares a format from `formats.KNOWN`; `arrow-arrays` (a dict of arrays) and `zip` open without Python, `pickle` is admitted for scikit-learn and marked non-portable. A fit is recorded only after the reloaded model predicts the first window exactly as the fitted one did, so what the log holds is what the bytes can reproduce.
+
+**The scorer** receives the predictions, the session, the window range and the evaluation's config, and returns a series with one row per scoring unit (here a squared error per row; for a cross-sectional metric, one row per day). `metrics` reduces a series to named numbers and runs twice: per fold, which gives `fold_mean` and `fold_std`, and over the concatenated folds, which gives `value`. The series is stored, so a paired test or a bootstrap can be run later from the log alone. `directions` says which way is better; `head_to_head` reads it to count wins.
+
+**`Pipeline`** binds the steps and a config. Its id is a hash of the declaration (the steps' dotted paths and the config's values), and `name` is a label outside the hash, so `ridge_shrunk` is one id under one name. The config is a frozen dataclass defined in a module the fit step imports, so an edited default is caught by the fit memo rather than silently reusing an old fit. `with_config` and `named` make variants; a variant that differs only in `postprocess` shares every fit with its parent.
+
+**`Evaluation`** is a dataset, a split, a scorer and a config, and `evaluations(dataset_id)` returns the list `lab run` scores every pipeline under. `WalkForward` here cuts at rows 2000, 3000 and 4000, trains on everything before each cut and scores the thousand rows after it. A split is any frozen dataclass with `folds(session)`, and folds are contiguous ranges in the stored row order, so the order chosen at ingest is the split's design: shuffle in a filter step and `BlockedKFold` is a random k-fold; interleave by class and it is stratified. The folds are recorded with the evaluation and checked on every run, so a split whose code changed under the same declaration is refused rather than scored against stale folds.
+
+**Why a rerun writes nothing.** A fit's id covers the dataset, the fit declaration, the train range, the code keys of every module the steps import (syntax trees, so comments and formatting do not count) and the environment lock of every distribution they reach. Edit `ridge_fit` and both pipelines refit; edit this README and nothing does. Predictions are keyed by fit and range, scores by their prediction ids. `lab run --dry-run` prints what would be computed and, per stale fit, which files moved.
+
+### Growing it
+
+- **Variants and sweeps**: `ridge.with_config(alpha=a).named(f"ridge_{a}")` in a list; a scoring sweep is a list of `dataclasses.replace(evaluation, config=..., name=...)`.
+- **A `features` step**: `features(session) -> {name: array}` computes columns once per dataset, shared by every pipeline that declares the step, read by the names in `session.feature_columns`. It is probed on five prefixes, so a feature that reads its row's future is refused at first computation.
+- **`postprocess`**: the cheap stateless stage after `predict` (clip, rank, neutralise); its knobs are bound with `step.configured(at=3.0)` so they enter the prediction's identity and not the fit's.
+- **Blends**: `Pipeline(members=(a, b), ...)`; `fit` and `predict` take the members' predictions as a fourth argument, and the members' fits are memoized on their own.
+- **A clock**: `Session(columns, ts)` with a sorted datetime array. It adds `CalendarWalkForward` (cutoffs every N months or trading days, named horizons, an embargo in whole timestamps), reveal lags on targets (`record(..., reveal={"y": timedelta(days=1)})`, or an integer count of trading dates), and the refusal of any fold that trains on labels revealed after its window starts.
+- **A test set**: a second `Evaluation` on `Holdout(train_fraction)` in its own module, `test.py`, run once after the pick is written down; `BlockedKFold(k, train_fraction)` validates on the same cut.
+- **The real-world template**: `examples/optiver/` adds a clock, three horizons, a per-stock taker simulation as the scorer and two model families (ridge, bonsai). `examples/optiver/launch.sh 20` runs it when the Kaggle "Trading at the Close" `train.csv` sits under `data/optiver/optiver-trading-at-the-close/`.
 
 ## Run
 
