@@ -131,11 +131,20 @@ def session_from_frame(frame: pl.DataFrame, ts: str = TS) -> Session:
 
 def series_save(values: np.ndarray) -> bytes:
     """A 1-D float array as a one-column Parquet file."""
-    return _parquet_bytes(pl.DataFrame({PREDICTION: np.asarray(values, np.float64)}))
+    values = np.asarray(values, np.float64)
+    columns = (
+        {PREDICTION: values}
+        if values.ndim == 1
+        else {f"{PREDICTION}_{i}": c for i, c in enumerate(values.T)}
+    )
+    return _parquet_bytes(pl.DataFrame(columns))
 
 
 def series_load(payload: bytes) -> np.ndarray:
-    return pl.read_parquet(io.BytesIO(payload))[PREDICTION].to_numpy()
+    frame = pl.read_parquet(io.BytesIO(payload))
+    if PREDICTION in frame.columns:
+        return frame[PREDICTION].to_numpy()
+    return frame.to_numpy()
 
 
 # Arrays ===============================================================================

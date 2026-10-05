@@ -974,30 +974,68 @@ def scalar_predict(model, session: Session, rng) -> float:
 
 
 @step
-def column_predict(model, session: Session, rng) -> np.ndarray:
-    return synthetic.ridge_predict(model, session, rng)[:, None]
-
-
-@step
 def first_row_postprocess(pred: np.ndarray, session: Session, rng) -> np.ndarray:
     return pred[:1]
 
 
+@step
+def two_column_predict(model, session: Session, rng) -> np.ndarray:
+    one = synthetic.ridge_predict(model, session, rng)
+    return np.column_stack([one, -one])
+
+
+@step
+def widening_predict(model, session: Session, rng) -> np.ndarray:
+    one = synthetic.ridge_predict(model, session, rng)
+    return one if rng[0] < 3000 else np.column_stack([one, one])
+
+
+@step
+def member_sum_predict(model, session: Session, rng, members: list) -> np.ndarray:
+    (only,) = members
+    assert only.shape == (rng[1] - rng[0], 2)
+    return only
+
+
+@scorer(metrics=lambda s: {"gap": float(np.mean(s))}, directions={"gap": "max"})
+def column_gap(pred: np.ndarray, session: Session, rng, config) -> np.ndarray:
+    assert pred.shape == (rng[1] - rng[0], 2)
+    return pred[:, 0] - pred[:, 1]
+
+
+def test_a_predict_of_k_columns_is_stored_scored_and_blended_as_such(ledger, dataset):
+    wide = dataclasses.replace(synthetic.ridge(1), predict=two_column_predict)
+    blend = dataclasses.replace(
+        synthetic.blend(wide), predict=member_sum_predict, name="column_blend"
+    )
+    evaluation = dataclasses.replace(synthetic.evaluation(dataset), scorer=column_gap)
+    report = _run(ledger, evaluation, wide, blend)
+    assert report.failed == {} and report.scores_recorded == 2
+    first = ledger.sql("SELECT id, range_start, range_end FROM raw_prediction")[0]
+    stored = _load_predictions(ledger, first["id"])
+    assert stored.shape == (first["range_end"] - first["range_start"], 2)
+    sha = ledger.sql("SELECT blob FROM raw_prediction WHERE id = ?", (first["id"],))
+    frame = pl.read_parquet(io.BytesIO(ledger.get_blob(sha[0]["blob"])))
+    assert frame.columns == ["prediction_0", "prediction_1"]
+    assert ledger.sql("SELECT value FROM board WHERE name = 'ridge_1m'")[0]["value"] > 0
+
+
+def test_a_predict_whose_width_changes_between_windows_is_refused(ledger, evaluation):
+    p = dataclasses.replace(synthetic.ridge(1), predict=widening_predict, name="wide")
+    report = _run(ledger, evaluation, p)
+    assert "the width is a property of the step" in report.failed["wide"]
+
+
 @pytest.mark.parametrize(
-    "change",
-    [
-        {"predict": scalar_predict},
-        {"predict": column_predict},
-        {"postprocess": first_row_postprocess},
-    ],
+    "change", [{"predict": scalar_predict}, {"postprocess": first_row_postprocess}]
 )
-def test_an_output_that_is_not_one_value_per_window_row_is_refused(
+def test_an_output_that_is_not_one_row_per_window_row_is_refused(
     ledger, evaluation, change
 ):
     p = dataclasses.replace(synthetic.ridge(1), **change, name="shaped")
     report = _run(ledger, evaluation, p)
     assert f"{next(iter(change))} returned shape" in report.failed["shaped"]
-    assert "a 1-D array with one value per row of the window" in report.failed["shaped"]
+    assert "one row per row of the window" in report.failed["shaped"]
     rows = ledger.sql("SELECT id, range_start, range_end FROM raw_prediction")
     assert all(
         len(_load_predictions(ledger, r["id"])) == r["range_end"] - r["range_start"]

@@ -306,6 +306,7 @@ class _Stage:
         self.pending: dict[str, tuple[Any, str, dict[str, Any]]] = {}
         self.fits: dict[str, str] = {}
         self.checked: set[str] = set()
+        self.widths: dict[str, tuple[int, ...]] = {}
 
     def fit(self, fold: Fold) -> str:
         if fold.label in self.fits:
@@ -721,11 +722,18 @@ class _Stage:
 
     def _one_per_row(self, stage: str, output: Any, rng: Range) -> np.ndarray:
         values = np.asarray(output)
-        if values.shape != (rng[1] - rng[0],):
+        rows = rng[1] - rng[0]
+        if values.ndim not in (1, 2) or values.shape[0] != rows:
             raise Refused(
                 f"{self.name}: {stage} returned shape {values.shape}; it must return "
-                "a 1-D array with one value per row of the window, shape "
-                f"({rng[1] - rng[0]},)"
+                f"one row per row of the window, shape ({rows},) or ({rows}, k)"
+            )
+        width = self.widths.setdefault(stage, values.shape[1:])
+        if values.shape[1:] != width:
+            raise Refused(
+                f"{self.name}: {stage} returned shape {values.shape} at rows "
+                f"{rng[0]}:{rng[1]} and shape ({rows}, {', '.join(map(str, width))}) "
+                "on an earlier window; the width is a property of the step"
             )
         return values
 
@@ -861,7 +869,7 @@ def _refuse_changed(
     full = full[: len(head)]
     head = np.asarray(head, dtype=np.float64)
     close = np.isclose(full, head, rtol=0, atol=rtol * scale, equal_nan=True)
-    moved = np.flatnonzero(~close)
+    moved = np.flatnonzero(~close.reshape(len(head), -1).all(axis=1))
     if moved.size:
         r = moved[0]
         gap = np.abs(full[moved] - head[moved])
