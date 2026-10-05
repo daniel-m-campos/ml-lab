@@ -1,4 +1,4 @@
-# Experiment-tracking and model-registry tools, 2026 state (build-versus-buy input for forestry)
+# Experiment-tracking and model-registry tools, 2026 state (build-versus-buy input for ml-lab)
 
 Research date: 2026-10-02. All facts below carry a source URL. Dates pulled from GitHub release pages often omit the year; where the year was inferred or two sources disagreed, the entry says so. Health signals (stars, last push) are GitHub API reads on 2026-10-02 unless noted; download counts are pypistats.org 30-day windows read the same day.
 
@@ -113,8 +113,8 @@ The field split in 2025-2026: the two big SaaS players changed hands (W&B to Cor
 - experiment-results-manager: "light-weight alternative to mlflow ... that doesn't require kubernetes". — [PyPI ERM](https://pypi.org/project/experiment-results-manager)
 
 ### Inferences
-- MLflow is the only general-purpose tracker whose default now matches forestry's constraint (one SQLite file, no server) while also carrying a registry, pandas export and git tags, but its 2026 release energy is in GenAI tracing and the registry still requires that database (no git- or file-backed registry).
-- Trackio is the closest existing "lite" shape to what forestry describes (SQLite per project, read-only SQL CLI, artifact versions with digests and aliases, agent-oriented API), with the explicit caveat that the schema is beta.
+- MLflow is the only general-purpose tracker whose default now matches ml-lab's constraint (one SQLite file, no server) while also carrying a registry, pandas export and git tags, but its 2026 release energy is in GenAI tracing and the registry still requires that database (no git- or file-backed registry).
+- Trackio is the closest existing "lite" shape to what ml-lab describes (SQLite per project, read-only SQL CLI, artifact versions with digests and aliases, agent-oriented API), with the explicit caveat that the schema is beta.
 - Neptune's deletion and W&B's docs moving behind CoreWeave are the two concrete lock-in events of 2025-2026; both argue for a tracker whose on-disk format is plain SQLite/Parquet.
 
 ### Gaps
@@ -188,7 +188,7 @@ Only GTO (DVC ecosystem) and Trackio's artifact tables qualify as git- or flat-f
 - DagsHub pairs DVC-versioned data/models with MLflow-compatible tracking. — [dagshub.com](https://dagshub.com/)
 
 ### Inferences
-- A git-tag registry (GTO pattern) plus content-addressed blobs (Trackio pattern) covers forestry's "registry in git or a flat file" requirement with two small, already-proven designs; MLflow's registry can be local but is a SQLAlchemy schema subject to `mlflow db upgrade` migrations.
+- A git-tag registry (GTO pattern) plus content-addressed blobs (Trackio pattern) covers ml-lab's "registry in git or a flat file" requirement with two small, already-proven designs; MLflow's registry can be local but is a SQLAlchemy schema subject to `mlflow db upgrade` migrations.
 
 ### Gaps
 - Comet's and W&B's registry data models were not read from primary docs (W&B docs gated; Comet registry page not fetched).

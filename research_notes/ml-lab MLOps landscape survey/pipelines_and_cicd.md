@@ -1,6 +1,6 @@
 # ML pipeline orchestration and CT/CI-CD tooling (2026), anchored on the GCP MLOps levels document
 
-Scope note: consumer is "forestry", a local-first framework for gradient-boosted trees run by one researcher plus agents on a laptop and rented pods, no Kubernetes. Research date 2026-10-02. Health numbers (last push, stars, latest PyPI release) were read live from the GitHub and PyPI APIs on that date.
+Scope note: consumer is "ml-lab", a local-first framework for gradient-boosted trees run by one researcher plus agents on a laptop and rented pods, no Kubernetes. Research date 2026-10-02. Health numbers (last push, stars, latest PyPI release) were read live from the GitHub and PyPI APIs on that date.
 
 ## Q1. What the GCP document actually defines (levels 0/1/2, components, validation steps)
 
@@ -50,7 +50,7 @@ By the document's own text, the correctness-bearing parts are: a pipeline defini
 - GitLab's model registry (GA since 17.6, Free tier) links "the model version to the job, giving convenient access to the job's logs, merge request, and pipeline" and exposes an MLflow-compatible client API, showing that a model registry can be a CI feature rather than a separate server — [GitLab docs](https://docs.gitlab.com/user/project/ml/model_registry/)
 
 ### Inferences
-- For forestry: essential = (a) one pipeline definition run by the same code locally and on a pod, (b) a per-run metadata record (code sha, params, data hashes, artifact paths, metrics) in a file or SQLite, (c) a data-schema check and a "beats current model on holdout and per segment" gate before promotion. Organizational scale = feature store, multi-team pipeline CI/CD, canary/A/B online validation, drift-triggered retraining (which requires a serving path and live labels).
+- For ml-lab: essential = (a) one pipeline definition run by the same code locally and on a pod, (b) a per-run metadata record (code sha, params, data hashes, artifact paths, metrics) in a file or SQLite, (c) a data-schema check and a "beats current model on holdout and per segment" gate before promotion. Organizational scale = feature store, multi-team pipeline CI/CD, canary/A/B online validation, drift-triggered retraining (which requires a serving path and live labels).
 - The GCP CI test list ("training converges", "no NaNs", "each component produces expected artifacts") maps directly onto an ordinary pytest suite run in GitHub Actions; no orchestrator is needed to satisfy "pipeline CI".
 
 ### Gaps
@@ -156,7 +156,7 @@ The consistent 2026 line is: solo and 2-3 person teams use a tracker (MLflow) an
 - Market churn signals in the period: lakeFS acquired DVC (Nov 2025) and the repo moved to treeverse/dvc; CML's last commit was 2025-06-02; Vertex AI Pipelines docs were relocated under "Gemini Enterprise Agent Platform"; Flyte now ships v1 (flytekit) and v2 (flyte) in parallel — [lakeFS](https://lakefs.io/blog/lakefs-acquires-dvc/); [CML GitHub](https://github.com/iterative/cml); [GCP caching page](https://docs.cloud.google.com/gemini-enterprise-agent-platform/machine-learning/pipelines/configure-caching); [PyPI flyte](https://pypi.org/project/flyte/)
 
 ### Inferences
-- For forestry, the practitioner consensus and the tool docs point the same way: a file-hashed DAG (DVC-style lockfile or Hamilton-style function cache), a git-tracked run record, pytest gates in GitHub Actions, and `ssh pod` for remote runs cover GCP levels 1 and the correctness half of level 2 without any daemon. Adopting Dagster/dagster-slurm becomes worthwhile only if a real Slurm cluster and multiple contributors appear.
+- For ml-lab, the practitioner consensus and the tool docs point the same way: a file-hashed DAG (DVC-style lockfile or Hamilton-style function cache), a git-tracked run record, pytest gates in GitHub Actions, and `ssh pod` for remote runs cover GCP levels 1 and the correctness half of level 2 without any daemon. Adopting Dagster/dagster-slurm becomes worthwhile only if a real Slurm cluster and multiple contributors appear.
 - Vendor stewardship changes (DVC to lakeFS, CML idle) argue for depending on file formats (`dvc.lock`-like JSON, git) rather than on a vendor's service.
 
 ### Gaps

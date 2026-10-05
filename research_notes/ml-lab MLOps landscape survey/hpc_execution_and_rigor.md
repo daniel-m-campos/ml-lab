@@ -1,6 +1,6 @@
 # HPC and rented-GPU execution, provenance, and benchmarking rigor (state as of 2026-10-02)
 
-Scope: job submission and remote execution tools, HPC reproducibility tooling, benchmarking rigor on shared hardware, and cost control for rented compute, for a lightweight solo-researcher-plus-agents framework ("forestry"). Repo liveness figures below come from the GitHub REST API queried on 2026-10-02 (`archived`, `pushed_at`, latest release); they are a point-in-time snapshot. Material older than 2024 is marked "(older)".
+Scope: job submission and remote execution tools, HPC reproducibility tooling, benchmarking rigor on shared hardware, and cost control for rented compute, for a lightweight solo-researcher-plus-agents framework ("ml-lab"). Repo liveness figures below come from the GitHub REST API queried on 2026-10-02 (`archived`, `pushed_at`, latest release); they are a point-in-time snapshot. Material older than 2024 is marked "(older)".
 
 ## Q1. Which tools launch a Python function or script onto a rented pod or Slurm node, stream results back, and tear down, with the least infrastructure?
 
@@ -61,7 +61,7 @@ The only widely used, machine-checked schema is MLPerf's system-description JSON
 - LLNL's Benchpark material (ICS 2026) argues every performance record needs a JSON sidecar with loaded modules, compiler/MPI versions, GPU drivers and hardware topology. [Benchpark ICS26 slides](https://software.llnl.gov/benchpark/_downloads/a6af6337810986f88c2fb270fe7b6278/ICS26-PArdhapurkar.pdf)
 
 ### Inferences
-- A forestry hardware fingerprint can be the MLPerf field set, trimmed and extended with three container-aware fields MLPerf lacks: `cpu.max` quota/period (effective vCPUs), `cpuset.cpus.effective` (which physical CPUs), and `cpu.stat` throttling counters captured after the run, since a throttled run is not comparable to an unthrottled one.
+- A ml-lab hardware fingerprint can be the MLPerf field set, trimmed and extended with three container-aware fields MLPerf lacks: `cpu.max` quota/period (effective vCPUs), `cpuset.cpus.effective` (which physical CPUs), and `cpu.stat` throttling counters captured after the run, since a throttled run is not comparable to an unthrottled one.
 - hwloc's XML/JSON export (`lstopo --of xml`) is the natural source for cache sizes and SMT pairing; archspec gives a stable microarchitecture name (e.g. "zen4") that is more useful for grouping results than the raw model string.
 - Because `os.process_cpu_count()` is affinity-only, a framework must read cgroup files itself (as Dask does) or it will size thread pools wrongly on RunPod-style containers.
 
@@ -91,7 +91,7 @@ Two camps exist and both are current: the "min" camp (Chen and Revels; LLVM's LN
 - Ruud van Asseldonk's essay "On benchmarking" (older, 2017) argues that for a deterministic computation the minimum is the right statistic and anything above it is external interference. [ruuda.nl](https://ruuda.nl/2017/on-benchmarking)
 
 ### Inferences
-- The two camps are reconcilable by purpose: min-over-repeats is the right estimator when comparing two versions of a deterministic kernel on the same host in the same session (the forestry A/B use case), because the comparison cares about intrinsic cost, not expected cost under load; distribution statistics belong when reporting what a user will experience.
+- The two camps are reconcilable by purpose: min-over-repeats is the right estimator when comparing two versions of a deterministic kernel on the same host in the same session (the ml-lab A/B use case), because the comparison cares about intrinsic cost, not expected cost under load; distribution statistics belong when reporting what a user will experience.
 - A defensible same-host protocol from these sources: pin both arms to the same cpuset (one SMT sibling per core, one L3 domain, one NUMA node), performance governor and no turbo where the host allows it, fixed memory limit, interleave arms A B A B (not AAAA BBBB) for k rounds, take min per arm, report the ratio with the round-to-round spread as the band; MLPerf-style trimmed mean is the fallback when the workload is nondeterministic.
 - Rented pods rarely allow governor or turbo control (containers), so interleaving and ratio-against-co-resident-control become the primary defence; the cgroup throttling counters from Q2 are the check that the quota did not bite one arm more than the other.
 - Mytkowicz and Stabilizer imply that a sub-2% A/B difference on a single binary pair is not evidence without either layout randomization or several independent builds.

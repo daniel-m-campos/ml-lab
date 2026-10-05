@@ -177,4 +177,4 @@ SELECT p.name, x.error, x.run FROM raw_failure x JOIN raw_pipeline p ON p.id = x
 - **"yields other folds than evaluation ... recorded"**: a split's code moved its folds; rename it or change a field.
 - **"ledger schema N, this build is M"**: delete the root and rerun.
 
-Layout: `src/ml_lab/ledger.py` (events, views, blobs), `experiment.py` (Pipeline, Evaluation, Scorer), `splits.py`, `runs.py` (memo, guards, probes), `dataset.py` (Dataset, record, load), `formats.py`, `identity.py` (hashes, code keys, import closures, the lock), `panel.py` ((time, key) grids), `cli.py`. Background: [reports/Forestry MLOps landscape survey.md](reports/Forestry%20MLOps%20landscape%20survey.md).
+Layout: `src/ml_lab/ledger.py` (events, views, blobs), `experiment.py` (Pipeline, Evaluation, Scorer), `splits.py`, `runs.py` (memo, guards, probes), `dataset.py` (Dataset, record, load), `formats.py`, `identity.py` (hashes, code keys, import closures, the lock), `panel.py` ((time, key) grids), `cli.py`. Background: [reports/ml-lab MLOps landscape survey.md](reports/ml-lab%20MLOps%20landscape%20survey.md).
