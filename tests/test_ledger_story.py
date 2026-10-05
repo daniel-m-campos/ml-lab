@@ -1042,6 +1042,12 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
     assert rows[0]["n"] == 1 and len(ledger.events(Event.SCORE)) == 2
 
 
+def test_connecting_drops_views_a_previous_build_left_behind(ledger):
+    ledger._db.execute("CREATE VIEW paired_score AS SELECT * FROM head_to_head")
+    names = Ledger(ledger.root).sql("SELECT name FROM sqlite_master WHERE type='view'")
+    assert "paired_score" not in {r["name"] for r in names}
+
+
 # Storage ==============================================================================
 
 

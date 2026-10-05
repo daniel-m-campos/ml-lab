@@ -55,7 +55,6 @@ CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
 """
 
 VIEWS = """
-DROP VIEW IF EXISTS raw_dataset;
 CREATE VIEW raw_dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.source') AS source,
   json_extract(payload,'$.window[0]') AS window_start,
@@ -64,14 +63,12 @@ CREATE VIEW raw_dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.blob.format') AS format
 FROM event WHERE type='dataset_recorded';
 
-DROP VIEW IF EXISTS raw_pipeline;
 CREATE VIEW raw_pipeline AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name, json_extract(payload,'$.config') AS config,
   json_extract(payload,'$.declaration') AS declaration
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
       FROM event WHERE type='pipeline_declared') WHERE rn = 1;
 
-DROP VIEW IF EXISTS raw_evaluation;
 CREATE VIEW raw_evaluation AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name,
   json_extract(payload,'$.dataset') AS dataset,
@@ -81,7 +78,6 @@ CREATE VIEW raw_evaluation AS SELECT seq, key AS id, at, actor,
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
       FROM event WHERE type='evaluation_declared') WHERE rn = 1;
 
-DROP VIEW IF EXISTS raw_run;
 CREATE VIEW raw_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.git.commit') AS "commit",
   json_extract(payload,'$.git.dirty') AS dirty,
@@ -91,7 +87,6 @@ CREATE VIEW raw_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.pipelines') AS pipelines
 FROM event WHERE type='run_started';
 
-DROP VIEW IF EXISTS raw_feature;
 CREATE VIEW raw_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.columns') AS columns,
@@ -103,7 +98,6 @@ CREATE VIEW raw_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='features_computed';
 
-DROP VIEW IF EXISTS raw_fit;
 CREATE VIEW raw_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.train') AS train, json_extract(payload,'$.label') AS label,
@@ -117,7 +111,6 @@ CREATE VIEW raw_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.duration_s') AS duration_s
 FROM event WHERE type='fit_computed';
 
-DROP VIEW IF EXISTS raw_prediction;
 CREATE VIEW raw_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.fit') AS fit,
   json_extract(payload,'$.range[0]') AS range_start,
@@ -128,12 +121,10 @@ CREATE VIEW raw_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.postprocess') AS postprocess
 FROM event WHERE type='predictions_computed';
 
-DROP VIEW IF EXISTS raw_score;
 CREATE VIEW raw_score AS SELECT seq, id, at, actor, stream AS evaluation,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run
 FROM event WHERE type='score_recorded';
 
-DROP VIEW IF EXISTS score_fold;
 CREATE VIEW score_fold AS SELECT e.id AS score, e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline,
   json_extract(f.value,'$.fold') AS fold,
@@ -142,7 +133,6 @@ CREATE VIEW score_fold AS SELECT e.id AS score, e.stream AS evaluation,
 FROM event e, json_each(e.payload,'$.folds') f, json_each(f.value,'$.metrics') m
 WHERE e.type='score_recorded';
 
-DROP VIEW IF EXISTS score_aggregate;
 CREATE VIEW score_aggregate AS SELECT e.id AS score,
   e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, a.key AS window,
@@ -159,7 +149,6 @@ JOIN (SELECT score, window, metric, COUNT(*) AS folds, AVG(value) AS fold_mean,
   ON f.score = e.id AND f.window = a.key AND f.metric = m.key
 WHERE e.type='score_recorded';
 
-DROP VIEW IF EXISTS score_latest;
 CREATE VIEW score_latest AS SELECT l.evaluation, e.name AS evaluation_name,
   l.pipeline, p.name, e.dataset, d.source, l.score, l.run, l.seq
 FROM (SELECT evaluation, pipeline, id AS score, run, seq,
@@ -170,7 +159,6 @@ JOIN raw_evaluation e ON e.id = l.evaluation
 JOIN raw_dataset d ON d.id = e.dataset
 WHERE l.rn = 1;
 
-DROP VIEW IF EXISTS score_fit;
 CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, fit) AS (
   SELECT s.id, s.stream, json_extract(s.payload,'$.pipeline'),
          json_extract(pr.payload,'$.fit')
@@ -189,13 +177,11 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
   json_extract(f.payload,'$.duration_s') AS duration_s
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
-DROP VIEW IF EXISTS board;
 CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, a.window, a.metric,
   a.value, a.folds, a.fold_mean, a.fold_std,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
 FROM score_latest l JOIN score_aggregate a ON a.score = l.score;
 
-DROP VIEW IF EXISTS head_to_head;
 CREATE VIEW head_to_head AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
     s.fold, s.window, s.metric, s.value,
@@ -220,7 +206,6 @@ FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
   AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric
 GROUP BY a.score, b.score, a.window, a.metric;
 
-DROP VIEW IF EXISTS raw_failure;
 CREATE VIEW raw_failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run,
@@ -245,7 +230,11 @@ class Ledger:
                 f"ledger schema {version}, this build is {SCHEMA_VERSION}; the log is "
                 "a cache of code plus data, delete the root and rerun"
             )
-        self._db.executescript(DDL + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};")
+        views = self._db.execute("SELECT name FROM sqlite_master WHERE type='view'")
+        drops = "".join(f"DROP VIEW {name};" for (name,) in views.fetchall())
+        self._db.executescript(
+            DDL + drops + VIEWS + f"PRAGMA user_version={SCHEMA_VERSION};"
+        )
 
     def __repr__(self) -> str:
         return f"Ledger({self.root})"
