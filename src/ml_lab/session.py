@@ -148,8 +148,6 @@ class Session:
     def _dtype(self, name: str) -> np.dtype:
         if name in self.columns:
             return self.columns[name].dtype
-        if name not in self.stores:
-            self.column(name, (0, 0))
         schema = pl.read_parquet_schema(self.stores[name])
         return pl.Series([], dtype=schema[name]).to_numpy().dtype
 

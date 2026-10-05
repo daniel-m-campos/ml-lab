@@ -114,11 +114,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
             print(f"lab run: {name} failed: {error}")
         failed |= report.failed
         for field in dataclasses.fields(runs.RunReport)[1:7]:
-            setattr(
-                total,
-                field.name,
-                getattr(total, field.name) + getattr(report, field.name),
-            )
+            vars(total)[field.name] += getattr(report, field.name)
         if args.dry_run:
             print(
                 f"dry run: would compute fits {report.fits_computed}, predictions "

@@ -99,10 +99,9 @@ def run(
                 f"config, one id {pipeline.id}; rename or change one"
             )
         for p in (pipeline, *pipeline.members):
-            held_by = [(s, getattr(p, s)) for s in ("fit", "predict", "save", "load")]
-            held_by += [("postprocess", p.postprocess)]
-            held_by += [("features", f) for f in p.feature_steps]
-            for slot, held in held_by:
+            for slot, held in [(s, getattr(p, s)) for s in _SLOTS] + [
+                ("features", f) for f in p.feature_steps
+            ]:
                 if held is not None and not callable(held):
                     raise Refused(
                         f"pipeline {p.name or name}: {slot} holds a "
@@ -499,7 +498,10 @@ class _Stage:
         if not self.feature_steps:
             return self.session.upto(cut)
         if self.featured is None:
-            sets = [self._features(step, fid) for step, fid in self._feature_pairs()]
+            sets = [
+                self._features(s, i)
+                for s, i in zip(self.feature_steps, self.feature_ids, strict=True)
+            ]
             names = tuple(n for columns, _, _ in sets for n in columns)
             stores = {n: path for columns, path, _ in sets for n in columns}
             self.featured = Session(
@@ -507,17 +509,15 @@ class _Stage:
             )
         return self.featured.upto(cut)
 
-    def _feature_pairs(self) -> list[tuple[Callable, str]]:
-        return list(zip(self.feature_steps, self.feature_ids, strict=True))
-
     def _feature_columns_id(self) -> str | None:
         """The fit's feature input: the id of the ordered columns' bytes, computing the
         features first when no run has, so a dry run's ids are the real ones.
         """
-        ids = [self._features(step, fid)[2] for step, fid in self._feature_pairs()]
-        if len(ids) > 1:
-            return identity.content_hash(ids)
-        return ids[0] if ids else None
+        ids = [
+            self._features(s, i)[2]
+            for s, i in zip(self.feature_steps, self.feature_ids, strict=True)
+        ]
+        return identity.content_hash(ids) if ids else None
 
     def _model_blob(self, model: Any) -> dict[str, Any]:
         """The saved model; a zip is portable iff every member's format is."""
@@ -551,8 +551,7 @@ class _Stage:
             payload = event["payload"]
             path = self.ledger.blobs / payload["blob"]["sha"]
             found = (tuple(payload["columns"]), path, payload["columns_id"])
-            self.features[feature_id] = found
-            return found
+            return self.features.setdefault(feature_id, found)
         revealed = {k: v for k, v in self.targets.items() if v is not None}
         bare = Session(
             {
@@ -568,8 +567,9 @@ class _Stage:
         self._unchanged("features")
         columns_id = _columns_id(columns)
         if self.dry:
-            self.features[feature_id] = (tuple(columns), None, columns_id)
-            return self.features[feature_id]
+            return self.features.setdefault(
+                feature_id, (tuple(columns), None, columns_id)
+            )
         n = bare.rows
         probe_rows = sorted(
             {bare.boundary(j * n // 6) for j in range(1, 6)} - {0, None}
@@ -612,12 +612,9 @@ class _Stage:
             id=feature_id,
         )
         self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
-        self.features[feature_id] = (
-            tuple(columns),
-            self.ledger.blobs / sha,
-            columns_id,
+        return self.features.setdefault(
+            feature_id, (tuple(columns), self.ledger.blobs / sha, columns_id)
         )
-        return self.features[feature_id]
 
     def _feature_columns(self, step: Callable, bare: Session) -> dict[str, np.ndarray]:
         out = step(bare)
@@ -803,7 +800,7 @@ def _refuse_changed(
     if moved.size:
         r = moved[0]
         gap = np.abs(full[moved] - head[moved])
-        worst = float(np.nanmax(np.where(np.isfinite(gap), gap, np.nan), initial=0.0))
+        worst = float(np.max(gap[np.isfinite(gap)], initial=0.0))
         where = f"read past row {at}" if at is not None else "is not stable"
         before = f"on the rows before {at}" if at is not None else "the second time"
         raise Refused(
@@ -920,6 +917,7 @@ def _positional(func: Callable) -> int:
 
 
 UNTRACKED_DIFF_CAP = 1 << 20
+_SLOTS = ("fit", "predict", "save", "load", "postprocess")
 
 
 def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
@@ -950,9 +948,8 @@ def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
         paths = (git("ls-files", "-z", "--others", "--exclude-standard") or "").split(
             "\0"
         )
-        paths = [p for p in paths if p]
-        big = [p for p in paths if (root / p).stat().st_size > UNTRACKED_DIFF_CAP]
-        small = [p for p in paths if p not in set(big)]
+        big = {p for p in paths if p and (root / p).stat().st_size > UNTRACKED_DIFF_CAP}
+        small = [p for p in paths if p and p not in big]
         with tempfile.TemporaryDirectory() as tmp:
             index = pathlib.Path(tmp) / "index"
             current = root / (git("rev-parse", "--git-path", "index") or "").strip()
