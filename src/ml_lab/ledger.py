@@ -26,7 +26,7 @@ from typing import Any, Final
 from ml_lab import identity
 from ml_lab.identity import Refused
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 ACTOR_ENV = "ML_LAB_ACTOR"
 
 
@@ -73,6 +73,7 @@ CREATE VIEW raw_evaluation AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.name') AS name,
   json_extract(payload,'$.dataset') AS dataset,
   json_extract(payload,'$.metrics') AS metrics,
+  json_extract(payload,'$.declaration.config') AS config,
   json_extract(payload,'$.declaration') AS declaration,
   json_extract(payload,'$.folds') AS folds
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
@@ -84,6 +85,7 @@ CREATE VIEW raw_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.git.diff.sha') AS diff,
   json_extract(payload,'$.resolution.path') AS resolution,
   json_extract(payload,'$.resolution.sha') AS resolution_sha,
+  json_extract(payload,'$.editable') AS editable,
   json_extract(payload,'$.pipelines') AS pipelines
 FROM event WHERE type='run_started';
 
@@ -137,15 +139,15 @@ CREATE VIEW score_aggregate AS SELECT e.id AS score,
   e.stream AS evaluation,
   json_extract(e.payload,'$.pipeline') AS pipeline, a.key AS window,
   m.key AS metric, m.value AS value, f.folds, f.fold_mean,
-  CASE WHEN f.folds > 1
-       THEN sqrt(max(f.sq - f.fold_mean * f.fold_mean, 0) * f.folds / (f.folds - 1))
-  END AS fold_std,
-  json_extract(e.payload,'$.series.' || a.key || '.sha') AS series,
-  json_extract(e.payload,'$.series.' || a.key || '.fold_rows') AS fold_rows
+  CASE WHEN f.folds > 1 THEN sqrt(f.ss / (f.folds - 1)) END AS fold_std,
+  json_extract(e.payload,'$.series."' || a.key || '".sha') AS series,
+  json_extract(e.payload,'$.series."' || a.key || '".fold_rows') AS fold_rows
 FROM event e, json_each(e.payload,'$.aggregate') a, json_each(a.value) m
 JOIN (SELECT score, window, metric, COUNT(*) AS folds, AVG(value) AS fold_mean,
-             AVG(value * value) AS sq
-      FROM score_fold GROUP BY score, window, metric) f
+             SUM((value - mean) * (value - mean)) AS ss
+      FROM (SELECT *, AVG(value) OVER (PARTITION BY score, window, metric) AS mean
+            FROM score_fold)
+      GROUP BY score, window, metric) f
   ON f.score = e.id AND f.window = a.key AND f.metric = m.key
 WHERE e.type='score_recorded';
 
@@ -178,39 +180,46 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
 CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, a.window, a.metric,
-  a.value, a.folds, a.fold_mean, a.fold_std,
+  a.fold_mean, a.fold_std, a.folds, a.value,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
 FROM score_latest l JOIN score_aggregate a ON a.score = l.score;
 
 CREATE VIEW head_to_head AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.pipeline, l.name, l.score,
     s.fold, s.window, s.metric, s.value,
-    json_extract(v.metrics, '$.' || s.metric) AS direction,
+    json_extract(v.metrics, '$."' || s.metric || '"') AS direction,
     json_extract(e.payload, '$.aggregate."' || s.window || '"."' || s.metric || '"')
       AS pooled
   FROM score_latest l JOIN score_fold s ON s.score = l.score
-  JOIN raw_evaluation v ON v.id = l.evaluation JOIN event e ON e.id = l.score)
-SELECT a.evaluation, a.evaluation_name, a.source, a.window, a.metric,
+  JOIN raw_evaluation v ON v.id = l.evaluation JOIN event e ON e.id = l.score),
+d AS (SELECT a.evaluation, a.evaluation_name, a.source, a.window, a.metric,
   a.pipeline, a.name, a.score,
   b.pipeline AS reference, b.name AS reference_name, b.score AS reference_score,
-  COUNT(*) AS folds, AVG(a.value - b.value) AS mean_delta,
-  CASE WHEN COUNT(*) > 1
-       THEN sqrt(max(AVG((a.value - b.value) * (a.value - b.value))
-                     - AVG(a.value - b.value) * AVG(a.value - b.value), 0)
-                 * COUNT(*) / (COUNT(*) - 1))
-  END AS delta_std,
-  SUM(CASE a.direction WHEN 'max' THEN a.value > b.value
-      WHEN 'min' THEN a.value < b.value END) AS wins,
+  a.value - b.value AS delta,
+  AVG(a.value - b.value) OVER (PARTITION BY a.score, b.score, a.window, a.metric)
+    AS mean,
+  CASE a.direction WHEN 'max' THEN a.value > b.value
+      WHEN 'min' THEN a.value < b.value END AS win,
   a.pooled - b.pooled AS pooled_delta
 FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
-  AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric
-GROUP BY a.score, b.score, a.window, a.metric;
+  AND b.fold = a.fold AND b.window = a.window AND b.metric = a.metric),
+h AS (SELECT evaluation, evaluation_name, source, window, metric, pipeline, name,
+  score, reference, reference_name, reference_score,
+  COUNT(*) AS folds, AVG(delta) AS mean_delta,
+  CASE WHEN COUNT(*) > 1
+       THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(*) - 1))
+  END AS delta_std,
+  SUM(win) AS wins, pooled_delta
+FROM d GROUP BY score, reference_score, window, metric)
+SELECT *, mean_delta * sqrt(folds) / delta_std AS t FROM h;
 
 CREATE VIEW raw_failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.error') AS error
-FROM event WHERE type='pipeline_failed';
+FROM event WHERE type='pipeline_failed' AND NOT EXISTS (
+  SELECT 1 FROM event s WHERE s.type='score_recorded' AND s.stream = event.stream
+    AND json_extract(s.payload,'$.pipeline') = event.key AND s.seq > event.seq);
 """
 
 
@@ -250,12 +259,16 @@ class Ledger:
         *,
         id: str | None = None,
     ) -> str:
-        """Insert one event and return its id; an existing id writes nothing."""
+        """Insert one event and return its id; an existing id writes nothing. A
+        non-finite float is stored as JSON null.
+        """
         event_id = id or identity.ulid()
+        text = json.dumps(payload, default=identity.canonical)
+        if "NaN" in text or "Infinity" in text:
+            text = json.dumps(json.loads(text, parse_constant=lambda c: None))
         self._db.execute(
-            "INSERT OR IGNORE INTO event "
-            "(id, type, stream, key, at, actor, host, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO event (id, type, stream, key, at, actor, host, payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
             (
                 event_id,
                 type,
@@ -264,7 +277,7 @@ class Ledger:
                 time.time(),
                 actor(),
                 platform.node(),
-                json.dumps(payload, default=identity.canonical),
+                text,
             ),
         )
         self._db.commit()

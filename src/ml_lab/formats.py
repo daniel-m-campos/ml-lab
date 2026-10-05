@@ -65,6 +65,10 @@ def zip_save(parts: dict[str, tuple[str, bytes]]) -> bytes:
     zip with a ``formats.json`` manifest: a model that is a foreign file plus a few
     numbers.
     """
+    if MANIFEST in parts:
+        raise ValueError(
+            f"{MANIFEST} is the manifest's name; name the member otherwise"
+        )
     manifest = json.dumps({n: f for n, (f, _) in parts.items()}, sort_keys=True)
     members = [
         (MANIFEST, manifest.encode()),
@@ -95,6 +99,10 @@ def session_save(session: Session) -> bytes:
     """A session as one Parquet file: ``ts`` as a nanosecond timestamp plus one column
     per array.
     """
+    if TS in session.columns:
+        raise ValueError(
+            f"a session column cannot be named {TS!r}: ts is the clock's name"
+        )
     stamps = {} if session.ts is None else {TS: session.ts}
     return _parquet_bytes(pl.DataFrame({**stamps, **session.columns}))
 
@@ -138,17 +146,16 @@ def arrays_save(arrays: dict[str, np.ndarray]) -> bytes:
     shape.
     """
     names = list(arrays)
+    data = [np.asarray(arrays[n], np.float64).ravel() for n in names]
+    if not any(d.size for d in data):
+        data = [d.tolist() for d in data]
     frame = pl.DataFrame(
         [
             pl.Series("name", names),
             pl.Series(
                 "shape", [list(np.shape(arrays[n])) for n in names], pl.List(pl.Int64)
             ),
-            pl.Series(
-                "data",
-                [np.asarray(arrays[n], np.float64).ravel() for n in names],
-                pl.List(pl.Float64),
-            ),
+            pl.Series("data", data, pl.List(pl.Float64)),
         ]
     )
     sink = io.BytesIO()

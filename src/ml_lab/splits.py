@@ -21,7 +21,7 @@ import datetime
 import numpy as np
 
 from ml_lab import dates
-from ml_lab.ledger import Refused
+from ml_lab.identity import Refused
 from ml_lab.session import Range, Session
 
 Segments = tuple[Range, ...]
@@ -51,6 +51,12 @@ class WalkForward:
 
     def folds(self, session: Session) -> list[Fold]:
         names = self.horizons or (1,)
+        _require(
+            step_rows=(self.step_rows, 1),
+            window_rows=(self.window_rows, 1),
+            embargo_rows=(self.embargo_rows, 0),
+            **{f"horizon {h}": (h, 1) for h in names},
+        )
         out: list[Fold] = []
         cutoff = self.first_cutoff_rows
         while cutoff + max(names) * self.window_rows <= session.rows:
@@ -89,6 +95,12 @@ class CalendarWalkForward:
     min_folds: int = 3
 
     def folds(self, session: Session) -> list[Fold]:
+        _require(
+            every=(self.every, 1),
+            window=(self.window, 1),
+            embargo_timestamps=(self.embargo_timestamps, 0),
+            **{f"horizon {h}": (h, 1) for h in self.horizons},
+        )
         stop = dates.as_date(self.end) if self.end else dates.span(session)[1]
         at = self._boundaries(session, stop)
         reach = max(self.horizons) * self.window
@@ -134,15 +146,18 @@ class CalendarWalkForward:
 
 @dataclasses.dataclass(frozen=True)
 class BlockedKFold:
-    """``k`` contiguous blocks; each is scored once as ``test`` with the rest as train,
-    minus ``embargo_rows`` on either side of it.
+    """``k`` contiguous blocks over the first ``train_fraction`` of rows, the rows
+    ``Holdout(train_fraction)`` trains on; each is scored once as ``test`` with the
+    rest as train, minus ``embargo_rows`` on either side of it.
     """
 
     k: int
     embargo_rows: int = 0
+    train_fraction: float = 1.0
 
     def folds(self, session: Session) -> list[Fold]:
-        n = session.rows
+        _require(k=(self.k, 2), embargo_rows=(self.embargo_rows, 0))
+        n = round(session.rows * self.train_fraction)
         bounds = [round(i * n / self.k) for i in range(self.k + 1)]
         out = []
         for i in range(self.k):
@@ -166,20 +181,33 @@ class Holdout:
     embargo_rows: int = 0
 
     def folds(self, session: Session) -> list[Fold]:
+        _require(embargo_rows=(self.embargo_rows, 0))
         n = session.rows
         cut = round(n * self.train_fraction)
         test = (min(cut + self.embargo_rows, n), n)
         return _at_least([Fold("holdout", ((0, cut),), {"test": test})], 1)
 
 
+def _require(**fields: tuple[int, int]):
+    """Refuse a split field below its floor, given as ``name=(value, floor)``."""
+    low = [f"{k}={v}" for k, (v, floor) in fields.items() if v < floor]
+    if low:
+        raise Refused(f"split fields out of range: {', '.join(low)}")
+
+
 def _at_least(folds: list[Fold], minimum: int, why: str = "") -> list[Fold]:
-    if len(folds) < minimum:
+    if len(folds) < max(minimum, 1):
         raise Refused(
             f"split yields {len(folds)} folds, at least {minimum} needed"
             + (f": {why}" if why else "")
         )
-    if any(lo >= hi for f in folds for lo, hi in f.windows.values()):
-        raise Refused("split yields an empty window")
+    empty = [
+        f"{f.label} {n}" for f in folds for n, (lo, hi) in f.windows.items() if lo >= hi
+    ]
+    if empty:
+        raise Refused(
+            f"split yields empty windows: {empty}" + (f"; {why}" if why else "")
+        )
     bare = [f.label for f in folds if all(lo >= hi for lo, hi in f.train)]
     if bare:
         raise Refused(f"split yields folds with no train rows: {bare}; start later")

@@ -7,3 +7,4 @@ data
 .ml-lab-optiver/
 .ml-lab/
 .scratch/
+.coverage

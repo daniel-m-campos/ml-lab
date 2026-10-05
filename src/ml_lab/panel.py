@@ -48,6 +48,13 @@ class Panel:
             unknown = column[~np.isin(column, self.keys)]
             if unknown.size:
                 raise ValueError(f"{key} {unknown[0]!r} is not in keys")
+        counts = np.bincount(self.ti * len(self.keys) + self.ki)
+        dup = int(counts.argmax())
+        if counts[dup] > 1:
+            raise ValueError(
+                f"rows share one (time, {key}): {self.times[dup // len(self.keys)]} "
+                f"{self.keys[dup % len(self.keys)]!r}"
+            )
         self.session = session
 
     def __repr__(self) -> str:

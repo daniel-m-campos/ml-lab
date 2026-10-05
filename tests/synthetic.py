@@ -438,3 +438,20 @@ def label_one_date_back(session: Session) -> dict[str, np.ndarray]:
 def label_one_row_back(session: Session) -> dict[str, np.ndarray]:
     """The previous row's label: same date, so not yet known under a one-date lag."""
     return {"f0_lag": np.r_[np.nan, session.columns[TARGET][:-1]]}
+
+
+@step
+def label_memory_fit(
+    session: Session, train: Segments, config: RidgeConfig
+) -> RidgeModel:
+    """Memorizes every label it can see, inside its train segments or not."""
+    return RidgeModel(session.column(TARGET, (0, session.rows)), 0.0)
+
+
+@step
+def label_replay_predict(model: RidgeModel, session: Session, rng: Range) -> np.ndarray:
+    """Replays the memorized labels over ``rng``, zero past them."""
+    seen = np.zeros(rng[1] - rng[0])
+    known = model.weights[rng[0] : rng[1]]
+    seen[: len(known)] = known
+    return seen

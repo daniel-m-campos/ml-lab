@@ -45,8 +45,10 @@ def scorer(
     """Register ``score(pred, session, range, config) -> series``.
 
     The series is a 1-D or 2-D array with one row per scoring unit: a prediction, or a
-    day for a cross-sectional metric. ``metrics`` defines the unit and must make sense
-    over the folds' rows concatenated.
+    day for a cross-sectional metric. ``metrics`` defines the unit; it runs per fold
+    and over the concatenated folds, and the pooled value equals the row-weighted fold
+    mean only for a metric that adds over rows. It reruns on the stored series alone,
+    so the series carries what it needs.
 
     Parameters
     ----------
@@ -121,6 +123,11 @@ class Pipeline:
     members: tuple[Pipeline, ...] = ()
     in_sample: bool = False
     name: str = dataclasses.field(default="", metadata={"label": True})
+
+    def __post_init__(self):
+        if isinstance(self.features, tuple) and len(self.features) < 2:
+            one = self.features[0] if self.features else None
+            object.__setattr__(self, "features", one)
 
     @property
     def id(self) -> str:

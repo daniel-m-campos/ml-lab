@@ -10,11 +10,14 @@ import datetime
 import importlib
 import io
 import json
+import math
 import pathlib
 import re
 import sqlite3
 import subprocess
 import sys
+import textwrap
+import types
 
 import numpy as np
 import polars as pl
@@ -22,10 +25,11 @@ import pytest
 
 from ml_lab import cli, formats, identity, runs, splits
 from ml_lab.dataset import data_id, load, record
+from ml_lab.experiment import Evaluation, Pipeline, scorer, step
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.panel import Panel
 from ml_lab.runs import _load_predictions
-from ml_lab.session import Session
+from ml_lab.session import Range, Session
 from tests import synthetic
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -46,8 +50,12 @@ def evaluation(dataset: str):
     return synthetic.evaluation(dataset)
 
 
-def _run(ledger, evaluation, *pipelines):
-    return runs.run(ledger, list(pipelines), evaluation, code_root=REPO)
+def _run(ledger, evaluation, *pipelines, **kwargs):
+    return runs.run(ledger, list(pipelines), evaluation, code_root=REPO, **kwargs)
+
+
+def _count(ledger, source: str, *params) -> int:
+    return ledger.sql(f"SELECT COUNT(*) AS n FROM {source}", params)[0]["n"]
 
 
 def _types(ledger) -> dict[str, int]:
@@ -69,6 +77,145 @@ def _latest(ledger, evaluation) -> dict[str, str]:
         (evaluation.id,),
     )
     return {r["name"]: r["score"] for r in rows}
+
+
+def _repo(
+    root: pathlib.Path, files: dict[str, str] | None = None, commit: bool = True
+) -> pathlib.Path:
+    for name, text in (files or {"a.py": "x = 1\n"}).items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(text)
+    git = ["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    if commit:
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "a"], check=True)
+    return root
+
+
+def _editable(
+    tmp_path: pathlib.Path, monkeypatch, name: str, single: bool = False
+) -> pathlib.Path:
+    """An editable install ``name`` of a git repo, and a study module ``<name>_steps``
+    whose fit reads ``a.SCALE``; returns the module or package the install serves.
+
+    A package holds modules ``a`` and ``b``; a ``single`` module install is ``a``.
+    """
+    site, repo, study = tmp_path / "site", tmp_path / "tool", tmp_path / "study"
+    info = site / f"{name}-0.1.dist-info"
+    for directory in (info, study):
+        directory.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: {name}\nVersion: 0.1\n"
+    )
+    (info / "direct_url.json").write_text(
+        json.dumps({"url": repo.as_uri(), "dir_info": {"editable": True}})
+    )
+    if single:
+        _repo(repo, {f"{name}.py": "SCALE = 1.0\n"})
+    else:
+        _repo(
+            repo,
+            {
+                f"{name}/__init__.py": "",
+                f"{name}/a.py": "SCALE = 1.0\n",
+                f"{name}/b.py": "def main():\n    return 0\n",
+            },
+        )
+    imported = f"import {name} as a" if single else f"from {name} import a"
+    (study / f"{name}_steps.py").write_text(
+        f"{imported}\n"
+        "from ml_lab.experiment import step\n"
+        "from tests import synthetic\n"
+        "@step\n"
+        "def fit(session, train, config):\n"
+        "    model = synthetic.ridge_fit(session, train, config)\n"
+        "    return synthetic.RidgeModel(model.weights * a.SCALE, model.bias)\n"
+    )
+    for path in (site, repo, study):
+        monkeypatch.syspath_prepend(path)
+    return repo / (f"{name}.py" if single else name)
+
+
+def _module(name: str, source: str) -> types.ModuleType:
+    module = types.ModuleType(name)
+    sys.modules[name] = module
+    exec(textwrap.dedent(source), module.__dict__)
+    return module
+
+
+def _session(n: int = 48, **extra: np.ndarray) -> Session:
+    rng = np.random.default_rng(0)
+    columns = {"x": rng.standard_normal(n), "y": rng.standard_normal(n), **extra}
+    clock = np.datetime64("2025-01-01", "ns") + np.arange(n).astype("timedelta64[h]")
+    return Session(columns, clock)
+
+
+def _record(ledger: Ledger, session: Session, **reveal) -> str:
+    return record(
+        ledger,
+        session,
+        source="s",
+        params={},
+        filters=(),
+        targets=("y",),
+        reveal=reveal or None,
+    )
+
+
+def _strings(*values: str | None) -> np.ndarray:
+    return np.array([None if v is None else "".join(list(v)) for v in values], object)
+
+
+@step
+def nan_safe_blend_fit(session: Session, train, config, members) -> object:
+    x = np.nan_to_num(np.column_stack(members))
+    y = session.column(synthetic.TARGET, train)
+    return synthetic.BlendModel(np.linalg.lstsq(x, y, rcond=None)[0])
+
+
+def _nested(member):
+    inner = dataclasses.replace(
+        synthetic.blend(member, synthetic.ridge(3)), fit=nan_safe_blend_fit, name="in"
+    )
+    return dataclasses.replace(
+        synthetic.blend(inner, synthetic.ridge(6)), fit=nan_safe_blend_fit, name="out"
+    )
+
+
+LAZY_STEPS = """
+from ml_lab.experiment import step
+from tests import synthetic
+
+
+@step
+def lazy_fit(session, train, config):
+    import {helper}
+    return synthetic.ridge_fit(session, train, config)
+
+
+@step
+def lazy_predict(model, session, rng):
+    import {helper}
+    return synthetic.ridge_predict(model, session, rng)
+"""
+
+
+def _lazy_steps(tmp_path, tag: str):
+    helper = f"lazy_helper_{tag}"
+    (tmp_path / f"{helper}.py").write_text("K = 1\n")
+    code = tmp_path / f"lazy_steps_{tag}.py"
+    code.write_text(LAZY_STEPS.format(helper=helper))
+    return cli._load(str(code)), helper
+
+
+def _score(ledger: Ledger, score: str, pipeline: str, values: list[float]):
+    folds = [
+        {"fold": i, "label": str(i), "window": "w", "metrics": {"m": v}}
+        for i, v in enumerate(values)
+    ]
+    payload = {"pipeline": pipeline, "folds": folds, "aggregate": {"w": {"m": 0.0}}}
+    ledger.append(Event.SCORE, "e", score, payload, id=score)
 
 
 # Dataset ==============================================================================
@@ -103,6 +250,70 @@ def test_the_dataset_blob_opens_with_polars_alone(ledger, dataset):
     assert ledger.sql("SELECT source FROM raw_dataset")[0] == {"source": "synthetic"}
 
 
+def test_a_string_column_hashes_by_its_values_not_its_objects():
+    def session(*values):
+        return Session({"c": _strings(*values), "x": np.arange(3.0)})
+
+    a = session("ab", None, "c")
+    assert data_id(a) == data_id(session("ab", None, "c"))
+    assert data_id(a) != data_id(session("ab", "", "c"))
+    assert data_id(a) != data_id(session("ab", None, "d"))
+    assert data_id(formats.session_load(formats.session_save(a))) == data_id(a)
+    with pytest.raises(Refused, match="not a str, number or None"):
+        data_id(Session({"c": np.array([b"raw", "s"], object)}))
+
+
+def test_a_column_named_ts_is_refused(ledger):
+    session = Session({"ts": np.arange(5.0), "y": np.ones(5)})
+    with pytest.raises(ValueError, match="clock's name"):
+        formats.session_save(session)
+    with pytest.raises(ValueError, match="clock's name"):
+        _record(ledger, session)
+
+
+def test_record_refuses_zero_rows(ledger):
+    with pytest.raises(ValueError, match="at least one row"):
+        _record(ledger, _session(0))
+
+
+def test_a_reveal_lag_is_a_timedelta_or_a_non_negative_int(ledger):
+    dataset_id = _record(ledger, _session(), y=np.timedelta64(3600 * 10**9, "ns"))
+    payload = ledger.latest(Event.DATASET, dataset_id)["payload"]
+    assert payload["recipe"]["targets"]["y"] == 3600.0
+    with pytest.raises(TypeError, match="float"):
+        _record(ledger, _session(), y=1.5)
+    for lag in (-1, datetime.timedelta(hours=-1), np.timedelta64(-1, "h")):
+        with pytest.raises(ValueError, match="negative"):
+            _record(ledger, _session(), y=lag)
+
+
+def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
+    rows = synthetic.generate(
+        start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
+    )
+    kw = dict(source="synthetic", params={}, filters=(), targets=(synthetic.TARGET,))
+    by_date = record(ledger, rows, reveal={synthetic.TARGET: 1}, **kw)
+    by_time = record(
+        ledger, rows, reveal={synthetic.TARGET: datetime.timedelta(1)}, **kw
+    )
+    assert by_date != by_time != record(ledger, rows, **kw)
+    recipe = ledger.events(Event.DATASET, key=by_date)[0]["payload"]["recipe"]
+    assert recipe["targets"][synthetic.TARGET] == {"dates": 1}
+    evaluation = synthetic.evaluation(by_date)
+    base = synthetic.ridge(1)
+    known = synthetic.featured(base, synthetic.label_one_date_back, "known")
+    early = synthetic.featured(base, synthetic.label_one_row_back, "early")
+    report = _run(ledger, evaluation, known, early)
+    assert set(report.failed) == {"early"}
+    assert "before its reveal lag" in report.failed["early"]
+    session = load(ledger, by_date)
+    at = session.index_of("2025-03-03")
+    masked = session.masked({synthetic.TARGET: 1}, at).columns[synthetic.TARGET]
+    assert np.isnan(masked[at:]).all() and not np.isnan(masked[:at]).any()
+    masked = session.masked({synthetic.TARGET: 2}, at).columns[synthetic.TARGET]
+    assert np.isnan(masked[at - 20]) and not np.isnan(masked[at - 21])
+
+
 # Declarations =========================================================================
 
 
@@ -118,7 +329,11 @@ def test_adding_a_defaulted_field_keeps_the_id_and_a_rename_reaches_the_views(
     old = dataclasses.make_dataclass("Config", [("alpha", float)], frozen=True)
     new = dataclasses.make_dataclass(
         "Config",
-        [("alpha", float), ("include", tuple, dataclasses.field(default=()))],
+        [
+            ("alpha", float),
+            ("include", tuple, dataclasses.field(default=())),
+            ("clip", float, dataclasses.field(default=math.nan)),
+        ],
         frozen=True,
     )
     assert identity.content_hash(old(1.0)) == identity.content_hash(new(1.0))
@@ -126,8 +341,8 @@ def test_adding_a_defaulted_field_keeps_the_id_and_a_rename_reaches_the_views(
     _run(ledger, evaluation, synthetic.ridge(1))
     _run(ledger, evaluation, synthetic.ridge(1).named("renamed"))
     assert set(_latest(ledger, evaluation)) == {"renamed"}
-    rows = ledger.sql("SELECT COUNT(*) AS n FROM raw_pipeline")
-    assert rows[0]["n"] == 1 and len(ledger.events(Event.PIPELINE)) == 2
+    assert _count(ledger, "raw_pipeline") == 1
+    assert len(ledger.events(Event.PIPELINE)) == 2
 
 
 def test_a_config_class_the_step_does_not_import_is_refused(ledger, evaluation):
@@ -144,14 +359,33 @@ def test_a_config_class_the_step_does_not_import_is_refused(ledger, evaluation):
     assert _types(ledger) == {Event.DATASET: 1}
 
 
+@pytest.mark.parametrize(
+    "broken",
+    [
+        dataclasses.replace(synthetic.ridge(1), features=("f0_lag",)),
+        _nested(dataclasses.replace(synthetic.ridge(1), predict="ridge_predict")),
+    ],
+    ids=["features", "member of a member's predict"],
+)
+def test_a_slot_that_is_not_a_step_is_refused_before_anything_is_written(
+    ledger, evaluation, broken
+):
+    with pytest.raises(Refused, match="holds a str, not a step"):
+        _run(ledger, evaluation, broken)
+    assert _types(ledger) == {Event.DATASET: 1}
+
+
+@pytest.mark.parametrize("dry", [False, True])
 def test_a_split_whose_folds_moved_under_one_declaration_is_refused(
-    ledger, dataset, evaluation, monkeypatch
+    ledger, dataset, evaluation, monkeypatch, dry
 ):
     _run(ledger, evaluation, synthetic.ridge(1))
     folds = evaluation.split.folds(load(ledger, dataset))
     monkeypatch.setattr(type(evaluation.split), "folds", lambda self, s: folds[1:])
-    with pytest.raises(Refused, match="yields other folds"):
-        _run(ledger, evaluation, synthetic.ridge(3))
+    with pytest.raises(Refused, match="yields other folds") as refused:
+        _run(ledger, evaluation, synthetic.ridge(3), dry=dry)
+    assert "ml_lab.splits:CalendarWalkForward" in str(refused.value)
+    assert "delete" not in str(refused.value)
 
 
 def test_a_blend_whose_fit_takes_three_arguments_predicts_no_train_range(
@@ -164,15 +398,22 @@ def test_a_blend_whose_fit_takes_three_arguments_predicts_no_train_range(
         name="equal",
     )
     _run(ledger, evaluation, fixed)
-    rows = ledger.sql(
-        "SELECT COUNT(*) AS n FROM raw_prediction WHERE window LIKE 'train:%'"
-    )
-    assert rows[0]["n"] == 0 and "equal" in _latest(ledger, evaluation)
+    assert _count(ledger, "raw_prediction WHERE window LIKE 'train:%'") == 0
+    assert "equal" in _latest(ledger, evaluation)
     with pytest.raises(Refused, match="in_sample"):
         _run(ledger, evaluation, dataclasses.replace(fixed, in_sample=True))
     learned = dataclasses.replace(fixed, fit=synthetic.blend_fit, in_sample=False)
     with pytest.raises(Refused, match="fourth parameter"):
         _run(ledger, evaluation, learned)
+
+
+def test_in_sample_without_members_is_refused_before_anything_is_written(
+    ledger, evaluation
+):
+    p = dataclasses.replace(synthetic.ridge(1), in_sample=True)
+    with pytest.raises(Refused, match="in_sample needs members"):
+        _run(ledger, evaluation, p)
+    assert _count(ledger, "event") == 1
 
 
 def test_a_dry_run_counts_shared_work_once_as_the_run_does(
@@ -232,7 +473,7 @@ def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
         "SELECT evaluation_name AS e, COUNT(*) AS n FROM score_latest GROUP BY 1"
     )
     assert {r["e"]: r["n"] for r in rows} == {"c0.001": 2, "c0.01": 2}
-    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_fit")[0]["n"] == 2 * len(
+    assert _count(ledger, "raw_fit") == 2 * len(
         synthetic.evaluation(dataset).split.folds(load(ledger, dataset))
     )
 
@@ -260,6 +501,11 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
         len(stored["folds"]) == len(folds)
         and stored["metrics"] == evaluation.directions
     )
+    config = ledger.sql("SELECT config FROM raw_evaluation")[0]["config"]
+    assert json.loads(config) == {
+        "__type__": "tests.synthetic:SimConfig",
+        "cost": 0.001,
+    }
 
 
 def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
@@ -279,6 +525,17 @@ def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
     )
 
 
+def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
+    session = load(ledger, dataset)
+    folds = splits.BlockedKFold(k=5, train_fraction=0.8).folds(session)
+    (hold,) = splits.Holdout(train_fraction=0.8).folds(session)
+    ends = [hi for f in folds for _, hi in [*f.train, *f.windows.values()]]
+    assert max(ends) == hold.train[0][1]
+    assert identity.content_hash(splits.BlockedKFold(k=5)) == identity.content_hash(
+        splits.BlockedKFold(k=5, train_fraction=1.0)
+    )
+
+
 def test_a_clockless_session_fits_on_segments_and_refuses_walk_forward(ledger):
     bare = Session(
         {
@@ -289,7 +546,7 @@ def test_a_clockless_session_fits_on_segments_and_refuses_walk_forward(ledger):
         }
     )
     assert bare.matrix(((0, 10), (90, 100)), ("f0", "f1")).shape == (20, 2)
-    with pytest.raises(ValueError, match="no timestamps"):
+    with pytest.raises(Refused, match="no timestamps; use a row-based split"):
         splits.CalendarWalkForward(first_cutoff="2025-01-01").folds(bare)
     assert synthetic.ridge_fit(
         bare, ((0, 50), (60, 100)), synthetic.RidgeConfig(0, 1.0)
@@ -377,12 +634,188 @@ def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
     assert gaps == [2] * len(folds) and len(folds) == 4
 
 
+def test_a_month_split_that_drops_the_tail_says_how_to_score_it(ledger, dataset):
+    session = load(ledger, dataset)
+    split = splits.CalendarWalkForward(first_cutoff="2025-11-01", horizons=(1, 2))
+    with pytest.raises(Refused, match="set end=2026-01-01 or later") as info:
+        split.folds(session)
+    assert "use unit='day'" in str(info.value)
+
+
 def test_the_clock_keeps_nanoseconds_and_the_dataset_id_sees_them():
     t0 = np.datetime64("2019-06-10T09:00:00", "ns")
     a = Session({"x": np.zeros(2)}, t0 + np.array([1, 2], "timedelta64[ns]"))
     b = Session({"x": np.zeros(2)}, t0 + np.array([1, 3], "timedelta64[ns]"))
     assert data_id(a) != data_id(b)
     assert np.array_equal(formats.session_load(formats.session_save(a)).ts, a.ts)
+
+
+# Identity =============================================================================
+
+
+def test_a_docstring_edit_keeps_the_code_key_and_a_code_edit_moves_it():
+    source = b'def f(x):\n    """Adds one."""\n    return x + 1\n'
+    reworded = b'def f(x):\n    """Adds\n    one more."""\n    return x + 1\n'
+    assert identity.code_key(source) == identity.code_key(reworded)
+    assert identity.code_key(source) == identity.code_key(
+        b'def f(x):\n    ""\n    return x + 1\n'
+    )
+    assert identity.code_key(source) == identity.code_key(
+        b"def f(x):\n    return x+1\n"
+    )
+    assert identity.code_key(source) != identity.code_key(
+        b'def f(x):\n    """Adds one."""\n    return x + 2\n'
+    )
+
+
+def test_two_dataclasses_with_one_qualname_in_two_modules_differ():
+    source = """
+        import dataclasses
+        @dataclasses.dataclass(frozen=True)
+        class Split:
+            rows: int
+    """
+    a = _module("twin_split_a", source)
+    b = _module("twin_split_b", source)
+    assert identity.content_hash(a.Split(5)) != identity.content_hash(b.Split(5))
+
+
+def test_dict_keys_keep_their_type():
+    assert identity.content_hash({1: 0.5}) != identity.content_hash({"1": 0.5})
+    assert identity.canonical({1: "a", "1": "b"}) == {"1": "b", "int:1": "a"}
+
+
+def test_a_numpy_bool_is_a_bool():
+    assert identity.canonical(np.bool_(True)) is True
+
+
+def test_a_module_imported_for_a_constant_is_in_the_closure(tmp_path, monkeypatch):
+    package = tmp_path / "const_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "knobs.py").write_text("SCALE = 2.0\n")
+    (package / "model.py").write_text(
+        "from ml_lab.experiment import step\n"
+        "from .knobs import SCALE\n"
+        "@step\n"
+        "def fit(session, train, config):\n"
+        "    return SCALE\n"
+    )
+    (package / "other.py").write_text("from .knobs import SCALE\n")
+    monkeypatch.syspath_prepend(tmp_path)
+    model = importlib.import_module("const_pkg.model")
+    importlib.import_module("const_pkg.other")
+    shas = identity.import_shas((model.fit,), tmp_path)
+    assert "const_pkg/knobs.py" in shas and "const_pkg/other.py" not in shas
+
+
+def test_a_namespace_package_submodule_is_in_the_closure(tmp_path, monkeypatch):
+    (tmp_path / "ns_pkg").mkdir()
+    (tmp_path / "ns_pkg" / "helpers.py").write_text("def two():\n    return 2\n")
+    (tmp_path / "ns_pkg_model.py").write_text(
+        "import ns_pkg.helpers\n"
+        "from ml_lab.experiment import step\n"
+        "@step\n"
+        "def fit(session, train, config):\n"
+        "    return ns_pkg.helpers.two()\n"
+    )
+    monkeypatch.syspath_prepend(tmp_path)
+    model = importlib.import_module("ns_pkg_model")
+    assert "ns_pkg/helpers.py" in identity.import_shas((model.fit,), tmp_path)
+
+
+def test_an_editable_single_module_install_hashes_its_source(tmp_path, monkeypatch):
+    source = _editable(tmp_path, monkeypatch, "single_tool", single=True)
+    fit = importlib.import_module("single_tool_steps").fit
+    before = identity.imported_dists((fit,), tmp_path / "study")["single_tool"]
+    source.write_text("SCALE = 2.0\n")
+    identity._editable_source.cache_clear()
+    assert identity.imported_dists((fit,), tmp_path / "study")["single_tool"] != before
+
+
+def test_an_editable_lock_covers_the_modules_the_steps_reach(tmp_path, monkeypatch):
+    package = _editable(tmp_path, monkeypatch, "lock_tool")
+    fit = importlib.import_module("lock_tool_steps").fit
+
+    def lock() -> str:
+        identity._editable_source.cache_clear()
+        return identity.imported_dists((fit,), tmp_path / "study")[package.name]
+
+    before = lock()
+    (package / "b.py").write_text("def main():\n    return 1\n")
+    assert lock() == before
+    (package / "a.py").write_text("SCALE = 2.0\n")
+    assert lock() != before
+
+
+def test_one_process_fits_under_one_lock_and_records_the_tool_commit(
+    ledger, tmp_path, monkeypatch
+):
+    package = _editable(tmp_path, monkeypatch, "run_tool")
+    fit = importlib.import_module("run_tool_steps").fit
+    head = subprocess.run(
+        ["git", "-C", package.parent, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    (package / "b.py").write_text("def main():\n    return 1\n")
+    evaluation = synthetic.evaluation(synthetic.dataset(ledger))
+    pipeline = dataclasses.replace(synthetic.ridge(1), fit=fit, name="tool")
+
+    def run() -> runs.RunReport:
+        return runs.run(ledger, [pipeline], evaluation, code_root=tmp_path / "study")
+
+    first = run()
+    assert not first.failed and first.fits_computed > 0
+    (package / "a.py").write_text("SCALE = 2.0\n")
+    assert run().fits_computed == 0
+    assert len(ledger.sql("SELECT DISTINCT env_lock FROM raw_fit")) == 1
+    started = ledger.latest(Event.RUN, first.run)["payload"]["editable"]
+    assert started[package.name]["commit"] == head
+    assert started[package.name]["dirty"] is True
+    editable = ledger.sql("SELECT editable FROM raw_run")[0]["editable"]
+    assert json.loads(editable)[package.name]["commit"] == head
+
+
+# Session ==============================================================================
+
+
+def test_feature_columns_are_read_from_their_store_not_memory(tmp_path):
+    rows = synthetic.generate(
+        start="2025-01-01", months=1, rows_per_day=4, seed=1, drift_at="2025-01-20"
+    )
+    store = tmp_path / "f.parquet"
+    lag = np.arange(rows.rows, dtype=np.int32)
+    pl.DataFrame({"f0_lag": lag}).write_parquet(store)
+    session = Session(rows.columns, rows.ts, ("f0_lag",), {"f0_lag": store})
+    assert "f0_lag" not in session.columns
+    assert session.column("f0_lag", (3, 7)).tolist() == [3, 4, 5, 6]
+    assert session.column("f0_lag", ((0, 2), (5, 6))).tolist() == [0, 1, 5]
+    matrix = session.matrix((2, 5), ("f0", "f0_lag"))
+    assert matrix.dtype == np.float64 and matrix[:, 1].tolist() == [2.0, 3.0, 4.0]
+    view = session.upto(10)
+    assert view.rows == 10 and view.column("f0_lag", (8, 10)).tolist() == [8, 9]
+    with pytest.raises(ValueError, match="visible before the cutoff"):
+        view.column("f0_lag", (8, 11))
+    with pytest.raises(KeyError, match=r"feature columns \['f0_lag'\]"):
+        session.column("f9", (0, 1))
+
+
+@pytest.mark.parametrize("segment", [(-1, 0), (-3, 10), (5, 4)])
+def test_a_segment_below_row_zero_or_reversed_is_refused(tmp_path, segment):
+    store = tmp_path / "f.parquet"
+    pl.DataFrame({"f": np.arange(100.0)}).write_parquet(store)
+    view = Session({"x": np.zeros(100)}, None, ("f",), {"f": store}).upto(10)
+    for name in ("x", "f"):
+        with pytest.raises(ValueError, match=rf"segment \({segment[0]}, "):
+            view.column(name, segment)
+
+
+def test_timestamps_with_a_nat_are_refused():
+    ts = np.array(["2025-01-01", "NaT"], dtype="datetime64[s]")
+    with pytest.raises(ValueError, match="NaT"):
+        Session({"x": np.zeros(2)}, ts)
 
 
 # Run ==================================================================================
@@ -440,6 +873,35 @@ def test_targets_are_hidden_inside_the_window(ledger, dataset, evaluation):
     assert np.isnan(pred).all()
 
 
+def test_a_kfold_fit_that_memorizes_labels_replays_none(ledger, dataset):
+    evaluation = synthetic.evaluation(dataset, split=splits.BlockedKFold(k=3))
+    peek = dataclasses.replace(
+        synthetic.ridge(0),
+        name="peek",
+        fit=synthetic.label_memory_fit,
+        predict=synthetic.label_replay_predict,
+    )
+    assert not _run(ledger, evaluation, peek).failed
+    for e in ledger.events(Event.PREDICTIONS):
+        assert not np.nan_to_num(_load_predictions(ledger, e["id"])).any()
+
+
+def test_a_fold_training_on_an_unrevealed_label_is_refused(ledger):
+    dataset = synthetic.panel(
+        ledger, reveal={synthetic.TARGET: datetime.timedelta(minutes=2)}
+    )
+    bare = splits.WalkForward(200, 50, 50, min_folds=2)
+    evaluation = synthetic.evaluation(dataset, split=bare)
+    for dry in (True, False):
+        with pytest.raises(
+            Refused,
+            match=r"4 fold windows.*rows 198 to 199 whose ret_1 .*0:02:00.*embargo 1 "
+            r"more timestamps \(2 rows\)",
+        ):
+            _run(ledger, evaluation, synthetic.ridge(0), dry=dry)
+    assert not ledger.events(Event.EVALUATION)
+
+
 def test_a_predict_that_reads_the_future_inside_its_window_is_refused(
     ledger, dataset, evaluation
 ):
@@ -447,6 +909,60 @@ def test_a_predict_that_reads_the_future_inside_its_window_is_refused(
     report = _run(ledger, evaluation, peek)
     assert "predict read past row" in report.failed["ridge_1m"]
     assert ledger.events(Event.SCORE) == []
+
+
+def test_rounding_passes_the_probe_and_a_leak_is_sized(ledger, evaluation):
+    full = np.array([1.0, -2.0, 4.0, np.nan])
+    runs._refuse_changed("x", "prediction", full, full[:3] + 1e-10, at=3)
+    runs._refuse_changed("x", "prediction", full, full, at=None)
+    with pytest.raises(Refused, match="3 of 3 rows moved") as info:
+        runs._refuse_changed("x", "prediction", full, full[:3] + 1e-6, at=3, first=10)
+    assert "at row 10" in str(info.value) and "read past row 3" in str(info.value)
+    assert "2.5e-07 of the largest |prediction| 4" in str(info.value)
+    with pytest.raises(Refused, match="is not stable"):
+        runs._refuse_changed("x", "prediction", full, np.array([1.0, -2.0, 4.0, 0.0]))
+    with pytest.raises(Refused, match="NaN|nan"):
+        runs._refuse_changed("x", "prediction", full, np.array([1.0, -2.0, 4.0, 0.0]))
+    wobbly = dataclasses.replace(synthetic.ridge(1), predict=synthetic.jittery_predict)
+    report = _run(ledger, evaluation, wobbly)
+    assert not report.failed and "ridge_1m" in _latest(ledger, evaluation)
+
+
+@step
+def scalar_predict(model, session: Session, rng) -> float:
+    return 0.0
+
+
+@step
+def column_predict(model, session: Session, rng) -> np.ndarray:
+    return synthetic.ridge_predict(model, session, rng)[:, None]
+
+
+@step
+def first_row_postprocess(pred: np.ndarray, session: Session, rng) -> np.ndarray:
+    return pred[:1]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"predict": scalar_predict},
+        {"predict": column_predict},
+        {"postprocess": first_row_postprocess},
+    ],
+)
+def test_an_output_that_is_not_one_value_per_window_row_is_refused(
+    ledger, evaluation, change
+):
+    p = dataclasses.replace(synthetic.ridge(1), **change, name="shaped")
+    report = _run(ledger, evaluation, p)
+    assert f"{next(iter(change))} returned shape" in report.failed["shaped"]
+    assert "a 1-D array with one value per row of the window" in report.failed["shaped"]
+    rows = ledger.sql("SELECT id, range_start, range_end FROM raw_prediction")
+    assert all(
+        len(_load_predictions(ledger, r["id"])) == r["range_end"] - r["range_start"]
+        for r in rows
+    )
 
 
 def test_a_module_edited_during_the_run_is_refused_not_recorded(ledger, tmp_path):
@@ -462,34 +978,6 @@ def test_a_module_edited_during_the_run_is_refused_not_recorded(ledger, tmp_path
     assert ledger.events(Event.FIT) == []
 
 
-def test_untracked_step_modules_are_in_the_run_diff(ledger, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", repo], check=True)
-    (repo / "a.py").write_text("x = 1\n")
-    subprocess.run(["git", "-C", repo, "add", "a.py"], check=True)
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            repo,
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "-m",
-            "a",
-        ],
-        check=True,
-    )
-    (repo / "new_steps.py").write_text("y = 2\n")
-    git = runs._git(ledger, repo)
-    diff = ledger.get_blob(git["diff"]["sha"]).decode()
-    assert git["dirty"] and "new_steps.py" in diff and "+y = 2" in diff
-
-
 def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     ledger, evaluation
 ):
@@ -503,9 +991,7 @@ def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     rows = ledger.sql("SELECT columns, probe_rows FROM raw_feature")
     assert len(rows) == 1 and json.loads(rows[0]["columns"]) == ["f0_lag"]
     assert json.loads(rows[0]["probe_rows"]) == cuts
-    assert (
-        ledger.sql("SELECT COUNT(*) AS n FROM raw_fit")[0]["n"] == report.fits_computed
-    )
+    assert _count(ledger, "raw_fit") == report.fits_computed
     assert set(_latest(ledger, evaluation)) == {"ridge_1m_lag", "ridge_3m_lag"}
     assert a.id != synthetic.ridge(1).id
     leaky = synthetic.featured(synthetic.ridge(1), synthetic.next_f0, "leaky")
@@ -513,7 +999,65 @@ def test_a_feature_step_runs_once_for_two_pipelines_and_a_lookahead_is_refused(
     report = _run(ledger, evaluation, leaky, copier)
     assert "features read past row" in report.failed["leaky"]
     assert synthetic.TARGET in report.failed["copier"]
-    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_feature")[0]["n"] == 1
+    assert _count(ledger, "raw_feature") == 1
+
+
+def test_a_features_tuple_is_one_event_per_step_shared_with_single_step_pipelines(
+    ledger, evaluation
+):
+    both = synthetic.featured(
+        synthetic.ridge(3), (synthetic.lagged_f0, synthetic.lagged_f1), "both"
+    )
+    both = dataclasses.replace(
+        both,
+        config=dataclasses.replace(
+            both.config, columns=synthetic.FEATURES + ("f0_lag", "f1_lag")
+        ),
+    )
+    assert both.feature_steps == (synthetic.lagged_f0, synthetic.lagged_f1)
+    report = _run(ledger, evaluation, both, synthetic.featured(synthetic.ridge(1)))
+    assert not report.failed
+    rows = ledger.sql("SELECT columns FROM raw_feature ORDER BY seq")
+    assert [json.loads(r["columns"]) for r in rows] == [["f0_lag"], ["f1_lag"]]
+    weights = {
+        r["pipeline"]: both.load(ledger.get_blob(r["model"])).weights.shape
+        for r in ledger.sql("SELECT pipeline, model FROM raw_fit")
+    }
+    assert weights[both.id] == (5,)
+    features = {r["features"] for r in ledger.sql("SELECT features FROM raw_fit")}
+    assert len(features) == 2
+
+
+@step
+def other_f0_lag(session: Session) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.full(session.rows, 7.0)}
+
+
+@pytest.mark.parametrize("second", [other_f0_lag, synthetic.lagged_f0])
+def test_feature_steps_naming_one_column_are_refused(ledger, evaluation, second):
+    p = synthetic.featured(synthetic.ridge(1), (synthetic.lagged_f0, second), "clash")
+    report = _run(ledger, evaluation, p)
+    assert "name the same columns ['f0_lag']" in report.failed["clash"]
+    assert _count(ledger, "raw_fit") == 0
+
+
+@step
+def prefix_named_features(session: Session) -> dict[str, np.ndarray]:
+    """Names its column by whether it sees more than 7000 rows."""
+    name = "whole" if session.rows > 7000 else "part"
+    return {name: session.columns["f0"].copy()}
+
+
+def test_a_feature_step_whose_names_change_with_the_prefix_is_refused(
+    ledger, evaluation
+):
+    p = dataclasses.replace(
+        synthetic.ridge(1), features=prefix_named_features, name="shifty"
+    )
+    report = _run(ledger, evaluation, p)
+    assert report.failed["shifty"].startswith("Refused: shifty: features name columns")
+    assert "['whole']" in report.failed["shifty"]
+    assert "['part'] on the rows before" in report.failed["shifty"]
 
 
 def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
@@ -546,7 +1090,7 @@ def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
     )
     assert ledger.sql("SELECT max(seq) AS m FROM event")[0]["m"] == seq
     assert set(ledger.blobs.iterdir()) == blobs
-    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_feature")[0]["n"] == 0
+    assert _count(ledger, "raw_feature") == 0
 
 
 def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
@@ -588,15 +1132,63 @@ def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evalua
     assert np.allclose(_load_predictions(ledger, first["id"]), np.mean(parts, axis=0))
     fit = ledger.latest(Event.FIT, first["payload"]["fit"])
     assert len(fit["payload"]["members"]) == 2
-    stands_on = ledger.sql(
-        "SELECT COUNT(*) AS n FROM score_fit WHERE pipeline = ?",
-        (synthetic.blend(one, three).id,),
+    stands_on = _count(
+        ledger, "score_fit WHERE pipeline = ?", synthetic.blend(one, three).id
     )
-    assert stands_on[0]["n"] == 3 * len(folds)
+    assert stands_on == 3 * len(folds)
     assert _run(ledger, evaluation, synthetic.blend(one, three)).run == ""
     assert _run(
         ledger, evaluation, synthetic.blend(one, three, shrink=0.5)
     ).fits_computed == len(folds)
+
+
+def test_a_member_postprocess_change_refits_an_in_sample_blend(ledger, evaluation):
+    member = synthetic.ridge(1)
+    first = _run(ledger, evaluation, synthetic.blend(member))
+    shifted = dataclasses.replace(
+        member, postprocess=synthetic.scale.configured(factor=2.0), name="x2"
+    )
+    second = _run(ledger, evaluation, synthetic.blend(shifted))
+    assert not first.failed and not second.failed
+    assert second.fits_computed == first.fits_computed // 2 > 0
+
+
+def test_every_fit_of_a_nested_blend_names_a_declared_pipeline(ledger, evaluation):
+    report = _run(ledger, evaluation, _nested(synthetic.ridge(1)))
+    assert not report.failed, report.failed
+    undeclared = ledger.sql(
+        "SELECT DISTINCT f.pipeline FROM raw_fit f LEFT JOIN raw_pipeline p "
+        "ON p.id = f.pipeline WHERE p.id IS NULL"
+    )
+    assert not undeclared and _count(ledger, "raw_pipeline") == 5
+
+
+def test_a_member_listed_twice_is_fit_once(ledger, evaluation):
+    r = synthetic.ridge(1)
+    blend = dataclasses.replace(
+        synthetic.blend(r, r), fit=synthetic.equal_fit, in_sample=False
+    )
+    report = _run(ledger, evaluation, blend)
+    assert not report.failed, report.failed
+    assert report.fits_computed == _count(ledger, "raw_fit")
+
+
+def test_a_blend_sees_its_members_shared_feature_columns(ledger, evaluation):
+    a = synthetic.featured(synthetic.ridge(1))
+    b = synthetic.featured(synthetic.ridge(3))
+    shifted = dataclasses.replace(
+        synthetic.blend(a, b),
+        fit=synthetic.equal_fit,
+        in_sample=False,
+        postprocess=synthetic.add_f0_lag,
+        name="shifted",
+    )
+    report = _run(ledger, evaluation, shifted)
+    assert not report.failed and shifted.feature_steps == ()
+    assert _count(ledger, "raw_feature") == 1
+    mixed = dataclasses.replace(shifted, members=(a, synthetic.ridge(3)), name="mixed")
+    report = _run(ledger, evaluation, mixed)
+    assert "feature columns []" in report.failed["mixed"]
 
 
 def test_pickle_is_marked_not_portable_and_an_unknown_format_is_refused(
@@ -680,7 +1272,7 @@ def test_a_feature_edit_that_keeps_the_columns_keeps_every_fit(
     module = importlib.reload(module)
     featured = synthetic.featured(synthetic.ridge(3), module.lag)
     report = runs.run(ledger, [featured], evaluation, code_root=tmp_path)
-    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_feature")[0]["n"] == 2
+    assert _count(ledger, "raw_feature") == 2
     assert report.fits_computed == report.predictions_computed == 0
     rows = ledger.sql("SELECT DISTINCT features FROM raw_fit")
     assert len(rows) == 1 and rows[0]["features"]
@@ -804,15 +1396,39 @@ def test_a_failing_pipeline_is_recorded_and_the_rest_continue_and_a_rerun_resume
     again = _run(ledger, evaluation, flaky)
     assert again.fits_computed == len(folds) - 2 and again.scores_recorded == 1
     assert set(_latest(ledger, evaluation)) == {"flaky", "ridge_1m"}
+    assert _count(ledger, "raw_failure") == 0
 
 
 def test_a_fit_that_imports_a_distribution_lazily_is_refused():
     pipeline = synthetic.ridge(3)
-    shas = identity.import_shas(pipeline.steps, REPO)
     dists = identity.imported_dists(pipeline.steps, REPO)
     before_pytest = {name for name in sys.modules if not name.startswith("pytest")}
-    with pytest.raises(Refused, match="distributions \\['pytest'\\]"):
-        runs._refuse_lazy_imports(pipeline, REPO, shas, dists, before_pytest)
+    with pytest.raises(Refused, match="distributions \\[.*'pytest'"):
+        runs._refuse_lazy_imports(pipeline, REPO, dists, before_pytest, "fit")
+
+
+@pytest.mark.parametrize("stage", ["fit", "predict"])
+def test_a_step_that_imports_a_repo_module_lazily_is_refused(
+    ledger, evaluation, tmp_path, stage
+):
+    module, helper = _lazy_steps(tmp_path, stage)
+    lazy = getattr(module, f"lazy_{stage}")
+    p = dataclasses.replace(synthetic.ridge(1), **{stage: lazy}, name="lazy")
+    report = runs.run(ledger, [p], evaluation, code_root=tmp_path)
+    assert f"{stage} imported lazily" in report.failed["lazy"]
+    assert helper in report.failed["lazy"]
+    assert _count(ledger, "raw_prediction") == 0
+
+
+def test_a_lazy_import_of_an_installed_submodule_is_not_a_repo_module(
+    ledger, evaluation, tmp_path
+):
+    code = tmp_path / "lazy_venv_steps.py"
+    code.write_text(LAZY_STEPS.format(helper="numpy.ma"))
+    module = cli._load(str(code))
+    p = dataclasses.replace(synthetic.ridge(1), predict=module.lazy_predict, name="pt")
+    report = runs.run(ledger, [p], evaluation, code_root=tmp_path)
+    assert not report.failed and "pt" in _latest(ledger, evaluation)
 
 
 def test_the_run_records_the_resolution_file_when_present(ledger, evaluation):
@@ -821,6 +1437,61 @@ def test_the_run_records_the_resolution_file_when_present(ledger, evaluation):
     assert run["resolution"] is None or run["resolution"]["path"].startswith(
         ("uv.lock", "requirements")
     )
+
+
+# Provenance ===========================================================================
+
+
+def test_untracked_step_modules_are_in_the_run_diff(ledger, tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / "new_steps.py").write_text("y = 2\n")
+    git = runs._git(ledger, repo)
+    diff = ledger.get_blob(git["diff"]["sha"]).decode()
+    assert git["dirty"] and "new_steps.py" in diff and "+y = 2" in diff
+
+
+def test_a_large_untracked_file_is_named_in_the_run_diff_not_diffed(ledger, tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / "big.csv").write_bytes(b"0" * (runs.UNTRACKED_DIFF_CAP + 1))
+    (repo / "b.py").write_text("y = 2\n")
+    diff = ledger.get_blob(runs._git(ledger, repo)["diff"]["sha"]).decode()
+    assert "+y = 2" in diff and "not diffed: big.csv" in diff
+    assert "+000" not in diff
+    assert not (repo / ".git" / "index").read_bytes().count(b"b.py")
+
+
+def test_git_keeps_the_raw_bytes_of_a_file_that_is_not_utf8(ledger, tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / "a.py").write_bytes(b"x = '\xe9t\xe9'\n")
+    git = runs._git(ledger, repo)
+    assert git["dirty"] and b"+x = '\xe9t\xe9'" in ledger.get_blob(git["diff"]["sha"])
+
+
+def test_git_survives_a_dangling_untracked_symlink(ledger, tmp_path):
+    repo = _repo(tmp_path / "repo")
+    (repo / "link.py").symlink_to(repo / "gone.py")
+    (repo / "b.py").write_text("y = 2\n")
+    git = runs._git(ledger, repo)
+    assert b"+y = 2" in ledger.get_blob(git["diff"]["sha"])
+
+
+def test_git_before_the_first_commit_records_the_untracked_code(ledger, tmp_path):
+    git = runs._git(ledger, _repo(tmp_path / "repo", commit=False))
+    assert git["commit"] is None and git["dirty"] is True
+    assert b"+x = 1" in ledger.get_blob(git["diff"]["sha"])
+
+
+def test_a_failing_git_leaves_no_fit_under_an_unrecorded_run(
+    ledger, evaluation, monkeypatch
+):
+    def broken(ledger, root):
+        raise RuntimeError("git broke")
+
+    monkeypatch.setattr(runs, "_git", broken)
+    with pytest.raises(RuntimeError, match="git broke"):
+        _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(3))
+    assert _count(ledger, "raw_run") == _count(ledger, "raw_fit") == 0
+    assert _count(ledger, "raw_failure") == 0
 
 
 # Command line =========================================================================
@@ -920,6 +1591,42 @@ def test_lab_run_flushes_each_progress_line(ledger, dataset, monkeypatch):
     assert cli.main(["--root", str(ledger.root), "run", "tests.synthetic"]) == 0
 
 
+def test_a_source_written_by_two_actors_needs_an_id(
+    ledger, dataset, evaluation, monkeypatch, capsys
+):
+    monkeypatch.setenv("ML_LAB_ACTOR", "other-agent")
+    second = synthetic.dataset(ledger, seed=8)
+    assert second != dataset
+    with pytest.raises(Refused, match="several actors") as info:
+        cli._dataset(ledger, "synthetic")
+    assert dataset[:8] in str(info.value) and "other-agent" in str(info.value)
+    with pytest.raises(Refused, match="several actors"):
+        cli._dataset(ledger, None)
+    assert cli._dataset(ledger, dataset[:8]) == dataset
+    assert cli.main(["--root", str(ledger.root), "run", "tests.synthetic"]) == 1
+    assert "several actors" in capsys.readouterr().err
+
+
+def test_lab_run_skips_a_failed_pipeline_in_later_evaluations(
+    ledger, dataset, tmp_path, capsys
+):
+    sweep = tmp_path / "skip.py"
+    sweep.write_text(
+        "import dataclasses\nfrom tests import synthetic\n"
+        "pipelines = [synthetic.ridge(1), dataclasses.replace(synthetic.ridge(3), "
+        "predict=synthetic.peeking_predict, name='peek')]\n"
+        "def evaluations(d):\n"
+        "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
+        " for c in (0.001, 0.01)]\n"
+    )
+    assert cli.main(["--root", str(ledger.root), "run", str(sweep)]) == 1
+    out = capsys.readouterr().out
+    assert out.count("lab run: peek failed") == 1
+    assert "failed, skipped in later evaluations: peek" in out
+    assert re.search(r"total over 2 evaluations: computed fits \d+", out)
+    assert _count(ledger, "raw_failure") == 1 and _count(ledger, "score_latest") == 2
+
+
 # Read back ============================================================================
 
 
@@ -996,6 +1703,7 @@ def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
     assert row["folds"] == len(d) and row["wins"] == int((d > 0).sum())
     assert np.isclose(row["mean_delta"], d.mean())
     assert np.isclose(row["delta_std"], d.std(ddof=1))
+    assert np.isclose(row["t"], d.mean() / (d.std(ddof=1) / np.sqrt(len(d))))
     sha = ledger.sql("SELECT series FROM score_aggregate WHERE window = '1' LIMIT 1")
     assert list(formats.arrays_load(ledger.get_blob(sha[0]["series"]))) == [
         "pnl",
@@ -1030,7 +1738,7 @@ def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
     row = ledger.sql(
         "SELECT * FROM head_to_head WHERE name = 'ridge_1m' AND metric = 'pnl'"
     )[0]
-    assert row["folds"] == 1 and row["delta_std"] is None
+    assert row["folds"] == 1 and row["delta_std"] is None and row["t"] is None
     series = ledger.sql(
         "SELECT score, series, fold_rows FROM score_aggregate "
         "WHERE window = 'test' AND metric = 'pnl' AND score IN (?, ?)",
@@ -1049,14 +1757,124 @@ def test_the_log_reads_as_it_stood(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(6))
     before = ledger.events()[-1]["seq"]
     _run(ledger, evaluation, synthetic.ridge(1))
-    rows = ledger.sql("SELECT COUNT(*) AS n FROM raw_score WHERE seq <= ?", (before,))
-    assert rows[0]["n"] == 1 and len(ledger.events(Event.SCORE)) == 2
+    assert _count(ledger, "raw_score WHERE seq <= ?", before) == 1
+    assert len(ledger.events(Event.SCORE)) == 2
 
 
 def test_connecting_drops_views_a_previous_build_left_behind(ledger):
     ledger._db.execute("CREATE VIEW paired_score AS SELECT * FROM head_to_head")
     names = Ledger(ledger.root).sql("SELECT name FROM sqlite_master WHERE type='view'")
     assert "paired_score" not in {r["name"] for r in names}
+
+
+def _nan_metrics(series):
+    return {"ic": float("nan")}
+
+
+@scorer(metrics=_nan_metrics, directions={"ic": "max"})
+def nan_scorer(pred, session, rng, config):
+    return np.zeros(rng[1] - rng[0])
+
+
+def test_a_nan_metric_records_a_score_whose_value_is_null(ledger, evaluation):
+    nan_evaluation = dataclasses.replace(evaluation, scorer=nan_scorer, config=None)
+    assert _run(ledger, nan_evaluation, synthetic.ridge(3)).scores_recorded == 1
+    values = {r["value"] for r in ledger.sql("SELECT value FROM score_aggregate")}
+    assert values == {None}
+
+
+@dataclasses.dataclass(frozen=True)
+class DottedSplit:
+    def folds(self, session):
+        cuts = (2000, 3000, 4000)
+        return [
+            splits.Fold(f"f{k}", ((0, c),), {"1.5d": (c, c + 500)})
+            for k, c in enumerate(cuts)
+        ]
+
+
+def _dotted_metrics(series):
+    return {"hit.rate": float((series > 0).mean())}
+
+
+@scorer(metrics=_dotted_metrics, directions={"hit.rate": "max"})
+def dotted_scorer(pred, session, rng, config):
+    return np.sign(pred) * session.column(synthetic.TARGET, rng)
+
+
+def test_a_dotted_window_keeps_its_series_and_a_dotted_metric_counts_wins(
+    ledger, dataset
+):
+    evaluation = Evaluation(dataset=dataset, split=DottedSplit(), scorer=dotted_scorer)
+    _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(3))
+    rows = ledger.sql("SELECT series, fold_rows FROM score_aggregate")
+    assert rows and all(r["series"] and r["fold_rows"] for r in rows)
+    rows = ledger.sql("SELECT wins FROM head_to_head")
+    assert rows and all(r["wins"] is not None for r in rows)
+
+
+def test_fold_and_delta_std_survive_a_large_metric_offset(ledger):
+    ledger.append(Event.DATASET, "d", "d", {"source": "s"}, id="d")
+    ledger.append(Event.EVALUATION, "e", "e", {"dataset": "d", "metrics": {}})
+    for p in ("a", "b"):
+        ledger.append(Event.PIPELINE, p, p, {"name": p})
+    _score(ledger, "sa", "a", [1e9 + i * i for i in range(4)])
+    _score(ledger, "sb", "b", [0.0] * 4)
+    std = pytest.approx(np.std([0, 1, 4, 9], ddof=1), rel=1e-6)
+    (row,) = ledger.sql("SELECT fold_std FROM score_aggregate WHERE score = 'sa'")
+    assert row["fold_std"] == std
+    (row,) = ledger.sql("SELECT delta_std FROM head_to_head WHERE pipeline = 'a'")
+    assert row["delta_std"] == std
+
+
+def _auc(series: np.ndarray) -> dict[str, float]:
+    p, y = series[:, 0], series[:, 1] == 1
+    _, inverse, counts = np.unique(p, return_inverse=True, return_counts=True)
+    ranks = (np.cumsum(counts) - (counts - 1) / 2)[inverse]
+    n1, n0 = y.sum(), (~y).sum()
+    return {"auc": float((ranks[y].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))}
+
+
+@scorer(metrics=_auc, directions={"auc": "max"}, columns=("p", "y"))
+def auc_score(pred: np.ndarray, session: Session, rng: Range, config: None):
+    return np.column_stack([pred, session.column("y", rng)])
+
+
+@step
+def prior_fit(session: Session, train: splits.Segments, config: None) -> float:
+    return float(np.mean(np.concatenate([session.column("y", s) for s in train])))
+
+
+@step
+def prior_predict(model: float, session: Session, rng: Range) -> np.ndarray:
+    return np.full(rng[1] - rng[0], model)
+
+
+@step(format=formats.Format.ARROW_ARRAYS)
+def prior_save(model: float) -> bytes:
+    return formats.arrays_save({"p": np.array([model])})
+
+
+@step
+def prior_load(payload: bytes) -> float:
+    return float(formats.arrays_load(payload)["p"][0])
+
+
+def test_a_constant_per_fold_scores_auc_one_half_by_fold_mean_not_pooled(ledger):
+    rate = np.repeat([0.1, 0.3, 0.5, 0.7], 100)
+    y = (np.random.default_rng(1).random(400) < rate).astype(float)
+    session = Session({"x": np.zeros(400), "y": y})
+    dataset = record(
+        ledger, session, source="auc", params={}, filters=(), targets=("y",)
+    )
+    evaluation = Evaluation(
+        dataset, splits.WalkForward(100, 100, 100, min_folds=3), auc_score
+    )
+    prior = Pipeline(prior_fit, prior_predict, prior_save, prior_load, None, name="p")
+    assert not _run(ledger, evaluation, prior).failed
+    row = ledger.sql("SELECT * FROM board")[0]
+    assert row["folds"] == 3 and row["fold_mean"] == 0.5 and row["value"] != 0.5
+    assert list(row).index("fold_mean") < list(row).index("value")
 
 
 # Storage ==============================================================================
@@ -1080,6 +1898,22 @@ def test_git_blob_sha_matches_git():
     assert (
         identity.git_blob_sha(b"hello\n") == "ce013625030ba8dba906f756967f9e9ca394464a"
     )
+
+
+def test_a_zip_member_named_like_the_manifest_is_refused():
+    with pytest.raises(ValueError, match="manifest"):
+        formats.zip_save({formats.MANIFEST: (formats.Format.TEXT, b"{}")})
+
+
+def test_arrays_round_trip_when_every_array_is_empty():
+    out = formats.arrays_load(formats.arrays_save({"e": np.zeros((0, 3))}))
+    assert out["e"].shape == (0, 3)
+
+
+def test_a_seconds_datetime_column_is_stored_in_nanoseconds():
+    column = np.datetime64("2025-01-01", "s") + np.arange(48).astype("timedelta64[s]")
+    loaded = formats.session_load(formats.session_save(_session(z=column)))
+    np.testing.assert_array_equal(loaded.columns["z"], column.astype("datetime64[ns]"))
 
 
 # Panel ================================================================================
@@ -1144,7 +1978,7 @@ def test_rows_sharing_a_timestamp_are_one_instant_to_the_probe(ledger):
 
 
 def test_a_revealed_target_is_a_feature_no_earlier_than_its_lag(ledger):
-    split = splits.WalkForward(200, 50, 50, min_folds=2)
+    split = splits.WalkForward(200, 50, 50, embargo_rows=2, min_folds=2)
     two = datetime.timedelta(minutes=2)
     dataset = synthetic.panel(ledger, reveal={synthetic.TARGET: two})
     assert dataset != synthetic.panel(ledger)
@@ -1168,200 +2002,3 @@ def test_the_features_probe_reruns_on_five_prefixes_and_catches_a_day_lookahead(
     error = report.failed["day_mean"]
     assert "features read past row" in error and ": f0_lag at row" in error
     assert "of the largest |f0_lag|" in error
-
-
-# Round four ===========================================================================
-
-
-def test_a_source_written_by_two_actors_needs_an_id(
-    ledger, dataset, evaluation, monkeypatch, capsys
-):
-    monkeypatch.setenv("ML_LAB_ACTOR", "other-agent")
-    second = synthetic.dataset(ledger, seed=8)
-    assert second != dataset
-    with pytest.raises(Refused, match="several actors") as info:
-        cli._dataset(ledger, "synthetic")
-    assert dataset[:8] in str(info.value) and "other-agent" in str(info.value)
-    with pytest.raises(Refused, match="several actors"):
-        cli._dataset(ledger, None)
-    assert cli._dataset(ledger, dataset[:8]) == dataset
-    assert cli.main(["--root", str(ledger.root), "run", "tests.synthetic"]) == 1
-    assert "several actors" in capsys.readouterr().err
-
-
-def test_a_docstring_edit_keeps_the_code_key_and_a_code_edit_moves_it():
-    source = b'def f(x):\n    """Adds one."""\n    return x + 1\n'
-    reworded = b'def f(x):\n    """Adds\n    one more."""\n    return x + 1\n'
-    assert identity.code_key(source) == identity.code_key(reworded)
-    assert identity.code_key(source) == identity.code_key(
-        b"def f(x):\n    return x+1\n"
-    )
-    assert identity.code_key(source) != identity.code_key(
-        b'def f(x):\n    """Adds one."""\n    return x + 2\n'
-    )
-
-
-def test_rounding_passes_the_probe_and_a_leak_is_sized(ledger, evaluation):
-    full = np.array([1.0, -2.0, 4.0, np.nan])
-    runs._refuse_changed("x", "prediction", full, full[:3] + 1e-10, at=3)
-    runs._refuse_changed("x", "prediction", full, full, at=None)
-    with pytest.raises(Refused, match="3 of 3 rows moved") as info:
-        runs._refuse_changed("x", "prediction", full, full[:3] + 1e-6, at=3, first=10)
-    assert "at row 10" in str(info.value) and "read past row 3" in str(info.value)
-    assert "2.5e-07 of the largest |prediction| 4" in str(info.value)
-    with pytest.raises(Refused, match="is not stable"):
-        runs._refuse_changed("x", "prediction", full, np.array([1.0, -2.0, 4.0, 0.0]))
-    with pytest.raises(Refused, match="NaN|nan"):
-        runs._refuse_changed("x", "prediction", full, np.array([1.0, -2.0, 4.0, 0.0]))
-    wobbly = dataclasses.replace(synthetic.ridge(1), predict=synthetic.jittery_predict)
-    report = _run(ledger, evaluation, wobbly)
-    assert not report.failed and "ridge_1m" in _latest(ledger, evaluation)
-
-
-def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
-    rows = synthetic.generate(
-        start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
-    )
-    kw = dict(source="synthetic", params={}, filters=(), targets=(synthetic.TARGET,))
-    by_date = record(ledger, rows, reveal={synthetic.TARGET: 1}, **kw)
-    by_time = record(
-        ledger, rows, reveal={synthetic.TARGET: datetime.timedelta(1)}, **kw
-    )
-    assert by_date != by_time != record(ledger, rows, **kw)
-    recipe = ledger.events(Event.DATASET, key=by_date)[0]["payload"]["recipe"]
-    assert recipe["targets"][synthetic.TARGET] == {"dates": 1}
-    evaluation = synthetic.evaluation(by_date)
-    base = synthetic.ridge(1)
-    known = synthetic.featured(base, synthetic.label_one_date_back, "known")
-    early = synthetic.featured(base, synthetic.label_one_row_back, "early")
-    report = _run(ledger, evaluation, known, early)
-    assert set(report.failed) == {"early"}
-    assert "before its reveal lag" in report.failed["early"]
-    session = load(ledger, by_date)
-    at = session.index_of("2025-03-03")
-    masked = session.masked({synthetic.TARGET: 1}, at).columns[synthetic.TARGET]
-    assert np.isnan(masked[at:]).all() and not np.isnan(masked[:at]).any()
-    masked = session.masked({synthetic.TARGET: 2}, at).columns[synthetic.TARGET]
-    assert np.isnan(masked[at - 20]) and not np.isnan(masked[at - 21])
-
-
-def test_a_features_tuple_is_one_event_per_step_shared_with_single_step_pipelines(
-    ledger, evaluation
-):
-    both = synthetic.featured(
-        synthetic.ridge(3), (synthetic.lagged_f0, synthetic.lagged_f1), "both"
-    )
-    both = dataclasses.replace(
-        both,
-        config=dataclasses.replace(
-            both.config, columns=synthetic.FEATURES + ("f0_lag", "f1_lag")
-        ),
-    )
-    assert both.feature_steps == (synthetic.lagged_f0, synthetic.lagged_f1)
-    report = _run(ledger, evaluation, both, synthetic.featured(synthetic.ridge(1)))
-    assert not report.failed
-    rows = ledger.sql("SELECT columns FROM raw_feature ORDER BY seq")
-    assert [json.loads(r["columns"]) for r in rows] == [["f0_lag"], ["f1_lag"]]
-    weights = {
-        r["pipeline"]: both.load(ledger.get_blob(r["model"])).weights.shape
-        for r in ledger.sql("SELECT pipeline, model FROM raw_fit")
-    }
-    assert weights[both.id] == (5,)
-    features = {r["features"] for r in ledger.sql("SELECT features FROM raw_fit")}
-    assert len(features) == 2
-
-
-def test_a_blend_sees_its_members_shared_feature_columns(ledger, evaluation):
-    a = synthetic.featured(synthetic.ridge(1))
-    b = synthetic.featured(synthetic.ridge(3))
-    shifted = dataclasses.replace(
-        synthetic.blend(a, b),
-        fit=synthetic.equal_fit,
-        in_sample=False,
-        postprocess=synthetic.add_f0_lag,
-        name="shifted",
-    )
-    report = _run(ledger, evaluation, shifted)
-    assert not report.failed and shifted.feature_steps == ()
-    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_feature")[0]["n"] == 1
-    mixed = dataclasses.replace(shifted, members=(a, synthetic.ridge(3)), name="mixed")
-    report = _run(ledger, evaluation, mixed)
-    assert "feature columns []" in report.failed["mixed"]
-
-
-def test_feature_columns_are_read_from_their_store_not_memory(tmp_path):
-    rows = synthetic.generate(
-        start="2025-01-01", months=1, rows_per_day=4, seed=1, drift_at="2025-01-20"
-    )
-    store = tmp_path / "f.parquet"
-    lag = np.arange(rows.rows, dtype=np.int32)
-    pl.DataFrame({"f0_lag": lag}).write_parquet(store)
-    session = Session(rows.columns, rows.ts, ("f0_lag",), {"f0_lag": store})
-    assert "f0_lag" not in session.columns
-    assert session.column("f0_lag", (3, 7)).tolist() == [3, 4, 5, 6]
-    assert session.column("f0_lag", ((0, 2), (5, 6))).tolist() == [0, 1, 5]
-    matrix = session.matrix((2, 5), ("f0", "f0_lag"))
-    assert matrix.dtype == np.float64 and matrix[:, 1].tolist() == [2.0, 3.0, 4.0]
-    view = session.upto(10)
-    assert view.rows == 10 and view.column("f0_lag", (8, 10)).tolist() == [8, 9]
-    with pytest.raises(ValueError, match="visible before the cutoff"):
-        view.column("f0_lag", (8, 11))
-    with pytest.raises(KeyError, match=r"feature columns \['f0_lag'\]"):
-        session.column("f9", (0, 1))
-
-
-def test_a_slot_that_is_not_a_step_is_refused_before_anything_is_written(
-    ledger, evaluation
-):
-    broken = dataclasses.replace(synthetic.ridge(1), features=("f0_lag",))
-    with pytest.raises(Refused, match="holds a str, not a step"):
-        _run(ledger, evaluation, broken)
-    assert _types(ledger) == {Event.DATASET: 1}
-
-
-def test_lab_run_skips_a_failed_pipeline_in_later_evaluations(
-    ledger, dataset, tmp_path, capsys
-):
-    sweep = tmp_path / "skip.py"
-    sweep.write_text(
-        "import dataclasses\nfrom tests import synthetic\n"
-        "pipelines = [synthetic.ridge(1), dataclasses.replace(synthetic.ridge(3), "
-        "predict=synthetic.peeking_predict, name='peek')]\n"
-        "def evaluations(d):\n"
-        "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
-        " for c in (0.001, 0.01)]\n"
-    )
-    assert cli.main(["--root", str(ledger.root), "run", str(sweep)]) == 1
-    out = capsys.readouterr().out
-    assert out.count("lab run: peek failed") == 1
-    assert "failed, skipped in later evaluations: peek" in out
-    assert re.search(r"total over 2 evaluations: computed fits \d+", out)
-    assert ledger.sql("SELECT COUNT(*) AS n FROM raw_failure")[0]["n"] == 1
-    assert ledger.sql("SELECT COUNT(*) AS n FROM score_latest")[0]["n"] == 2
-
-
-def test_a_large_untracked_file_is_named_in_the_run_diff_not_diffed(ledger, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", repo], check=True)
-    (repo / "a.py").write_text("x = 1\n")
-    subprocess.run(["git", "-C", repo, "add", "a.py"], check=True)
-    subprocess.run(
-        ["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t"]
-        + ["commit", "-q", "-m", "a"],
-        check=True,
-    )
-    (repo / "big.csv").write_bytes(b"0" * (runs.UNTRACKED_DIFF_CAP + 1))
-    (repo / "b.py").write_text("y = 2\n")
-    diff = ledger.get_blob(runs._git(ledger, repo)["diff"]["sha"]).decode()
-    assert "+y = 2" in diff and "not diffed: big.csv" in diff
-    assert "+000" not in diff
-    assert not (repo / ".git" / "index").read_bytes().count(b"b.py")
-
-
-def test_a_month_split_that_drops_the_tail_says_how_to_score_it(ledger, dataset):
-    session = load(ledger, dataset)
-    split = splits.CalendarWalkForward(first_cutoff="2025-11-01", horizons=(1, 2))
-    with pytest.raises(Refused, match="set end=2026-01-01 or later") as info:
-        split.folds(session)
-    assert "use unit='day'" in str(info.value)

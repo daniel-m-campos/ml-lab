@@ -68,13 +68,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     root = pathlib.Path(args.root)
     try:
+        if root.exists() and not root.is_dir():
+            raise Refused(f"{root} is not a directory")
         if args.command == "run" and not (root / "ml_lab.sqlite").exists():
             raise Refused(
                 f"no ledger at {root.resolve()}; set ML_LAB_ROOT or --root, or lab "
                 "ingest to create one"
             )
         return args.handler(args, Ledger(root))
-    except (Refused, KeyError, ImportError) as refused:
+    except (Refused, KeyError, ImportError, SyntaxError) as refused:
         print(f"lab {args.command}: {refused}", file=sys.stderr)
         return 1
 
@@ -83,7 +85,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
-    print(_load(args.module).dataset(ledger, *args.args))
+    dataset = getattr(_load(args.module), "dataset", None)
+    if dataset is None:
+        raise Refused(f"{args.module} declares no dataset(ledger, *args)")
+    print(dataset(ledger, *args.args))
     return 0
 
 
@@ -155,6 +160,13 @@ def _experiments(
     declares them. Two names on one evaluation, or one name on two, are refused.
     """
     modules = [_load(spec) for spec in args.experiments]
+    for m in modules:
+        for attr in ("pipelines", "evaluations"):
+            held = getattr(m, attr, [])
+            if not (isinstance(held, (list, tuple)) or callable(held)):
+                raise Refused(
+                    f"{m.__name__}.{attr} is a {type(held).__name__}, not a list"
+                )
     pipelines = [p for m in modules for p in getattr(m, "pipelines", [])]
     found = [m.evaluations for m in modules if hasattr(m, "evaluations")]
     if len(found) != 1:
@@ -165,6 +177,14 @@ def _experiments(
     evaluations = found[0]
     if callable(evaluations):
         evaluations = evaluations(_dataset(ledger, args.dataset))
+    elif args.dataset:
+        chosen = _dataset(ledger, args.dataset)
+        off = [e.name or e.id for e in evaluations if e.dataset != chosen]
+        if off:
+            raise Refused(
+                f"evaluations {off} are declared on another dataset than --dataset "
+                f"{args.dataset} ({chosen[:8]}); a list of evaluations fixes its own"
+            )
     evaluations = list(evaluations)
     names, ids = {e.name or e.id for e in evaluations}, {e.id for e in evaluations}
     if not (evaluations and len(names) == len(ids) == len(evaluations)):
@@ -196,9 +216,10 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
     if selector:
         matches = [r["id"] for r in rows if r["id"].startswith(selector)]
         if len(matches) != 1:
+            hint = "pass a longer prefix: " + ", ".join(matches)
             raise Refused(
                 f"dataset {selector}: {len(matches)} matches in "
-                f"{ledger.root.resolve()}; lab ingest first"
+                f"{ledger.root.resolve()}; {hint if matches else 'lab ingest first'}"
             )
         return matches[0]
     if len(by_source) > 1:
@@ -216,13 +237,19 @@ def _load(spec: str) -> Any:
     name.
     """
     if spec.endswith(".py"):
-        path = pathlib.Path(spec).resolve()
+        path = spec_path = pathlib.Path(spec).resolve()
         parts = [path.stem]
         while (path.parent / "__init__.py").exists():
             path = path.parent
             parts.insert(0, path.name)
         sys.path.insert(0, str(path.parent))
         spec = ".".join(parts)
+        loaded = getattr(sys.modules.get(spec), "__file__", None)
+        if loaded and pathlib.Path(loaded).resolve() != spec_path:
+            raise Refused(
+                f"{spec_path} and {loaded} both import as {spec}; put them in packages "
+                "(a directory with __init__.py) or rename one"
+            )
     else:
         sys.path.insert(0, os.getcwd())
     return importlib.import_module(spec)

@@ -85,7 +85,7 @@ def canonical(obj: Any) -> Any:
     """Reduce a declaration to JSON-serializable values with a stable form."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
-    if isinstance(obj, (np.integer, np.floating)):
+    if isinstance(obj, (np.integer, np.floating, np.bool_)):
         return obj.item()
     if callable(obj):
         kwargs = getattr(obj, "__ml_lab_meta__", {}).get("kwargs")
@@ -99,12 +99,14 @@ def canonical(obj: Any) -> Any:
             for f in dataclasses.fields(obj)
             if not f.metadata.get("label") and not _at_default(f, getattr(obj, f.name))
         }
-        return {"__type__": type(obj).__qualname__, **fields}
+        kind = f"{type(obj).__module__}:{type(obj).__qualname__}"
+        return {"__type__": kind, **fields}
     if isinstance(obj, dict):
-        return {
-            str(k): canonical(v)
-            for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))
+        keys = {
+            k if isinstance(k, str) else f"{type(k).__name__}:{k}": v
+            for k, v in obj.items()
         }
+        return {k: canonical(keys[k]) for k in sorted(keys)}
     if isinstance(obj, (list, tuple)):
         return [canonical(v) for v in obj]
     raise Refused(f"cannot serialize {type(obj).__name__} into a declaration")
@@ -115,10 +117,12 @@ def _at_default(field: dataclasses.Field, value: Any) -> bool:
     declaration keeps every existing id.
     """
     if field.default is not dataclasses.MISSING:
-        return canonical(value) == canonical(field.default)
-    if field.default_factory is not dataclasses.MISSING:
-        return canonical(value) == canonical(field.default_factory())
-    return False
+        default = field.default
+    elif field.default_factory is not dataclasses.MISSING:
+        default = field.default_factory()
+    else:
+        return False
+    return content_hash(value) == content_hash(default)
 
 
 def content_hash(obj: Any) -> str:
@@ -130,6 +134,19 @@ def content_hash(obj: Any) -> str:
 def bytes_hash(payload: bytes) -> str:
     """Full sha256 hex of raw bytes, the blob store key."""
     return hashlib.sha256(payload).hexdigest()
+
+
+def array_hash(array: np.ndarray) -> str:
+    """Full sha256 hex of an array's bytes, or of an object array's values as JSON."""
+    if array.dtype.kind != "O":
+        return bytes_hash(np.ascontiguousarray(array).tobytes())
+    try:
+        text = json.dumps(array.tolist(), ensure_ascii=False)
+    except TypeError as error:
+        raise Refused(
+            f"an object column holds a value that is not a str, number or None: {error}"
+        ) from None
+    return bytes_hash(text.encode())
 
 
 # Ids ==================================================================================
@@ -180,7 +197,8 @@ def imports(
     """Every module reachable from the steps' modules through module-level names.
 
     Modules outside ``code_root`` are reached but not expanded, so a third-party package
-    appears once and its internals are never walked.
+    appears once and its internals are never walked, except an editable install's
+    modules, which are expanded as the repo's are, their sources read once per process.
     """
     root = code_root.resolve()
     queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
@@ -190,7 +208,13 @@ def imports(
         if module.__name__ in seen:
             continue
         seen[module.__name__] = module
-        if _module_path(module, root) is None:
+        path = _module_path(module, root)
+        editable = None if path else _editable(module)
+        if path or editable:
+            source = path.read_bytes() if path else _editable_source(editable[1])
+            names = _imported_names(source, module.__package__)
+            queue.extend(sys.modules[n] for n in names if n in sys.modules)
+        elif not _namespace_under(module, root):
             continue
         for value in vars(module).values():
             if isinstance(value, types.ModuleType):
@@ -225,7 +249,9 @@ def code_key(source: bytes) -> str:
     """
     tree = ast.parse(source)
     for node in ast.walk(tree):
-        if isinstance(node, _DOC_OWNERS) and ast.get_docstring(node, clean=False):
+        if isinstance(node, _DOC_OWNERS) and (
+            ast.get_docstring(node, clean=False) is not None
+        ):
             del node.body[0]
     return hashlib.sha256(ast.dump(tree).encode()).hexdigest()[:HASH_LEN]
 
@@ -249,11 +275,13 @@ def imported_dists(
     """Installed distributions the steps' closure imports, with their requirements, name
     to version.
 
-    An editable install's version carries a hash of its source files, since the version
-    does not move when the files do.
+    An editable install's version carries a hash of the code keys of its modules the
+    closure reaches, since the version does not move when the files do; see
+    ``_editable_suffix``.
     """
     owners = distribution_owners()
-    tops = {m.__name__.partition(".")[0] for m in imports(funcs, code_root)}
+    modules = imports(funcs, code_root)
+    tops = {m.__name__.partition(".")[0] for m in modules}
     todo = {d for top in tops for d in owners.get(top, (top,))}
     found: dict[str, str] = {}
     while todo:
@@ -264,11 +292,50 @@ def imported_dists(
         name = dist.metadata["Name"]
         if name in found:
             continue
-        found[name] = dist.version + _editable_suffix(dist)
+        found[name] = dist.version + _editable_suffix(dist, modules)
         for req in dist.requires or ():
             if "extra ==" not in req:
                 todo.add(re.match(r"[A-Za-z0-9_.-]+", req).group())
     return dict(sorted(found.items()))
+
+
+def editable_roots(
+    funcs: Iterable[Callable], code_root: pathlib.Path
+) -> dict[str, pathlib.Path]:
+    """Each editable install the steps' closure reaches, name to the git root of the
+    files its modules were imported from.
+    """
+    roots: dict[str, pathlib.Path] = {}
+    for module in imports(funcs, code_root):
+        editable = _editable(module)
+        if editable and editable[0] not in roots:
+            roots[editable[0]] = repo_root(editable[1])
+    return dict(sorted(roots.items()))
+
+
+@functools.cache
+def _imported_names(source: bytes, package: str | None) -> tuple[str, ...]:
+    names = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            relative = "." * node.level + (node.module or "")
+            try:
+                module = importlib.util.resolve_name(relative, package)
+            except ImportError:
+                continue
+            for alias in node.names:
+                sub = f"{module}.{alias.name}"
+                names.append(sub if sub in sys.modules else module)
+    return tuple(names)
+
+
+def _namespace_under(module: types.ModuleType, root: pathlib.Path) -> bool:
+    if getattr(module, "__file__", None):
+        return False
+    paths = getattr(module, "__path__", ())
+    return any(pathlib.Path(p).resolve().is_relative_to(root) for p in paths)
 
 
 def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path | None:
@@ -276,7 +343,7 @@ def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path |
     if not file:
         return None
     path = pathlib.Path(file).resolve()
-    if root not in path.parents or ".venv" in path.parts or not path.suffix == ".py":
+    if not path.is_relative_to(root) or ".venv" in path.parts or path.suffix != ".py":
         return None
     return path
 
@@ -286,21 +353,70 @@ def distribution_owners() -> dict[str, list[str]]:
     return importlib.metadata.packages_distributions()
 
 
-def _editable_suffix(dist: importlib.metadata.Distribution) -> str:
+def _editable(module: types.ModuleType) -> tuple[str, pathlib.Path] | None:
+    file = getattr(module, "__file__", None)
+    if not file or not file.endswith(".py"):
+        return None
+    dist = _editable_dist(module.__name__.partition(".")[0])
+    return (dist, pathlib.Path(file).resolve()) if dist else None
+
+
+@functools.cache
+def _editable_dist(top: str) -> str | None:
+    for name in distribution_owners().get(top, (top,)):
+        try:
+            dist = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        if _is_editable(dist):
+            return dist.metadata["Name"]
+    return None
+
+
+def _is_editable(dist: importlib.metadata.Distribution) -> bool:
     text = dist.read_text("direct_url.json")
-    info = json.loads(text) if text else {}
-    if not info.get("dir_info", {}).get("editable"):
+    return bool(text and json.loads(text).get("dir_info", {}).get("editable"))
+
+
+@functools.cache
+def _editable_source(path: pathlib.Path) -> bytes:
+    """An editable module's source, read once per process, so one run fits under one
+    lock however the install is edited meanwhile. The repo's own modules are read
+    fresh, which is how a run catches their edits.
+    """
+    return path.read_bytes()
+
+
+def _editable_suffix(
+    dist: importlib.metadata.Distribution, modules: Iterable[types.ModuleType]
+) -> str:
+    """``+`` and a hash of the code keys of an editable install's modules among
+    ``modules``, so an edit to a module no step reaches keeps the lock; every module
+    of the install when none is among them, as for one reached only as a requirement.
+    Empty for an install that is not editable.
+    """
+    if not _is_editable(dist):
         return ""
     name = dist.metadata["Name"]
+    files = {
+        m.__name__: code_key(_editable_source(editable[1]))
+        for m in modules
+        if (editable := _editable(m)) and editable[0] == name
+    }
+    if files:
+        return "+" + content_hash(files)
     tops = [t for t, owners in distribution_owners().items() if name in owners]
-    files: dict[str, str] = {}
     for top in tops or [name.replace("-", "_")]:
         spec = importlib.util.find_spec(top)
         if spec is None:
             continue
-        for location in spec.submodule_search_locations or [spec.origin]:
+        if spec.submodule_search_locations is None:
+            if spec.origin and spec.origin.endswith(".py"):
+                files[top] = code_key(_editable_source(pathlib.Path(spec.origin)))
+            continue
+        for location in spec.submodule_search_locations:
             for f in sorted(pathlib.Path(location).rglob("*.py")):
                 files[f"{top}/{f.relative_to(location).as_posix()}"] = code_key(
-                    f.read_bytes()
+                    _editable_source(f.resolve())
                 )
     return "+" + content_hash(files)

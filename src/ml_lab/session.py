@@ -17,6 +17,8 @@ import pathlib
 import numpy as np
 import polars as pl
 
+from ml_lab.identity import Refused
+
 Range = tuple[int, int]
 Rows = Range | tuple[Range, ...]
 Lag = np.timedelta64 | int | None
@@ -37,11 +39,16 @@ class Session:
         feature_columns: tuple[str, ...] = (),
         stores: dict[str, pathlib.Path] | None = None,
     ):
-        self.columns = columns
+        self.columns = {
+            n: a.astype("datetime64[ns]", copy=False) if a.dtype.kind == "M" else a
+            for n, a in columns.items()
+        }
         self.feature_columns = feature_columns
         self.stores = stores or {}
         self.cut: int | None = None
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
+        if self.ts is not None and np.isnat(self.ts).any():
+            raise ValueError("timestamps must not contain NaT")
         if self.ts is not None and np.any(self.ts[1:] < self.ts[:-1]):
             raise ValueError("timestamps must be sorted")
 
@@ -96,6 +103,14 @@ class Session:
             view.columns[name] = values
         return view
 
+    def train_view(self, targets: tuple[str, ...], train: tuple[Range, ...]) -> Session:
+        """The view a fit sees: target columns NaN outside ``train``."""
+        view = self.upto(self.rows)
+        keep = row_mask(self.rows, train)
+        for name in targets:
+            view.columns[name] = np.where(keep, view.columns[name], np.nan)
+        return view
+
     def boundary(self, row: int, lo: int = 0) -> int | None:
         """The first row of ``row``'s timestamp, or of the next one when that is
         ``lo``; None when no timestamp starts inside ``(lo, rows)``. Without a clock
@@ -124,14 +139,18 @@ class Session:
         return out
 
     def column(self, name: str, rows: Rows) -> np.ndarray:
-        end = max(hi for _, hi in segments(rows))
+        parts = segments(rows)
+        for lo, hi in parts:
+            if lo < 0 or hi < lo:
+                raise ValueError(f"segment ({lo}, {hi}) asked; one needs 0 <= lo <= hi")
+        end = max(hi for _, hi in parts)
         if end > self.rows:
             raise ValueError(
                 f"rows up to {end} asked, {self.rows} visible before the cutoff"
             )
         if name in self.columns:
             values = self.columns[name]
-            return np.concatenate([values[lo:hi] for lo, hi in segments(rows)])
+            return np.concatenate([values[lo:hi] for lo, hi in parts])
         if name not in self.stores:
             raise KeyError(
                 f"{name!r} is not a column: dataset columns {sorted(self.columns)}, "
@@ -139,10 +158,7 @@ class Session:
             )
         scan = pl.scan_parquet(self.stores[name]).select(name)
         return np.concatenate(
-            [
-                scan.slice(lo, hi - lo).collect()[name].to_numpy()
-                for lo, hi in segments(rows)
-            ]
+            [scan.slice(lo, hi - lo).collect()[name].to_numpy() for lo, hi in parts]
         )
 
     def _dtype(self, name: str) -> np.dtype:
@@ -153,10 +169,18 @@ class Session:
 
     def _clock(self) -> np.ndarray:
         if self.ts is None:
-            raise ValueError("session has no timestamps; use a row-based split")
+            raise Refused("session has no timestamps; use a row-based split")
         return self.ts
 
 
 def segments(rows: Rows) -> tuple[Range, ...]:
     """A range or a tuple of ranges as a tuple of ranges."""
     return (rows,) if isinstance(rows[0], (int, np.integer)) else rows
+
+
+def row_mask(size: int, rows: Rows) -> np.ndarray:
+    """A bool mask of ``size`` rows, True inside the segments."""
+    mask = np.zeros(size, bool)
+    for lo, hi in segments(rows):
+        mask[lo:hi] = True
+    return mask

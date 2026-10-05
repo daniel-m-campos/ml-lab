@@ -32,16 +32,18 @@ def record(
     params: Mapping[str, Any],
     filters: Sequence[Callable],
     targets: Sequence[str],
-    reveal: Mapping[str, datetime.timedelta | int] | None = None,
+    reveal: Mapping[str, datetime.timedelta | np.timedelta64 | int] | None = None,
 ) -> str:
     """Apply the filters, check the targets, store the rows; returns the dataset id.
 
-    ``reveal`` maps a target to when its label is known: a ``timedelta`` after its
-    row's timestamp, or an ``int`` of later dates with rows (``1`` is the next
-    trading day's open, ``2`` two trading dates later whatever the calendar gap). A
-    features step may read a revealed target, probed against that lag. Targets and
-    their lags are part of the dataset id.
+    ``reveal`` maps a target to when its label is known: a ``timedelta`` or
+    ``numpy.timedelta64`` after its row's timestamp, or an ``int`` of later dates with
+    rows (``1`` is the next trading day's open, ``2`` two trading dates later whatever
+    the calendar gap). A features step may read a revealed target, probed against
+    that lag. Targets and their lags are part of the dataset id.
     """
+    if session.rows == 0:
+        raise ValueError("a dataset needs at least one row")
     has_clock = session.ts is not None
     reveal = dict(reveal or {})
     if reveal and not has_clock:
@@ -79,20 +81,27 @@ def record(
     return dataset_id
 
 
-def _lag(reveal: datetime.timedelta | int) -> float | dict[str, int]:
+def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str, int]:
     """Seconds for a time lag, ``{"dates": n}`` for a count of later dates."""
-    if isinstance(reveal, datetime.timedelta):
-        return reveal.total_seconds()
-    return {"dates": int(reveal)}
+    time = isinstance(reveal, (datetime.timedelta, np.timedelta64))
+    if not time and not isinstance(reveal, (int, np.integer)):
+        raise TypeError(
+            f"a reveal lag is a timedelta or an int, not {type(reveal).__name__}"
+        )
+    lag = reveal / np.timedelta64(1, "s") if time else reveal
+    if lag < 0:
+        raise ValueError(f"a reveal lag cannot be negative: {reveal!r}")
+    return lag if time else {"dates": lag}
 
 
 def data_id(session: Session, targets: Mapping[str, Any] | None = None) -> str:
-    """The content id of a session: its column names, dtypes and bytes, and which
-    columns are targets with their reveal lags in seconds.
+    """The content id of a session: its column names, dtypes and values (a string
+    column by its strings), and which columns are targets with their reveal lags in
+    seconds.
     """
     ts = None if session.ts is None else identity.bytes_hash(session.ts.tobytes())
     columns = {
-        name: [str(a.dtype), identity.bytes_hash(np.ascontiguousarray(a).tobytes())]
+        name: [str(a.dtype), identity.array_hash(a)]
         for name, a in session.columns.items()
     }
     return identity.content_hash({"ts": ts, "columns": columns, "targets": targets})
