@@ -4,7 +4,6 @@ blobs/
 .venv/
 *.egg-info/
 data
-.ml-lab-minimal/
-.ml-lab/
+.ml-lab*/
 .scratch/
 .coverage
