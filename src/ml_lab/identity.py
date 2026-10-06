@@ -30,6 +30,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import sysconfig
 import time
 import types
 from collections.abc import Callable, Iterable
@@ -228,11 +229,18 @@ def refuse_unseen_code(funcs: Iterable[Callable], code_root: pathlib.Path):
     """Refuse a reached module whose code the memo cannot see: a ``.py`` file outside
     ``code_root`` that no installed distribution owns, whose edit would not refit, or a
     module under it that ran from cached bytecode other than its source.
+
+    Ownership is by the file, not the module's name: a file is the standard library's
+    when it lies under its paths outside a site directory, and a distribution's when
+    its record lists it, when it lies in the site directory of one that records no
+    files, or when it serves an editable install, whose lock hashes the file that ran.
+    A ``calendar.py`` on the path, or a fork shadowing an installed package, is
+    refused.
     """
     root = code_root.resolve()
     for module in imports(funcs, root):
         file = str(getattr(module, "__file__", None) or "")
-        top = module.__name__.partition(".")[0]
+        path = pathlib.Path(file).resolve()
         if _module_path(module, root) and _stale(module):
             raise Refused(
                 f"{file} ran from bytecode {module.__cached__} that is not its "
@@ -241,9 +249,10 @@ def refuse_unseen_code(funcs: Iterable[Callable], code_root: pathlib.Path):
             )
         if (
             file.endswith(".py")
-            and not pathlib.Path(file).resolve().is_relative_to(root)
-            and top not in sys.stdlib_module_names
-            and not _owned(top)
+            and not path.is_relative_to(root)
+            and not _stdlib(path)
+            and not _editable(module)
+            and not _owned(module.__name__.partition(".")[0], path)
         ):
             raise Refused(
                 f"{file} is reached from the declared functions but lies outside the "
@@ -378,15 +387,35 @@ def distribution_owners() -> dict[str, list[str]]:
     return importlib.metadata.packages_distributions()
 
 
+def _stdlib(path: pathlib.Path) -> bool:
+    unsited = {"site-packages", "dist-packages"}.isdisjoint(path.parts)
+    return unsited and any(path.is_relative_to(p) for p in _stdlib_paths())
+
+
 @functools.cache
-def _owned(top: str) -> bool:
-    for name in distribution_owners().get(top, (top,)):
-        try:
-            importlib.metadata.distribution(name)
-        except importlib.metadata.PackageNotFoundError:
-            continue
-        return True
-    return False
+def _stdlib_paths() -> tuple[pathlib.Path, ...]:
+    paths = sysconfig.get_paths()
+    return tuple(pathlib.Path(paths[k]).resolve() for k in ("stdlib", "platstdlib"))
+
+
+def _owned(top: str, path: pathlib.Path) -> bool:
+    names = distribution_owners().get(top, (top,))
+    return any(p in _installed(n) for n in names for p in (path, *path.parents))
+
+
+@functools.cache
+def _installed(name: str) -> frozenset[pathlib.Path]:
+    """The files a distribution's record lists, resolved, or its site directory when
+    it records none; empty when it is not installed.
+    """
+    try:
+        dist = importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        return frozenset()
+    base = pathlib.Path(dist.locate_file("")).resolve()
+    if dist.files is None:
+        return frozenset({base})
+    return frozenset(pathlib.Path(os.path.normpath(base / f)) for f in dist.files)
 
 
 def _stale(module: types.ModuleType) -> bool:

@@ -965,6 +965,55 @@ def test_a_reached_module_the_memo_cannot_see_is_refused(tmp_path, monkeypatch):
         identity.refuse_unseen_code((stale,), tmp_path)
 
 
+def test_a_module_named_like_the_standard_library_is_owned_by_its_file(
+    tmp_path, monkeypatch
+):
+    for directory in ("lib", "root"):
+        (tmp_path / directory).mkdir()
+    (tmp_path / "lib" / "calendar.py").write_text("def sign():\n    return 1.0\n")
+    spec = importlib.util.spec_from_file_location(
+        "calendar", tmp_path / "lib" / "calendar.py"
+    )
+    shadow = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shadow)
+    monkeypatch.setitem(sys.modules, "calendar", shadow)
+    monkeypatch.syspath_prepend(tmp_path / "root")
+    (tmp_path / "root" / "calendar_functions.py").write_text(
+        "import calendar\nimport json\n\ndef fit(dataset, train, config):\n"
+        "    return calendar.sign()\n"
+    )
+    fit = importlib.import_module("calendar_functions").fit
+    with pytest.raises(Refused, match=r"lib/calendar.py is reached .* outside"):
+        identity.refuse_unseen_code((fit,), tmp_path / "root")
+
+
+def test_a_fork_shadowing_an_installed_distribution_is_refused(tmp_path, monkeypatch):
+    site, fork, root = (tmp_path / d for d in ("site", "fork", "root"))
+    info = site / "fork_tool-1.0.dist-info"
+    for directory in (info, site / "fork_tool", fork / "fork_tool", root):
+        directory.mkdir(parents=True)
+    (info / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: fork_tool\nVersion: 1.0\n"
+    )
+    (info / "RECORD").write_text("fork_tool/__init__.py,,\n")
+    for directory in (site, fork):
+        (directory / "fork_tool" / "__init__.py").write_text("SCALE = 1.0\n")
+        monkeypatch.syspath_prepend(directory)
+    for name in ("forked", "installed"):
+        (root / f"{name}_functions.py").write_text(
+            "import fork_tool\n\ndef fit(dataset, train, config):\n"
+            "    return fork_tool.SCALE\n"
+        )
+    monkeypatch.syspath_prepend(root)
+    forked = importlib.import_module("forked_functions").fit
+    with pytest.raises(Refused, match=r"fork/fork_tool/__init__.py is reached"):
+        identity.refuse_unseen_code((forked,), root)
+    monkeypatch.delitem(sys.modules, "fork_tool")
+    monkeypatch.syspath_prepend(site)
+    installed = importlib.import_module("installed_functions").fit
+    identity.refuse_unseen_code((installed,), root)
+
+
 def test_a_numpy_bool_is_a_bool():
     assert identity.canonical(np.bool_(True)) is True
 
