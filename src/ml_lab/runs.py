@@ -893,10 +893,10 @@ def _score(
             scorer.series(pred, visible, fold.test, evaluation.scorer_params),
         )
         parts.append(series)
-        metrics = _finite(name, evaluation.metrics(series), f"fold {fold.label}")
+        metrics = _finite(name, evaluation.metrics(series.copy()), f"fold {fold.label}")
         per_fold.append({"fold": index, "label": fold.label, "metrics": metrics})
     whole = np.concatenate(parts)
-    aggregate = _finite(name, evaluation.metrics(whole), "the pooled folds")
+    aggregate = _finite(name, evaluation.metrics(whole.copy()), "the pooled folds")
     _refuse_lazy_imports(pipeline, context.root, dists, loaded, "scorer")
     columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
     names = scorer.columns or [str(i) for i in range(columns.shape[1])]

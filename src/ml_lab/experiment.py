@@ -45,7 +45,8 @@ class Scorer:
     series : Callable
         ``series(pred, dataset, rows, scorer_params) -> series``.
     metrics : Callable
-        ``metrics(series) -> dict``; applied per fold and over the concatenated folds.
+        ``metrics(series) -> dict``; applied to a copy per fold and over the
+        concatenated folds.
     directions : dict[str, str]
         Metric name to ``"max"`` or ``"min"``; comparisons read it.
     columns : tuple[str, ...], optional

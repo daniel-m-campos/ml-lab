@@ -2723,6 +2723,25 @@ def dotted_score(pred, dataset, rows, config):
 dotted_scorer = Scorer(dotted_score, _dotted_metrics, {"hit.rate": "max"})
 
 
+def _sorting_metrics(series):
+    series.sort(axis=0)
+    return synthetic.sim_metrics(series)
+
+
+def test_a_metrics_function_that_sorts_its_series_changes_nothing_stored(
+    ledger, evaluation
+):
+    sorting = dataclasses.replace(
+        evaluation,
+        scorer=dataclasses.replace(synthetic.sign_scorer, metrics=_sorting_metrics),
+    )
+    _run(ledger, evaluation, synthetic.ridge(1))
+    _run(ledger, sorting, synthetic.ridge(1))
+    rows = ledger.sql("SELECT series, pooled FROM score_aggregate WHERE metric = 'pnl'")
+    assert len(rows) == 2 and rows[0]["series"] == rows[1]["series"]
+    assert math.isclose(rows[0]["pooled"], rows[1]["pooled"])
+
+
 def test_a_dotted_metric_keeps_its_series_and_counts_wins(ledger, dataset):
     evaluation = Evaluation(
         dataset_id=dataset, split=DottedSplit(), scorer=dotted_scorer
