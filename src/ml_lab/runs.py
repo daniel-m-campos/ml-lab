@@ -342,7 +342,6 @@ class _Stage:
         self.models: dict[str, Any] = {}
         self.pending: dict[str, tuple[Any, str, dict[str, Any]]] = {}
         self.fits: dict[tuple[tuple[int, int], ...], str] = {}
-        self.checked: set[str] = set()
         self.widths: dict[str, tuple[int, ...]] = {}
 
     def fit(self, fold: Fold, index: int) -> str:
@@ -823,10 +822,10 @@ class _Stage:
             )
 
     def _check_imports(self, stage: str, loaded: set[str]):
-        """Check each stage once, on its first computation, before its write."""
-        if stage not in self.checked:
-            self.checked.add(stage)
-            _refuse_lazy_imports(self.pipeline, self.root, self.dists, loaded, stage)
+        """Check each computation of a stage before its write, so an import on a later
+        fold is named as one.
+        """
+        _refuse_lazy_imports(self.pipeline, self.root, self.dists, loaded, stage)
 
     def _model(self, fit_id: str) -> Any:
         if fit_id not in self.models:
@@ -861,7 +860,8 @@ def _score(
     scorer = evaluation.scorer
     scoring = _scoring(evaluation)
     scorer_shas = identity.import_shas(scoring, context.root)
-    lock = _lock_text(identity.imported_dists(scoring, context.root))
+    dists = identity.imported_dists(scoring, context.root)
+    lock = _lock_text(dists)
     score_id = identity.content_hash(
         {
             "evaluation": evaluation.id,
@@ -882,6 +882,7 @@ def _score(
         context.log(f"would score {name}")
         return
     per_fold, parts = [], []
+    loaded = set(sys.modules)
     for index, fold in enumerate(folds):
         pred = _load_predictions(ledger, predictions[str(index)])
         visible = context.dataset.upto(fold.test[1])
@@ -894,6 +895,7 @@ def _score(
         per_fold.append({"fold": index, "label": fold.label, "metrics": metrics})
     whole = np.concatenate(parts)
     aggregate = _finite(name, evaluation.metrics(whole), "the pooled folds")
+    _refuse_lazy_imports(pipeline, context.root, dists, loaded, "scorer")
     columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
     names = scorer.columns or [str(i) for i in range(columns.shape[1])]
     if len(names) != columns.shape[1]:
@@ -1338,11 +1340,16 @@ def _refuse_lazy_imports(
     stage: str,
 ):
     """A function that imports inside its body hides code from the memo; refuse and
-    name the repo modules and distributions it loaded.
+    name the repo modules, the modules outside the root no distribution owns, and the
+    distributions it loaded.
     """
     new = set(sys.modules) - loaded
+    root = root.resolve()
     grown = sorted(
-        n for n in new if identity._module_path(sys.modules.get(n), root.resolve())
+        n
+        for n in new
+        if identity._module_path(sys.modules.get(n), root)
+        or identity.unseen(sys.modules.get(n), root)
     )
     owners = identity.distribution_owners()
     tops = {name.partition(".")[0] for name in new}

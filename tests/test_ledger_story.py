@@ -2019,6 +2019,58 @@ def test_a_lazy_import_of_an_installed_submodule_is_not_a_repo_module(
     assert not report.failed and "pt" in _latest(ledger, evaluation)
 
 
+def test_a_lazy_import_from_outside_the_code_root_is_refused(
+    ledger, evaluation, scratch, tmp_path, monkeypatch
+):
+    (tmp_path / "outside_helper.py").write_text("K = 1\n")
+    monkeypatch.syspath_prepend(tmp_path)
+    code = scratch / "lazy_outside_functions.py"
+    code.write_text(LAZY_FUNCTIONS.format(helper="outside_helper"))
+    module = cli._load(str(code))
+    p = dataclasses.replace(synthetic.ridge(1), fit=module.lazy_fit, name="out")
+    report = _run(ledger, evaluation, p)
+    assert "fit imported lazily: modules ['outside_helper']" in report.failed["out"]
+
+
+def test_a_lazy_import_on_a_later_fold_is_named_as_one(ledger, evaluation, scratch):
+    (scratch / "late_helper.py").write_text("K = 1\n")
+    code = scratch / "late_functions.py"
+    code.write_text(
+        "from tests import synthetic\nSEEN = []\n\n"
+        "def late_fit(dataset, train, config):\n"
+        "    if SEEN:\n        import late_helper\n"
+        "    SEEN.append(train)\n"
+        "    return synthetic.ridge_fit(dataset, train, config)\n"
+    )
+    module = cli._load(str(code))
+    p = dataclasses.replace(synthetic.ridge(1), fit=module.late_fit, name="late")
+    failed = _run(ledger, evaluation, p).failed["late"]
+    assert "fit imported lazily: modules ['late_helper']" in failed
+    assert len(module.SEEN) == 2
+
+
+def test_a_scorer_that_imports_a_repo_module_lazily_is_refused(
+    ledger, evaluation, scratch
+):
+    (scratch / "scorer_helper.py").write_text("K = 1\n")
+    code = scratch / "lazy_scorer.py"
+    code.write_text(
+        "from tests import synthetic\n\n"
+        "def series(pred, dataset, rows, config):\n"
+        "    import scorer_helper\n"
+        "    return synthetic.sign_sim(pred, dataset, rows, config)\n"
+    )
+    scorer = dataclasses.replace(
+        synthetic.sign_scorer, series=cli._load(str(code)).series
+    )
+    evaluation = dataclasses.replace(evaluation, scorer=scorer)
+    report = _run(ledger, evaluation, synthetic.ridge(1))
+    assert (
+        "scorer imported lazily: modules ['scorer_helper']" in report.failed["ridge_1m"]
+    )
+    assert _count(ledger, "event_score") == 0
+
+
 def test_the_run_records_the_resolution_file_when_present(ledger, evaluation):
     _run(ledger, evaluation, synthetic.ridge(3))
     run = ledger.events(Event.RUN)[0]["payload"]

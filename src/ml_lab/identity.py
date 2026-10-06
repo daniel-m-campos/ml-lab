@@ -229,36 +229,43 @@ def refuse_unseen_code(funcs: Iterable[Callable], code_root: pathlib.Path):
     """Refuse a reached module whose code the memo cannot see: a ``.py`` file outside
     ``code_root`` that no installed distribution owns, whose edit would not refit, or a
     module under it that ran from cached bytecode other than its source.
-
-    Ownership is by the file, not the module's name: a file is the standard library's
-    when it lies under its paths outside a site directory, and a distribution's when
-    its record lists it, when it lies in the site directory of one that records no
-    files, or when it serves an editable install, whose lock hashes the file that ran.
-    A ``calendar.py`` on the path, or a fork shadowing an installed package, is
-    refused.
     """
     root = code_root.resolve()
     for module in imports(funcs, root):
         file = str(getattr(module, "__file__", None) or "")
-        path = pathlib.Path(file).resolve()
         if _module_path(module, root) and _stale(module):
             raise Refused(
                 f"{file} ran from bytecode {module.__cached__} that is not its "
                 "source, as after an edit inside one mtime second; delete the bytecode "
                 "and rerun"
             )
-        if (
-            file.endswith(".py")
-            and not path.is_relative_to(root)
-            and not _stdlib(path)
-            and not _editable(module)
-            and not _owned(module.__name__.partition(".")[0], path)
-        ):
+        if unseen(module, root):
             raise Refused(
                 f"{file} is reached from the declared functions but lies outside the "
                 f"code root {root} and no installed distribution owns it, so an edit "
                 f"to it would not refit; move it under {root} or install it"
             )
+
+
+def unseen(module: types.ModuleType | None, root: pathlib.Path) -> bool:
+    """Whether a module is a ``.py`` file outside ``root``, a resolved path, that is
+    neither the standard library's nor an installed distribution's.
+
+    Ownership is by the file, not the module's name: a file is the standard library's
+    when it lies under its paths outside a site directory, and a distribution's when
+    its record lists it, when it lies in the site directory of one that records no
+    files, or when it serves an editable install, whose lock hashes the file that ran.
+    A ``calendar.py`` on the path, or a fork shadowing an installed package, is unseen.
+    """
+    file = str(getattr(module, "__file__", None) or "")
+    path = pathlib.Path(file).resolve()
+    return (
+        file.endswith(".py")
+        and not path.is_relative_to(root)
+        and not _stdlib(path)
+        and not _editable(module)
+        and not _owned(module.__name__.partition(".")[0], path)
+    )
 
 
 @functools.cache
