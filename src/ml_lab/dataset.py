@@ -134,8 +134,7 @@ class Dataset:
     def boundary(self, row: int, lo: int = 0) -> int | None:
         """The first row of ``row``'s timestamp, or of the next one when that is
         ``lo``; None when no timestamp starts inside ``(lo, rows)``. Without a clock
-        every row is its own timestamp. A probe cuts here so it never splits a
-        cross-section.
+        every row is its own timestamp.
         """
         if self.ts is None:
             return row if lo < row < self.rows else None

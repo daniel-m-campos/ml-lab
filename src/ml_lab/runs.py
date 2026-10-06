@@ -514,7 +514,11 @@ class _Stage:
             if fit_id in self.pending:
                 self._record_fit(fit_id, fold, raw, lambda m: predict(m, visible, rows))
             self._probe(
-                "predict", raw, lambda v, part: predict(model, v, part), visible, rows
+                "predict",
+                raw,
+                lambda v, part: predict(self._model(fit_id, fresh=True), v, part),
+                visible,
+                rows,
             )
             self._check_imports("predict", loaded)
             if self.pipeline.postprocess is None and not train:
@@ -646,9 +650,8 @@ class _Stage:
     def _features(self, function: Callable, feature_id: str) -> Features:
         """One features function's columns, computed once per feature id over the
         dataset without its targets, probed and stored; a dry run computes and stores
-        nothing, so the names and id are known. The probe cuts at each sixth of the
-        rows and at the middle timestamp of the date each sixth falls in, so a cut
-        lands inside a date even when the sixths fall on date opens.
+        nothing, so the names and id are known. The probe cuts each of the five spans
+        between the sixths of the rows and the end by ``_cuts``.
         """
         if feature_id in self.features:
             return self.features[feature_id]
@@ -679,11 +682,12 @@ class _Stage:
                 feature_id, (tuple(columns), None, columns_id)
             )
         n = bare.rows
-        sixths = [j * n // 6 for j in range(1, 6)]
-        starts = bare.date_starts(0, n)
-        days = np.searchsorted(starts, sixths, "right") - 1
-        middles = {bare.middle(starts[d], starts[d + 1]) for d in days}
-        probe_rows = sorted(({bare.boundary(r) for r in sixths} | middles) - {0, None})
+        sixths = [j * n // 6 for j in range(1, 7)]
+        probe_rows = [
+            at
+            for span in zip(sixths, sixths[1:], strict=False)
+            for at in _cuts(bare, *span)
+        ]
         for row in probe_rows:
             head = self._feature_columns(
                 function, bare.upto(row).masked(revealed, row - 1)
@@ -777,20 +781,12 @@ class _Stage:
         visible: Dataset,
         rows: Range,
     ):
-        """Rerun the function on the rows before each cut, with its array inputs cut
-        there, and require the predictions before it to stand; every computed range,
-        before it is written. The cuts are the middle timestamp of the range's middle
-        date and one strictly inside its last date, when they exist, so a read of a
-        later row of the same date is caught however the range meets the calendar.
+        """Rerun the function on the rows before each cut of ``_cuts``, with its array
+        inputs cut there, and require the predictions before it to stand; every computed
+        range, before it is written.
         """
         lo, hi = rows
-        starts = visible.date_starts(lo, hi)
-        middle = len(starts) // 2 - 1
-        cuts = {
-            visible.middle(starts[d], starts[d + 1]): floor
-            for d, floor in ((middle, lo), (len(starts) - 2, starts[-2]))
-        }
-        for at in sorted(at for at, floor in cuts.items() if at > floor):
+        for at in _cuts(visible, lo, hi):
             again = np.asarray(compute(visible.upto(at), (lo, at)))
             _refuse_changed(
                 f"{self.name}: {stage}", "prediction", output, again, at=at, first=lo
@@ -827,12 +823,18 @@ class _Stage:
         """
         _refuse_lazy_imports(self.pipeline, self.root, self.dists, loaded, stage)
 
-    def _model(self, fit_id: str) -> Any:
-        if fit_id not in self.models:
+    def _model(self, fit_id: str, fresh: bool = False) -> Any:
+        """The fit's model loaded from its saved bytes once per run, or with ``fresh`` a
+        new load, so a probe meets no state an earlier predict left in the model.
+        """
+        if fresh or fit_id not in self.models:
             fit = self.ledger.latest(Event.FIT, fit_id)
-            self.models[fit_id] = self.pipeline.load(
+            model = self.pipeline.load(
                 self.ledger.get_blob(fit["payload"]["model"]["sha"])
             )
+            if fresh:
+                return model
+            self.models[fit_id] = model
         return self.models[fit_id]
 
     def _write(self, pred_id: str, pred: Any, payload: dict[str, Any]) -> np.ndarray:
@@ -928,6 +930,29 @@ def _score(
     report.scores_recorded += 1
     context.log(
         f"score {name} " + " ".join(f"{k}={v:.4g}" for k, v in aggregate.items())
+    )
+
+
+def _cuts(dataset: Dataset, lo: int, hi: int) -> list[int]:
+    """Where a probe cuts rows ``lo`` to ``hi``: at the timestamp after the open of a
+    date that opens in the range (after the range's first timestamp when none does), and
+    at any timestamp inside the range, each drawn by a hash of the range. The first cut
+    catches a date's opening rows reading later rows of their date, or on a daily
+    calendar the next date; the second varies where in its date a cut falls from range
+    to range, so no calendar lines every cut up with a date open or a fixed time of day.
+    A range of one timestamp has no cut, since its function sees nothing after it.
+    """
+    ts = np.arange(hi) if dataset.ts is None else dataset.ts[:hi]
+    stamps = lo + np.flatnonzero(np.r_[True, ts[lo + 1 : hi] != ts[lo : hi - 1]])
+    if len(stamps) < 2:
+        return []
+    starts = dataset.date_starts(max(lo - 1, 0), hi)
+    opens = starts[(starts >= lo) & (starts < stamps[-1])]
+    afters = stamps[np.searchsorted(stamps, opens if opens.size else [lo], "right")]
+    draw = int(identity.content_hash([lo, hi]), 16)
+    inner = stamps[1:]
+    return sorted(
+        {int(afters[draw % len(afters)]), int(inner[(draw >> 32) % len(inner)])}
     )
 
 

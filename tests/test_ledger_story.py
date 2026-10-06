@@ -11,6 +11,7 @@ import datetime
 import functools
 import importlib
 import io
+import itertools
 import json
 import math
 import os
@@ -1320,30 +1321,101 @@ def test_a_predict_that_reads_the_future_inside_its_range_is_refused(
     assert ledger.events(Event.SCORE) == []
 
 
-def day_mean_predict(model, dataset: Dataset, rows: Range) -> np.ndarray:
-    """Each row's f0 mean over its date in the range: reads later rows of the date."""
+def opening_mean(dataset: Dataset, rows: Range) -> np.ndarray:
+    """Each row's f0 mean over the first five rows of its date in ``rows``: those five
+    read later rows of their date.
+    """
     day = dataset.ts[rows[0] : rows[1]].astype("datetime64[D]")
     _, at = np.unique(day, return_inverse=True)
-    x = dataset.column("f0", rows)
-    return (np.bincount(at, x) / np.bincount(at))[at]
+    opening = np.arange(len(at)) - np.searchsorted(at, at) < 5
+    x = np.where(opening, dataset.column("f0", rows), 0.0)
+    return (np.bincount(at, x) / np.bincount(at, opening))[at]
+
+
+def opening_predict(model, dataset: Dataset, rows: Range) -> np.ndarray:
+    return synthetic.ridge_predict(model, dataset, rows) + opening_mean(dataset, rows)
+
+
+def opening_features(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": opening_mean(dataset, (0, dataset.rows))}
 
 
 def test_the_probes_cut_inside_a_date_however_the_calendar_falls(ledger):
     rows = synthetic.generate(
         start="2025-01-01", months=3, rows_per_day=20, seed=7, drift_at="2025-02-01"
     )
+    assert rows.rows // 6 % 20 == 0
     dataset = record(ledger, rows, source="s", params={}, targets=(synthetic.TARGET,))
     two_days = splits.CalendarWalkForward(
         "2025-02-01", unit="day", step=20, test_units=2, embargo_timestamps=1
     )
     evaluation = synthetic.evaluation(dataset, split=two_days)
-    sixths = synthetic.featured(synthetic.ridge(1), synthetic.day_mean, "sixths")
+    sixths = synthetic.featured(synthetic.ridge(1), opening_features, "sixths")
     window = dataclasses.replace(
-        synthetic.ridge(1), predict=day_mean_predict, name="window"
+        synthetic.ridge(1), predict=opening_predict, name="window"
     )
     report = _run(ledger, evaluation, sixths, window)
-    assert "features read past row 310" in report.failed["sixths"]
+    assert "features read past row 341" in report.failed["sixths"]
     assert "predict read past row" in report.failed["window"]
+
+
+def next_date_predict(model, dataset: Dataset, rows: Range) -> np.ndarray:
+    """Each row's ridge prediction plus the next date's mean f0 in ``rows``."""
+    _, at = np.unique(dataset.ts[rows[0] : rows[1]], return_inverse=True)
+    means = np.bincount(at, dataset.column("f0", rows)) / np.bincount(at)
+    return synthetic.ridge_predict(model, dataset, rows) + np.r_[means[1:], 0.0][at]
+
+
+def test_a_two_date_range_of_a_daily_cross_section_is_probed(ledger):
+    f0, f1, f2, y = np.random.default_rng(4).standard_normal((4, 600))
+    ts = np.datetime64("2025-01-01T16:00", "ns") + (np.arange(600) // 10).astype(
+        "timedelta64[D]"
+    )
+    columns = {"f0": f0, "f1": f1, "f2": f2, synthetic.TARGET: y}
+    daily = record(
+        ledger, Dataset(columns, ts), source="d", targets=(synthetic.TARGET,)
+    )
+    evaluation = synthetic.evaluation(daily, split=splits.WalkForward(300, 20, 20))
+    peek = dataclasses.replace(
+        synthetic.ridge(0), predict=next_date_predict, name="peek"
+    )
+    report = _run(ledger, evaluation, synthetic.ridge(0), peek)
+    assert set(report.failed) == {"peek"}
+    assert "predict read past row 310" in report.failed["peek"]
+
+
+def memo_fit(dataset: Dataset, train: Segments, config) -> dict:
+    return {"ridge": synthetic.ridge_fit(dataset, train, config), "seen": {}}
+
+
+def memo_save(model: dict) -> bytes:
+    return synthetic.ridge_save(model["ridge"])
+
+
+def memo_load(payload: bytes) -> dict:
+    return {"ridge": synthetic.ridge_load(payload), "seen": {}}
+
+
+def memo_peeking_predict(model: dict, dataset: Dataset, rows: Range) -> np.ndarray:
+    """``peeking_predict`` answered from a per-row memo the model keeps."""
+    fresh = synthetic.peeking_predict(model["ridge"], dataset, rows)
+    seen = model["seen"]
+    return np.array(
+        [seen.setdefault(r, v) for r, v in zip(range(*rows), fresh, strict=True)]
+    )
+
+
+def test_the_probe_predicts_with_a_model_no_earlier_call_touched(ledger, evaluation):
+    memo = dataclasses.replace(
+        synthetic.ridge(1),
+        fit=memo_fit,
+        save=memo_save,
+        load=memo_load,
+        predict=memo_peeking_predict,
+        name="memo",
+    )
+    report = _run(ledger, evaluation, memo)
+    assert "predict read past row" in report.failed["memo"]
 
 
 def test_rounding_passes_the_probe_and_a_leak_is_sized(ledger, evaluation):
@@ -1463,9 +1535,13 @@ def test_a_features_function_runs_once_for_two_pipelines_and_a_lookahead_is_refu
     b = synthetic.featured(synthetic.ridge(3))
     report = _run(ledger, evaluation, a, b)
     n = load(ledger, evaluation.dataset_id).rows
-    sixths = [j * n // 6 for j in range(1, 6)]
-    cuts = sorted({*sixths, *(row // 20 * 20 + 10 for row in sixths)})
-    assert not report.failed and synthetic.FEATURE_CALLS[1:] == cuts
+    sixths = [j * n // 6 for j in range(1, 7)]
+    cuts = synthetic.FEATURE_CALLS[1:]
+    assert not report.failed and cuts == sorted(cuts)
+    assert [
+        sum(lo < c < hi for c in cuts) for lo, hi in itertools.pairwise(sixths)
+    ] == [2] * 5
+    assert sum(c % 20 == 1 for c in cuts) >= 5
     rows = ledger.sql("SELECT columns, probe_rows FROM event_feature")
     assert len(rows) == 1 and json.loads(rows[0]["columns"]) == ["f0_lag"]
     assert json.loads(rows[0]["probe_rows"]) == cuts
@@ -2867,6 +2943,38 @@ def test_a_revealed_target_is_a_feature_no_earlier_than_its_lag(ledger):
     assert set(report.failed) == {"early"} and "f0_lag" in report.failed["early"]
     unrevealed = synthetic.evaluation(synthetic.panel(ledger), split=split)
     assert synthetic.TARGET in _run(ledger, unrevealed, known).failed["known"]
+
+
+def label_one_date_back_or_zero(dataset: Dataset) -> dict[str, np.ndarray]:
+    """The previous date's label at the same slot, zero on the first date."""
+    return {"f0_lag": np.r_[np.zeros(20), dataset.columns[synthetic.TARGET][:-20]]}
+
+
+def label_one_date_back_at_slot_three(dataset: Dataset) -> dict[str, np.ndarray]:
+    """The previous date's label at its fourth slot on every row of the date, zero on
+    the first date: known only from that slot on.
+    """
+    y = dataset.columns[synthetic.TARGET]
+    return {"f0_lag": np.r_[np.zeros(20), y[np.arange(20, len(y)) // 20 * 20 - 17]]}
+
+
+def test_a_revealed_target_read_before_its_lag_at_a_date_open_is_refused(ledger):
+    rows = synthetic.generate(
+        start="2025-01-01", months=3, rows_per_day=20, seed=7, drift_at="2025-02-01"
+    )
+    assert rows.rows // 6 % 20 == 0
+    one_day = {synthetic.TARGET: datetime.timedelta(days=1)}
+    dataset = record(
+        ledger, rows, source="s", params={}, targets=(synthetic.TARGET,), reveal=one_day
+    )
+    split = splits.WalkForward(900, 300, 300, embargo_rows=20)
+    evaluation = synthetic.evaluation(dataset, split=split)
+    base = synthetic.ridge(0)
+    known = synthetic.featured(base, label_one_date_back_or_zero, "known")
+    early = synthetic.featured(base, label_one_date_back_at_slot_three, "early")
+    report = _run(ledger, evaluation, known, early)
+    assert set(report.failed) == {"early"}
+    assert "read a revealed target before its reveal lag" in report.failed["early"]
 
 
 def test_the_features_probe_catches_a_day_lookahead(ledger, dataset):
