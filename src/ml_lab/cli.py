@@ -9,7 +9,8 @@ more modules, reads ``pipelines`` (a list of ``Pipeline``) from each and
 one) from exactly one of them, so a file an agent wrote holding only new pipelines
 runs beside the project's declarations; every pipeline is scored under every
 evaluation. The code root the memo hashes from is the git root of the module that
-declares the evaluations; the modules themselves join no id, so adding a pipeline to
+declares the evaluations, and both verbs refuse a module outside a git repository; the
+modules themselves join no id, so adding a pipeline to
 one refits nothing else. A module is a dotted name importable from the current
 directory or a ``.py`` path, imported without writing bytecode. The dataset defaults
 to the newest one recorded when the ledger holds one source. The ledger root comes
@@ -98,9 +99,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
-    ingest = getattr(_load(args.module), "dataset", None)
+    module = _load(args.module)
+    ingest = getattr(module, "dataset", None)
     if ingest is None:
         raise Refused(f"{args.module} declares no dataset(ledger, *args)")
+    _code_root(module)
     print(ingest(ledger, *args.args))
     return 0
 
@@ -112,7 +115,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     """
     pipelines, evaluations, modules = _experiments(args, ledger)
     home = next(m for m in modules if hasattr(m, "evaluations"))
-    root = identity.repo_root(pathlib.Path(home.__file__))
+    root = _code_root(home)
     failed: dict[str, str] = {}
     failed_ids: set[str] = set()
     planned: set[str] = set()
@@ -215,6 +218,19 @@ def _experiments(
             "name per evaluation and one evaluation per name"
         )
     return pipelines, evaluations, modules
+
+
+def _code_root(module: Any) -> pathlib.Path:
+    """The git root of the module's file, refused outside a repo: a run records the
+    commit its code came from.
+    """
+    root = identity.repo_root(pathlib.Path(module.__file__))
+    if not (root / ".git").exists():
+        raise Refused(
+            f"{module.__file__} is not inside a git repository; git init the project, "
+            "since provenance names a commit"
+        )
+    return root
 
 
 def _dataset(ledger: Ledger, selector: str | None) -> str:

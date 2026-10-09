@@ -651,8 +651,8 @@ def test_a_dry_run_counts_shared_work_once_as_the_run_does(
     assert dry == real and dry[1] == ("0", "0", "4")
 
 
-def test_lab_run_refuses_a_lambda_once(ledger, dataset, tmp_path, capsys):
-    probe = tmp_path / "probe.py"
+def test_lab_run_refuses_a_lambda_once(ledger, dataset, scratch, capsys):
+    probe = scratch / "probe.py"
     probe.write_text(
         "import dataclasses\nfrom tests import synthetic\n"
         "bare = lambda dataset: {}\n"
@@ -2366,8 +2366,8 @@ def test_fy_run_merges_pipelines_from_several_modules_and_defaults_the_dataset(
     assert "up to date" in capsys.readouterr().out
 
 
-def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
-    extra = tmp_path / "bare.py"
+def test_fy_run_refuses_bad_experiments(ledger, dataset, scratch, capsys):
+    extra = scratch / "bare.py"
     extra.write_text("from tests.synthetic import ridge\npipelines = [ridge(12)]\n")
     root = ["--root", str(ledger.root)]
     assert cli.main([*root, "run", str(extra)]) == 1
@@ -2376,7 +2376,7 @@ def test_fy_run_refuses_bad_experiments(ledger, dataset, tmp_path, capsys):
     assert "No module named 'nope'" in capsys.readouterr().err
     assert cli.main([*root, "run", "tests.synthetic", "--dataset", "zzz"]) == 1
     assert "0 matches" in capsys.readouterr().err
-    empty = tmp_path / "none.py"
+    empty = scratch / "none.py"
     empty.write_text("from tests.synthetic import evaluations\npipelines = []\n")
     assert cli.main([*root, "run", str(empty)]) == 1
     assert "no pipelines declared" in capsys.readouterr().err
@@ -2399,6 +2399,22 @@ def test_fy_run_refuses_a_shared_ledger_without_dataset_and_takes_a_source(
     assert "several sources" in capsys.readouterr().err
     assert cli.main([*root, "run", "tests.synthetic", "--dataset", "synthetic"]) == 0
     assert set(_latest(ledger, evaluation)) == {"ridge_1m", "ridge_3m", "ridge_6m"}
+
+
+def test_lab_run_and_ingest_refuse_a_project_outside_a_git_repo(
+    ledger, dataset, tmp_path, capsys
+):
+    outside = tmp_path / "outside.py"
+    outside.write_text("from tests.synthetic import dataset, evaluations, pipelines\n")
+    written = len(ledger.events())
+    for verb in ("run", "ingest"):
+        assert cli.main(["--root", str(ledger.root), verb, str(outside)]) == 1
+        err = capsys.readouterr().err
+        assert (
+            f"lab {verb}: {outside.resolve()} is not inside a git repository; git init"
+            in err
+        )
+    assert len(ledger.events()) == written
 
 
 def test_two_names_on_one_declaration_are_refused(ledger, evaluation):
