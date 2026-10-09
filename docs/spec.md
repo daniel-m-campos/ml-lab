@@ -18,6 +18,8 @@ The log never stores what a function is, only a dotted path and the blob shas gi
 
 One table. Rows are only inserted.
 
+The schema number, `PRAGMA user_version`, moves only when this table's layout or a payload shape changes, and a connect refuses a ledger at any other number. A view change keeps the number: every connect rebuilds the views, so it upgrades an existing ledger in place.
+
 ```sql
 CREATE TABLE event (
   seq     INTEGER PRIMARY KEY,   -- global order
