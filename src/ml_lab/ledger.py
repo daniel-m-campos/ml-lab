@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS event (
   payload TEXT NOT NULL CHECK (json_valid(payload)));
 CREATE INDEX IF NOT EXISTS event_stream ON event(stream, type, seq);
 CREATE INDEX IF NOT EXISTS event_key ON event(type, key, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS event_sealed_score
+  ON event(stream, json_extract(payload,'$.pipeline'))
+  WHERE type='score_recorded' AND json_extract(payload,'$.sealed');
 """
 
 VIEWS = """

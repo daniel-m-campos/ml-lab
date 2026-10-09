@@ -148,7 +148,7 @@ Growing it:
 - `Pipeline(features=f)` with `f(dataset) -> {name: array}`: columns computed once per dataset, shared by every pipeline declaring `f`, read by the names in `dataset.computed_columns`, probed on shorter prefixes cut as `predict`'s are, in each of the last five sixths of the rows.
 - `Pipeline(postprocess=clip, postprocess_config=Clip(at=3.0))`: a stateless stage after `predict`, called as `clip(pred, dataset, rows, config)`; its config enters the prediction id, not the fit's.
 - `Pipeline(members=(a, b))`: a blend whose `predict` takes the members' predictions as a fourth argument.
-- A test set: `record(..., sealed_from=4000)`, a row or a date, seals the tail. An evaluation whose folds validate past it is refused unless it is `Evaluation(sealed=True)`, so validate on `BlockedKFold(n_splits=4, train_size=0.8)` or a split that ends before it. A sealed evaluation scores each pipeline once; the pick is the pipeline list committed in `test.py` before the run:
+- A test set: `record(..., sealed_from=4000)`, a row (the first row of its timestamp) or a date, seals the tail. An evaluation whose folds validate or train past it is refused unless it is `Evaluation(sealed=True)`, so validate on `BlockedKFold(n_splits=4, train_size=0.8)` or a split that ends before it. A sealed evaluation validates the tail only and trains before it, or on tail rows an earlier fold of it validated, so `Holdout(train_size=0.8)` cuts at row 4000 of 5000. It scores each pipeline id once, checked before any fit: a rerun after a code or scorer edit is refused even when its predictions match, and the later of two concurrent runs fails. The pick is the pipeline list committed in `test.py` before the run:
 
 ```python
 from experiment import mse, pipelines as candidates

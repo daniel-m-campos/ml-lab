@@ -22,6 +22,7 @@ import os
 import pathlib
 import platform
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -105,8 +106,10 @@ def run(
     its train segments,
     whose folds train on labels not revealed when their test range starts (the message
     names the purge that clears them); a split whose folds moved under an unchanged
-    declaration; a sealed evaluation on a dataset without a sealed tail, and an
-    evaluation that is not sealed validating on one.
+    declaration; a sealed evaluation on a dataset without a sealed tail, an
+    evaluation that is not sealed validating on one, a sealed evaluation validating
+    before it, and a fold training on a tail row no earlier fold of a sealed
+    evaluation tested.
 
     Recorded as ``pipeline_failed``, after which the others continue and a rerun resumes
     from what was written: an error a function raises, noted with the fold's label; an
@@ -115,8 +118,9 @@ def run(
     prefix; a model reloaded from its saved bytes that predicts differently; a scored
     prediction or a metric that is not finite; a series that is a scalar or empty, or
     whose column count ``Scorer.columns`` disagrees with; an import inside a function
-    body; a module edited during the run; a second score of one pipeline under a sealed
-    evaluation.
+    body; a module edited during the run; a second score of one pipeline id under a
+    sealed evaluation, found by computing its ids before any fit or prediction, and
+    held at the write against a concurrent run.
     """
     if not pipelines:
         raise Refused("no pipelines declared")
@@ -223,6 +227,21 @@ def run(
             for declared in _nested(pipeline):
                 _declare_pipeline(ledger, declared)
         try:
+            if (
+                evaluation.sealed
+                and not dry
+                and _held_score(ledger, evaluation, pipeline)
+            ):
+                quiet = dataclasses.replace(
+                    context,
+                    report=RunReport(),
+                    log=lambda line: None,
+                    dry=True,
+                    planned=set(),
+                    features={},
+                    stages={},
+                )
+                _run_pipeline(quiet, schedule, pipeline)
             _run_pipeline(context, schedule, pipeline)
         except Exception as error:  # noqa: BLE001
             name = pipeline.name or pipeline.id
@@ -911,22 +930,27 @@ def _score(
         "format": formats.Format.ARROW_ARRAYS,
         "fold_rows": [len(part) for part in parts],
     }
-    ledger.append(
-        Event.SCORE,
-        evaluation.id,
-        score_id,
-        {
-            "pipeline": pipeline.id,
-            "run": context.start(),
-            "predictions": predictions,
-            "folds": per_fold,
-            "aggregate": aggregate,
-            "directions": evaluation.directions,
-            "series": stored,
-            "scorer_shas": scorer_shas,
-        },
-        id=score_id,
-    )
+    try:
+        ledger.append(
+            Event.SCORE,
+            evaluation.id,
+            score_id,
+            {
+                "pipeline": pipeline.id,
+                "run": context.start(),
+                "predictions": predictions,
+                "folds": per_fold,
+                "aggregate": aggregate,
+                "directions": evaluation.directions,
+                "series": stored,
+                "scorer_shas": scorer_shas,
+                "sealed": evaluation.sealed,
+            },
+            id=score_id,
+        )
+    except sqlite3.IntegrityError:
+        _refuse_rescoring(ledger, evaluation, pipeline)
+        raise
     report.scores_recorded += 1
     context.log(
         f"score {name} " + " ".join(f"{k}={v:.4g}" for k, v in aggregate.items())
@@ -1113,8 +1137,9 @@ def _refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fo
 
 
 def _refuse_sealed(evaluation: Evaluation, folds: list[Fold], sealed: int | None):
-    """A sealed tail is validated only by a sealed evaluation, and a sealed evaluation
-    needs one.
+    """A sealed tail is validated only by a sealed evaluation, a sealed evaluation
+    needs one and validates nothing else, and a fold trains on a tail row only after
+    an earlier fold of a sealed evaluation tested it.
     """
     name = evaluation.name or evaluation.id
     if evaluation.sealed and sealed is None:
@@ -1122,25 +1147,51 @@ def _refuse_sealed(evaluation: Evaluation, folds: list[Fold], sealed: int | None
             f"evaluation {name} is sealed and dataset {evaluation.dataset_id} has no "
             "sealed tail; record the dataset with sealed_from"
         )
-    late = [f for f in folds if sealed is not None and f.test[1] > sealed]
-    if late and not evaluation.sealed:
-        lo, hi = late[0].test
-        raise Refused(
-            f"evaluation {name} is not sealed and fold {late[0].label} validates rows "
-            f"{lo} to {hi}, past row {sealed} where the dataset's sealed tail starts; "
-            f"end its folds by row {sealed}, or declare Evaluation(sealed=True)"
-        )
+    if sealed is None:
+        return
+    tested = np.zeros(max(s[1] for f in folds for s in (*f.train, f.test)), bool)
+    for fold in folds:
+        lo, hi = fold.test
+        if evaluation.sealed and lo < sealed:
+            raise Refused(
+                f"evaluation {name} is sealed and fold {fold.label} validates rows "
+                f"{lo} to {hi}, before row {sealed} where the dataset's sealed tail "
+                f"starts; a sealed evaluation validates the tail only, so start its "
+                f"folds at row {sealed} or later"
+            )
+        if not evaluation.sealed and hi > sealed:
+            raise Refused(
+                f"evaluation {name} is not sealed and fold {fold.label} validates rows "
+                f"{lo} to {hi}, past row {sealed} where the dataset's sealed tail "
+                f"starts; end its folds by row {sealed}, or declare "
+                "Evaluation(sealed=True)"
+            )
+        for a, b in fold.train:
+            if b > sealed and not tested[max(a, sealed) : b].all():
+                raise Refused(
+                    f"evaluation {name} fold {fold.label} trains on rows {a} to {b}, "
+                    f"past row {sealed} where the dataset's sealed tail starts; end "
+                    f"its train segments by row {sealed}, or by the end of what an "
+                    "earlier fold of a sealed evaluation tested"
+                )
+        if evaluation.sealed:
+            tested[lo:hi] = True
 
 
-def _refuse_rescoring(ledger: Ledger, evaluation: Evaluation, pipeline: Pipeline):
+def _held_score(ledger: Ledger, evaluation: Evaluation, pipeline: Pipeline) -> str:
     held = ledger.sql(
         "SELECT id FROM event_score WHERE evaluation = ? AND pipeline = ?",
         (evaluation.id, pipeline.id),
     )
+    return held[0]["id"] if held else ""
+
+
+def _refuse_rescoring(ledger: Ledger, evaluation: Evaluation, pipeline: Pipeline):
+    held = _held_score(ledger, evaluation, pipeline)
     if held:
         raise Refused(
             f"sealed evaluation {evaluation.name or evaluation.id} already scored "
-            f"pipeline {pipeline.name or pipeline.id} as score {held[0]['id']}; a "
+            f"pipeline {pipeline.name or pipeline.id} as score {held}; a "
             "sealed evaluation scores each pipeline once"
         )
 
