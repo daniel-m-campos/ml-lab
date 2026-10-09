@@ -29,7 +29,7 @@ from typing import Any, Final
 from ml_lab import identity
 from ml_lab.identity import Refused
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 17
 ACTOR_ENV = "ML_LAB_ACTOR"
 BUSY_TIMEOUT_S = 5.0
 

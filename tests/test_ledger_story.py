@@ -3068,6 +3068,29 @@ def test_concurrent_connects_rebuild_the_views_whole(tmp_path):
     assert failures == []
 
 
+def test_a_ledger_from_before_a_view_change_reads_back_under_the_new_views(
+    ledger, evaluation
+):
+    _run(ledger, evaluation, synthetic.ridge(3))
+    ledger._db.executescript(
+        "DROP VIEW event_run; CREATE VIEW event_run AS SELECT "
+        "json_extract(payload,'$.git.commit') AS \"commit\" FROM event "
+        "WHERE type='run_started'; PRAGMA user_version=17;"
+    )
+    commit = ledger.events(Event.RUN)[0]["payload"]["git"]["commit"]
+    reopened = Ledger(ledger.root)
+    assert reopened.sql("SELECT code_commit FROM event_run") == [
+        {"code_commit": commit}
+    ]
+    assert reopened.sql("SELECT COUNT(*) AS n FROM board")[0]["n"] > 0
+
+
+def test_a_ledger_at_an_older_event_schema_is_refused(ledger):
+    ledger._db.execute("PRAGMA user_version=16")
+    with pytest.raises(Refused, match="ledger schema 16, this build is 17; the log"):
+        Ledger(ledger.root)
+
+
 def test_ulids_sort_and_do_not_collide():
     ids = [identity.ulid() for _ in range(1000)]
     assert (
