@@ -2119,6 +2119,12 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
     assert model.weights.shape == (3,)
 
 
+def test_the_run_commit_reads_back_without_quoting(ledger, evaluation):
+    _run(ledger, evaluation, synthetic.ridge(3))
+    commit = ledger.events(Event.RUN)[0]["payload"]["git"]["commit"]
+    assert ledger.sql("SELECT code_commit FROM event_run") == [{"code_commit": commit}]
+
+
 def test_a_changed_source_file_is_a_new_fit_and_score_but_the_same_pipeline(
     ledger, tmp_path
 ):
