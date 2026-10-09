@@ -3,7 +3,7 @@
 A local-first record of experimentation on frozen datasets with a fixed row order: time series when there is a clock, any tabular data once shuffled into one. Declare pipelines and evaluations in Python; `lab run` computes only what the log lacks, refuses the common leaks before recording anything, and writes every result as an event naming the code, data and environment behind it. Read with SQL.
 
 - **Memo.** A fit, prediction or score is reused when the log holds one for the same data, declaration, code and environment. A rerun of an unchanged tree writes nothing.
-- **Identity from content.** A dataset id is its rows, a pipeline id its declaration. Edit code and the affected fits rerun; edit a comment and nothing does. Names are labels.
+- **Identity from content.** A dataset id is its rows, a pipeline id its declaration. Edit code and the affected fits rerun; edit a comment and nothing does. A fit's code key covers its functions' modules and every module they import, so an edit anywhere in those files refits: keep pipeline families and shared constants in their own modules. Names are labels.
 - **Guards that refuse.** A function sees rows only up to where it may look; unknown labels are NaN; a fold that trains on labels revealed after its test range starts is refused; every prediction is recomputed on a shorter prefix and must agree.
 - **Provenance.** A score names its run, predictions and fits; a run records the commit, dirty diff, host and the tool's commit.
 
