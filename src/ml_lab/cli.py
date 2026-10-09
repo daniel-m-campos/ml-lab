@@ -114,11 +114,12 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     home = next(m for m in modules if hasattr(m, "evaluations"))
     root = identity.repo_root(pathlib.Path(home.__file__))
     failed: dict[str, str] = {}
+    failed_ids: set[str] = set()
     planned: set[str] = set()
     total = runs.RunReport()
     for evaluation in evaluations:
         print(f"evaluation {evaluation.id} {evaluation.name}".rstrip())
-        live = [p for p in pipelines if (p.name or p.id) not in failed]
+        live = [p for p in pipelines if p.id not in failed_ids]
         if pipelines and not live:
             print("skipped: every pipeline failed above")
             continue
@@ -134,6 +135,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
         for name, error in report.failed.items():
             print(f"lab run: {name} failed: {error}")
         failed |= report.failed
+        failed_ids |= report.failed_ids
         for field in dataclasses.fields(runs.RunReport)[1:7]:
             vars(total)[field.name] += getattr(report, field.name)
         if args.dry_run:

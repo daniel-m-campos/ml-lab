@@ -192,19 +192,24 @@ SELECT DISTINCT so.score, so.evaluation, so.pipeline, f.id AS fit,
   json_extract(f.payload,'$.duration_s') AS duration_s
 FROM stands_on so JOIN event f ON f.type='fit_computed' AND f.id = so.fit;
 
-CREATE VIEW board AS SELECT l.source, l.evaluation_name, l.name, l.actor, a.metric,
-  a.direction,
-  CASE WHEN a.direction IN ('max', 'min') AND a.fold_mean IS NOT NULL
-    THEN RANK() OVER (PARTITION BY l.evaluation, a.metric
-    ORDER BY CASE a.direction WHEN 'max' THEN -a.fold_mean ELSE a.fold_mean END
+CREATE VIEW board AS SELECT source, evaluation_name, name, actor, metric, direction,
+  CASE WHEN direction IN ('max', 'min') AND fold_mean IS NOT NULL
+    THEN RANK() OVER (PARTITION BY evaluation, metric
+    ORDER BY CASE direction WHEN 'max' THEN -fold_mean ELSE fold_mean END
       NULLS LAST) END AS rank,
+  fold_mean, fold_std, n_folds, pooled, evaluation, pipeline, score, run, seq
+FROM (SELECT l.source, l.evaluation_name, l.name, l.actor, a.metric,
+  FIRST_VALUE(a.direction) OVER (PARTITION BY l.evaluation, a.metric
+    ORDER BY l.seq DESC) AS direction,
   a.fold_mean, a.fold_std, a.n_folds, a.pooled,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
-FROM score_latest l JOIN score_aggregate a ON a.score = l.score;
+FROM score_latest l JOIN score_aggregate a ON a.score = l.score);
 
 CREATE VIEW pair_fold AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.actor, l.pipeline, l.name,
-    l.score, s.fold, s.label, s.metric, s.value, s.direction
+    l.score, s.fold, s.label, s.metric, s.value,
+    FIRST_VALUE(s.direction) OVER (PARTITION BY l.evaluation, s.metric
+      ORDER BY l.seq DESC) AS direction
   FROM score_latest l JOIN score_fold s ON s.score = l.score)
 SELECT a.evaluation, a.evaluation_name, a.source, a.actor, a.metric, a.fold, a.label,
   a.pipeline, a.name, b.pipeline AS reference, b.name AS reference_name,

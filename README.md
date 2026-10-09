@@ -190,7 +190,7 @@ SELECT name, reference_name, delta_mean, delta_std, t, wins, n_folds FROM head_t
 WHERE source = 'toy' AND reference_name = 'ridge' AND metric = 'mse';
 ```
 
-`board` holds the latest score per evaluation, pipeline and metric, whoever recorded it; `rank` is 1 for the best by `direction`. `head_to_head` pairs pipelines fold by fold: `delta_mean` is name minus reference, `t` is fold-paired, `wins` follow the direction, and `pair_fold` holds the per-fold rows. At one fold, `ml_lab.paired` pairs the stored series row by row:
+`board` holds the latest score per evaluation, pipeline and metric, whoever recorded it; `direction` is the newest score's for that evaluation and metric, and `rank` (1 is the best) and `head_to_head`'s `wins` follow it, so a scorer edit that flips a direction reorders every row. `head_to_head` pairs pipelines fold by fold: `delta_mean` is name minus reference, `t` is fold-paired, and `pair_fold` holds the per-fold rows. At one fold, `ml_lab.paired` pairs the stored series row by row:
 
 ```python
 from ml_lab import Ledger, paired
