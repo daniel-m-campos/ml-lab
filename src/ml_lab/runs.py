@@ -45,6 +45,7 @@ from ml_lab.splits import Fold
 class RunReport:
     """What a run wrote; ``run`` is empty when every fit, prediction and score already
     existed. In a dry run the computed counts are what a run would compute.
+    ``failed`` maps a failed pipeline's name to its error, ``failed_ids`` holds its id.
     """
 
     run: str = ""
@@ -55,6 +56,7 @@ class RunReport:
     predictions_reused: int = 0
     scores_reused: int = 0
     failed: dict[str, str] = dataclasses.field(default_factory=dict)
+    failed_ids: set[str] = dataclasses.field(default_factory=set)
 
 
 PARQUET = formats.Format.PARQUET
@@ -248,6 +250,7 @@ def run(
             report.failed[name] = "; ".join(
                 [f"{type(error).__name__}: {error}", *getattr(error, "__notes__", ())]
             )
+            report.failed_ids.add(pipeline.id)
             context.stages.clear()
             if dry:
                 continue

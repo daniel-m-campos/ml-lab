@@ -2511,6 +2511,29 @@ def test_lab_run_skips_a_failed_pipeline_in_later_evaluations(
     assert _count(ledger, "event_failure") == 1 and _count(ledger, "score_latest") == 2
 
 
+def test_lab_run_skips_only_the_failed_id_of_two_pipelines_sharing_a_name(
+    ledger, dataset, scratch, capsys
+):
+    sweep = scratch / "twins.py"
+    sweep.write_text(
+        "import dataclasses\nfrom tests import synthetic\n"
+        "pipelines = [dataclasses.replace(synthetic.ridge(3), "
+        "predict=synthetic.peeking_predict, name='ridge'), "
+        "synthetic.ridge(1).named('ridge')]\n"
+        "def evaluations(d):\n"
+        "    return [dataclasses.replace(synthetic.evaluation(d, cost=c), name=f'c{c}')"
+        " for c in (0.001, 0.01)]\n"
+    )
+    assert cli.main(["--root", str(ledger.root), "run", str(sweep)]) == 1
+    assert capsys.readouterr().out.count("lab run: ridge failed") == 1
+    rows = ledger.sql("SELECT evaluation_name, pipeline FROM score_latest")
+    assert sorted(r["evaluation_name"] for r in rows) == ["c0.001", "c0.01"]
+    assert {r["pipeline"] for r in rows} == {synthetic.ridge(1).id}
+
+
+# Read back ============================================================================
+
+
 def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path):
     folds = evaluation.split.folds(load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
@@ -2738,6 +2761,21 @@ def test_wins_follow_the_direction_recorded_with_each_score(
     (after,) = ledger.sql(query)
     assert 0 < before["wins"] < before["n_folds"]
     assert after["wins"] == before["n_folds"] - before["wins"]
+
+
+def test_board_and_wins_rank_a_metric_by_its_newest_direction(ledger, evaluation):
+    _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
+    flipped = {"pnl": "min", "turnover": "min"}
+    scorer = dataclasses.replace(evaluation.scorer, directions=flipped)
+    _run(ledger, dataclasses.replace(evaluation, scorer=scorer), synthetic.ridge(6))
+    rows = ledger.sql(
+        "SELECT direction, rank, fold_mean FROM board WHERE metric = 'pnl' "
+        "ORDER BY rank"
+    )
+    assert [(r["direction"], r["rank"]) for r in rows] == [("min", 1), ("min", 2)]
+    assert rows[0]["fold_mean"] < rows[1]["fold_mean"]
+    pairs = ledger.sql("SELECT wins, n_folds FROM head_to_head WHERE metric = 'pnl'")
+    assert sum(r["wins"] for r in pairs) == pairs[0]["n_folds"]
 
 
 def test_a_one_fold_holdout_pairs_the_stored_series_by_row(ledger, dataset):
