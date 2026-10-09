@@ -29,7 +29,7 @@ from typing import Any, Final
 from ml_lab import identity
 from ml_lab.identity import Refused
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 ACTOR_ENV = "ML_LAB_ACTOR"
 BUSY_TIMEOUT_S = 5.0
 
@@ -88,7 +88,7 @@ FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
       FROM event WHERE type='evaluation_declared') WHERE rn = 1;
 
 CREATE VIEW event_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
-  json_extract(payload,'$.git.commit') AS "commit",
+  json_extract(payload,'$.git.commit') AS code_commit,
   json_extract(payload,'$.git.dirty') AS dirty,
   json_extract(payload,'$.git.diff.sha') AS diff,
   json_extract(payload,'$.resolution.path') AS resolution,
