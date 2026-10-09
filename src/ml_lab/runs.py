@@ -89,8 +89,8 @@ def run(
     ``series`` up to the end of the fold's test range with unknown labels NaN. ``log``
     receives one line per feature set, fit, prediction set and score as it is written.
     A ``dry`` run computes every id, looks each one up and writes nothing; it logs what
-    it would compute and, for a fit, which repo files moved against the newest earlier
-    fit of the same pipeline and label. ``planned`` carries the ids a dry run would
+    it would compute and, for a fit, which inputs moved against the nearest earlier fit
+    of the same pipeline and label. ``planned`` carries the ids a dry run would
     write across several calls, so shared work counts once. ``code_root`` is where
     repo modules are hashed from, the git root of the first pipeline's fit when not
     given.
@@ -403,7 +403,9 @@ class _Stage:
         if self.dry:
             self.planned.add(fit_id)
             self.report.fits_computed += 1
-            self.log(f"would fit {self.name} {fold.label}: {self._why(fold.label)}")
+            self.log(
+                f"would fit {self.name} {fold.label}: {self._why(fold.label, train)}"
+            )
             return fit_id
         visible = self._visible(max(hi for _, hi in fold.train)).train_view(fold.train)
         inputs = (
@@ -418,7 +420,7 @@ class _Stage:
         )
         run_id = self.start()
         loaded = set(sys.modules)
-        why = self._why(fold.label)
+        why = self._why(fold.label, train)
         started = time.perf_counter()
         model = _noted(
             f"fit on fold {fold.label}; {FIT_HINT}",
@@ -777,23 +779,47 @@ class _Stage:
             columns[name] = values
         return columns
 
-    def _why(self, label: str) -> str:
-        """Why a dry run would fit: the repo files and lock that moved against the
-        newest earlier fit of this pipeline and label.
+    def _why(self, label: str, train: list[list[int]]) -> str:
+        """Why a fit is computed: the inputs that moved against the nearest earlier fit
+        of this pipeline, by id or name, and label, the one with the fewest moved, the
+        newest among ties.
         """
         rows = self.ledger.sql(
-            "SELECT code_keys, env_lock FROM event_fit WHERE pipeline = ? "
-            "AND label = ? ORDER BY seq DESC LIMIT 1",
-            (self.pipeline.id, label),
+            "SELECT f.dataset, f.train, f.code_keys, f.env_lock, (SELECT d.payload "
+            "FROM event d WHERE d.type = 'pipeline_declared' AND d.key = f.pipeline "
+            "LIMIT 1) AS declared FROM event_fit f JOIN event_pipeline p "
+            "ON p.id = f.pipeline WHERE (f.pipeline = ? OR p.name = ?) "
+            "AND f.label = ? ORDER BY f.seq DESC",
+            (self.pipeline.id, self.pipeline.name, label),
         )
         if not rows:
             return "no earlier fit of this pipeline and label"
-        before, now = json.loads(rows[0]["code_keys"]), self.stage_keys["fit"]
-        files = sorted(k for k in set(before) | set(now) if before.get(k) != now.get(k))
-        moved = [f"module changed: {', '.join(files)}"] if files else []
-        if json.loads(rows[0]["env_lock"])["sha"] != self.env_lock["sha"]:
-            moved.append("environment lock changed")
-        return "; ".join(moved) or "train segments, members or feature columns changed"
+        now = self.stage_keys["fit"]
+        params = identity.content_hash(self.pipeline.params)
+
+        def moved(row: dict[str, Any]) -> list[str]:
+            before = json.loads(row["code_keys"])
+            files = sorted(
+                k for k in set(before) | set(now) if before.get(k) != now.get(k)
+            )
+            declared = json.loads(row["declared"])["params"]
+            return [
+                reason
+                for reason, differs in (
+                    ("dataset changed", row["dataset"] != self.evaluation.dataset_id),
+                    ("params changed", identity.content_hash(declared) != params),
+                    (f"code changed: {', '.join(files)}", bool(files)),
+                    (
+                        "environment lock changed",
+                        json.loads(row["env_lock"])["sha"] != self.env_lock["sha"],
+                    ),
+                    ("train segments changed", json.loads(row["train"]) != train),
+                )
+                if differs
+            ]
+
+        nearest = min((moved(r) for r in rows), key=len)
+        return "; ".join(nearest) or "members or feature columns changed"
 
     def _probe(
         self,

@@ -1648,7 +1648,7 @@ def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
     assert len(would) == 2 * folds
     plain = [line for line in would if "ridge_3m " in line]
     assert len(plain) == folds and all(
-        line.endswith(": module changed: functions_d.py") for line in plain
+        line.endswith(": code changed: functions_d.py") for line in plain
     )
     lag = [line for line in would if "ridge_3m_lag" in line]
     assert len(lag) == folds and all(
@@ -1657,6 +1657,33 @@ def test_a_dry_run_names_the_moved_module_and_writes_nothing(ledger, tmp_path):
     assert ledger.sql("SELECT max(seq) AS m FROM event")[0]["m"] == seq
     assert set(ledger.blobs.iterdir()) == blobs
     assert _count(ledger, "event_feature") == 0
+
+
+def test_the_fit_reason_names_the_input_that_moved_against_the_nearest_fit(
+    ledger, tmp_path
+):
+    code = tmp_path / "functions_r.py"
+    code.write_text((REPO / "tests" / "synthetic.py").read_text())
+    module = cli._load(str(code))
+    dataset = module.dataset(ledger)
+    evaluation = module.evaluation(dataset, split=splits.Holdout(train_size=0.8))
+    runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    original = code.read_text()
+    code.write_text(original.replace("0.01 * np.sum", "0.02 * np.sum"))
+    runs.run(ledger, [module.ridge(3)], evaluation, code_root=tmp_path)
+    code.write_text(original)
+    shorter = module.evaluation(dataset, split=splits.Holdout(train_size=0.7))
+    lines = []
+    runs.run(
+        ledger,
+        [module.ridge(3)],
+        shorter,
+        code_root=tmp_path,
+        dry=True,
+        log=lines.append,
+    )
+    would = [line for line in lines if line.startswith("would fit")]
+    assert would == ["would fit ridge_3m holdout: train segments changed"]
 
 
 def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
