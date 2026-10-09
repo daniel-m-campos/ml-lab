@@ -179,7 +179,7 @@ class Evaluation:
     of ``dataclasses.replace(base, scorer_params=SimParams(t), name=f"cost{t}")``; the
     scorer's params class must live in a module the scorer imports. Only a ``sealed``
     evaluation validates on the dataset's sealed tail (``record(sealed_from=...)``),
-    and it scores each pipeline once.
+    it validates nothing before the tail, and it scores each pipeline once.
     """
 
     dataset_id: str

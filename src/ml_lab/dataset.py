@@ -276,11 +276,12 @@ def record(
     when its label is known: a ``timedelta`` or ``numpy.timedelta64`` after its row's
     timestamp, or an ``int`` of later dates with rows (``1`` is the next trading day's
     open, ``2`` two trading dates later whatever the calendar gap). A features function
-    may read a revealed target, probed against that lag. ``sealed_from``, a row or a
-    date (its first row at or after it), starts the sealed tail that only an
-    ``Evaluation(sealed=True)`` validates on, each pipeline once. Targets, their lags
-    and the sealed tail's first row are part of the dataset id. An empty ``targets``
-    is refused.
+    may read a revealed target, probed against that lag. ``sealed_from``, a row (the
+    first row of its timestamp) or a date (its first row at or after it), starts the
+    sealed tail that only an ``Evaluation(sealed=True)`` validates on, each pipeline
+    once, and that no fold trains on before such an evaluation tests it. Targets,
+    their lags and the sealed tail's first row are part of the dataset id. An empty
+    ``targets`` is refused.
     """
     if not targets:
         raise Refused(
@@ -336,12 +337,16 @@ def _numeric(dtype: np.dtype) -> bool:
 
 
 def _sealed(dataset: Dataset, sealed_from: int | str | None) -> int | None:
-    """The row the sealed tail starts at, inside the dataset."""
+    """The row the sealed tail starts at, inside the dataset, on the first row of its
+    timestamp.
+    """
     if sealed_from is None:
         return None
     row = sealed_from
     if not isinstance(row, (int, np.integer)):
         row = dataset.index_of(sealed_from)
+    elif dataset.ts is not None and 0 < row < dataset.rows:
+        row = dataset.index_of(dataset.ts[row])
     if not 0 < row < dataset.rows:
         raise Refused(
             f"sealed_from {sealed_from!r} is row {row} of {dataset.rows}; a sealed "

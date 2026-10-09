@@ -386,6 +386,18 @@ def test_a_sealed_tail_starts_at_a_row_kept_in_the_payload_and_the_id(ledger):
         )
 
 
+def test_a_sealed_row_inside_a_timestamp_starts_at_its_first_row(ledger):
+    clock = np.datetime64("2025-01-01", "ns") + np.repeat(np.arange(12), 4).astype(
+        "timedelta64[h]"
+    )
+    rows = Dataset(_dataset().columns, clock)
+    kwargs = {"source": "s", "params": {}, "targets": ("y",)}
+    by_row = record(ledger, rows, sealed_from=22, **kwargs)
+    by_date = record(ledger, rows, sealed_from="2025-01-01T05:00", **kwargs)
+    assert by_row == by_date
+    assert ledger.latest(Event.DATASET, by_row)["payload"]["sealed_from"] == 20
+
+
 def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
     rows = synthetic.generate(
         start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
@@ -1965,6 +1977,127 @@ def test_a_sealed_tail_is_validated_by_a_sealed_evaluation_once(ledger):
         _run(ledger, dataclasses.replace(unsealed, sealed=True), synthetic.ridge(1))
 
 
+@dataclasses.dataclass(frozen=True)
+class RowsSplit:
+    train: tuple[tuple[int, int], ...]
+    test: tuple[int, int]
+
+    def folds(self, dataset):
+        return [splits.Fold("rows", self.train, self.test)]
+
+
+def _sealed(ledger: Ledger, generate=synthetic.generate) -> tuple[str, int, int]:
+    rows = generate(
+        start="2025-01-01", months=4, rows_per_day=4, seed=7, drift_at="2025-03-01"
+    )
+    dataset = record(
+        ledger,
+        rows,
+        source="sealed",
+        params={},
+        targets=(synthetic.TARGET,),
+        sealed_from="2025-04-01",
+    )
+    return dataset, rows.index_of("2025-04-01"), rows.rows
+
+
+def test_an_evaluation_that_is_not_sealed_trains_before_the_tail(ledger):
+    dataset, tail, n = _sealed(ledger)
+    split = RowsSplit(((0, 200), (tail, n)), (200, tail))
+    with pytest.raises(
+        Refused, match=rf"fold rows trains on rows {tail} to {n}, past row {tail}"
+    ):
+        _run(ledger, synthetic.evaluation(dataset, split=split), synthetic.ridge(1))
+
+
+def test_a_sealed_evaluation_validates_the_tail_and_trains_before_it(ledger):
+    dataset, tail, n = _sealed(ledger)
+    refused = {
+        rf"sealed and fold rows validates rows 200 to {n}, before row {tail}": (
+            RowsSplit(((0, 200),), (200, n))
+        ),
+        rf"sealed and fold rows validates rows 200 to 300, before row {tail}": (
+            RowsSplit(((0, 200),), (200, 300))
+        ),
+        rf"fold rows trains on rows 0 to {tail + 40}, past row {tail}": (
+            RowsSplit(((0, tail + 40),), (tail + 40, n))
+        ),
+    }
+    for message, split in refused.items():
+        test = synthetic.evaluation(dataset, split=split)
+        with pytest.raises(Refused, match=message):
+            _run(ledger, dataclasses.replace(test, sealed=True), synthetic.ridge(1))
+    test = synthetic.evaluation(dataset, split=RowsSplit(((0, tail),), (tail, n)))
+    report = _run(ledger, dataclasses.replace(test, sealed=True), synthetic.ridge(1))
+    assert report.scores_recorded == 1
+
+
+def test_a_sealed_rerun_after_a_code_edit_is_refused_before_it_fits(ledger, tmp_path):
+    code = tmp_path / "functions_s.py"
+    code.write_text(
+        (REPO / "tests" / "synthetic.py").read_text().replace("SYN", "SYNS")
+    )
+    module = cli._load(str(code))
+    dataset, tail, n = _sealed(ledger, module.generate)
+    split = splits.Holdout(train_size=tail / n)
+    test = dataclasses.replace(module.evaluation(dataset, split=split), sealed=True)
+    runs.run(ledger, [module.ridge(1)], test, code_root=tmp_path)
+    before = _types(ledger)
+    code.write_text(code.read_text().replace("0.01 * np.sum", "0.02 * np.sum"))
+    module = cli._load(str(code))
+    report = runs.run(ledger, [module.ridge(1)], test, code_root=tmp_path)
+    assert "a sealed evaluation scores each pipeline once" in report.failed["ridge_1m"]
+    after = _types(ledger)
+    assert after.pop(Event.FAILED) == 1 and after.pop(Event.RUN) == 2
+    assert after == {k: v for k, v in before.items() if k != Event.RUN}
+
+
+def test_two_runs_racing_on_a_sealed_evaluation_score_a_pipeline_once(
+    ledger, scratch, tmp_path
+):
+    dataset, tail, n = _sealed(ledger)
+    gate = tmp_path / "gate"
+    gate.mkdir()
+    race = scratch / "race.py"
+    race.write_text(
+        "import os, pathlib, time\n"
+        "from ml_lab.experiment import Evaluation, Scorer\n"
+        "from ml_lab.splits import Holdout\n"
+        "from tests import synthetic\n"
+        "pipelines = [synthetic.ridge(1)]\n"
+        "def gated(pred, dataset, rows, config):\n"
+        "    gate = pathlib.Path(os.environ['RACE_GATE'])\n"
+        "    (gate / os.environ['ML_LAB_ACTOR']).touch()\n"
+        "    deadline = time.monotonic() + 60\n"
+        "    while len(list(gate.iterdir())) < 2 and time.monotonic() < deadline:\n"
+        "        time.sleep(0.01)\n"
+        "    return synthetic.sign_sim(pred, dataset, rows, config)\n"
+        "scorer = Scorer(gated, synthetic.sim_metrics, "
+        "{'pnl': os.environ['ML_LAB_ACTOR']})\n"
+        "def evaluations(d):\n"
+        f"    split = Holdout(train_size={tail / n!r})\n"
+        "    return [Evaluation(d, split, scorer, synthetic.SimConfig(0.001), "
+        "sealed=True, name='test')]\n"
+    )
+    paths = [str(REPO / "src"), str(REPO), os.environ.get("PYTHONPATH", "")]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(paths), "RACE_GATE": str(gate)}
+    command = [sys.executable, "-m", "ml_lab.cli", "--root", str(ledger.root), "run"]
+    racers = [
+        subprocess.Popen(
+            [*command, str(race), "--dataset", dataset],
+            env={**env, "ML_LAB_ACTOR": direction},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        for direction in ("max", "min")
+    ]
+    outs = [r.communicate(timeout=300)[0].decode() for r in racers]
+    assert sorted(r.returncode for r in racers) == [0, 1], outs
+    assert _count(ledger, "event_score") == 1
+    (failure,) = ledger.sql("SELECT error FROM event_failure")
+    assert "a sealed evaluation scores each pipeline once" in failure["error"]
+
+
 def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
     ledger, evaluation
 ):
@@ -2376,9 +2509,6 @@ def test_lab_run_skips_a_failed_pipeline_in_later_evaluations(
     assert "failed, skipped in later evaluations: peek" in out
     assert re.search(r"total over 2 evaluations: computed fits \d+", out)
     assert _count(ledger, "event_failure") == 1 and _count(ledger, "score_latest") == 2
-
-
-# Read back ============================================================================
 
 
 def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path):
