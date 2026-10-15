@@ -177,7 +177,7 @@ export ML_LAB_ROOT=$PWD/ledger ML_LAB_ACTOR=daniel   # ML_LAB_ACTOR is required:
 lab ingest project/dataset.py 20                     # calls dataset(ledger, "20")
 lab run project/experiment.py                        # the newest dataset when the ledger holds one source; otherwise --dataset <source or id prefix>
 lab run project/experiment.py ideas/agent7.py        # pipelines from both files, the evaluations from one
-lab run project/experiment.py --dry-run              # every id computed, nothing written: what would fit and why; a new feature set is computed and probed
+lab run project/experiment.py --dry-run              # every id computed, nothing written: what would fit and why; a new feature set is computed and probed, and kept for the run that follows
 ```
 
 A pipeline that raises is recorded as a failure and the rest continue; `lab run` exits 1 naming it. Views over the log, in `ml_lab.sqlite`, for `sqlite3` or DuckDB:
