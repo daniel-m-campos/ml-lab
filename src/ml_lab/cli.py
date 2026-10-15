@@ -74,7 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--dry-run",
         action="store_true",
-        help="compute nothing, write nothing; say what a run would compute and why",
+        help="write nothing; say what a run would compute and why, computing and "
+        "probing a new feature set on its first span so its ids are real",
     )
     p.set_defaults(handler=_run)
 
@@ -139,32 +140,30 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
             print(f"lab run: {name} failed: {error}")
         failed |= report.failed
         failed_ids |= report.failed_ids
-        for field in dataclasses.fields(runs.RunReport)[1:7]:
-            vars(total)[field.name] += getattr(report, field.name)
+        for field in dataclasses.fields(runs.RunReport):
+            if field.type == "int":
+                vars(total)[field.name] += getattr(report, field.name)
         if args.dry_run:
-            print(
-                f"dry run: would compute fits {report.fits_computed}, predictions "
-                f"{report.predictions_computed}, scores {report.scores_recorded}; "
-                f"reuse {report.fits_reused}, {report.predictions_reused}, "
-                f"{report.scores_reused}"
-            )
+            print(f"dry run: would compute {_counts(report)}; reuse {_reuse(report)}")
         elif not report.run:
             print(
-                f"up to date: {report.scores_reused} scores; {report.fits_reused} fits "
-                f"and {report.predictions_reused} predictions reused, nothing written"
+                f"up to date: {report.scores_reused} scores; {report.features_reused} "
+                f"feature sets, {report.fits_reused} fits and "
+                f"{report.predictions_reused} predictions reused, nothing written"
             )
         else:
-            print(
-                f"run {report.run}: fits {report.fits_computed}, predictions "
-                f"{report.predictions_computed}, scores {report.scores_recorded}"
-            )
+            print(f"run {report.run}: {_counts(report)}")
     if len(evaluations) > 1:
         verb = "would compute" if args.dry_run else "computed"
         print(
-            f"total over {len(evaluations)} evaluations: {verb} fits "
-            f"{total.fits_computed}, predictions {total.predictions_computed}, scores "
-            f"{total.scores_recorded}; reuse {total.fits_reused}, "
-            f"{total.predictions_reused}, {total.scores_reused}"
+            f"total over {len(evaluations)} evaluations: {verb} {_counts(total)}; "
+            f"reuse {_reuse(total)}"
+        )
+    if args.dry_run:
+        print(
+            "dry run: a new feature set was computed and probed on its first span "
+            "only; the full probes and those of predict and postprocess run only in "
+            "the real run"
         )
     if failed:
         print(f"failed, skipped in later evaluations: {', '.join(failed)}")
@@ -172,6 +171,29 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 # Private Functions ====================================================================
+
+
+def _counts(report: runs.RunReport) -> str:
+    """The computed counts of a report as one phrase, features first when any."""
+    features = f"features {report.features_computed}, " if _featured(report) else ""
+    return (
+        f"{features}fits {report.fits_computed}, predictions "
+        f"{report.predictions_computed}, scores {report.scores_recorded}"
+    )
+
+
+def _featured(report: runs.RunReport) -> bool:
+    """Whether the report touched a feature set, so its counts name features."""
+    return bool(report.features_computed or report.features_reused)
+
+
+def _reuse(report: runs.RunReport) -> str:
+    """The reused counts of a report in the order of ``_counts``."""
+    features = f"{report.features_reused}, " if _featured(report) else ""
+    return (
+        f"{features}{report.fits_reused}, {report.predictions_reused}, "
+        f"{report.scores_reused}"
+    )
 
 
 def _experiments(

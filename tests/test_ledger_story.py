@@ -3244,3 +3244,108 @@ def test_the_features_probe_catches_a_day_lookahead(ledger, dataset):
     error = report.failed["day_mean"]
     assert "features read past row" in error and ": f0_lag at row" in error
     assert "of the largest |f0_lag|" in error
+
+
+def test_a_dry_run_computes_probes_and_explains_a_new_feature_set(
+    ledger, dataset, evaluation
+):
+    lines: list[str] = []
+    lag = synthetic.featured(synthetic.ridge(1))
+    report = _run(ledger, evaluation, lag, dry=True, log=lines.append)
+    assert (report.features_computed, report.features_reused) == (1, 0)
+    assert report.run == "" and not report.failed
+    would = [line for line in lines if line.startswith("would compute features")]
+    assert len(would) == 1 and re.fullmatch(
+        r"would compute features ridge_1m_lag tests\.synthetic:lagged_f0 1 columns "
+        r"\d+\.\ds: no earlier features of this function; probed at rows "
+        r"\[\d+(, \d+)?\] only",
+        would[0],
+    )
+    started = "computing features ridge_1m_lag tests.synthetic:lagged_f0"
+    assert lines.index(started) < lines.index(would[0])
+    assert _count(ledger, "event_feature") == 0 and not ledger.events(Event.RUN)
+    leaky = synthetic.featured(synthetic.ridge(1), synthetic.next_f0, "leaky")
+    report = _run(ledger, evaluation, leaky, dry=True, log=lines.append)
+    assert "features read past row" in report.failed["leaky"]
+    assert not ledger.events(Event.FAILED) and _count(ledger, "event_feature") == 0
+    report = _run(ledger, evaluation, lag, log=lines.append)
+    assert (report.features_computed, report.features_reused) == (1, 0)
+    assert _count(ledger, "event_feature") == 1
+    lines.clear()
+    report = _run(ledger, evaluation, lag, dry=True, log=lines.append)
+    assert (report.features_computed, report.features_reused) == (0, 1)
+    assert not any(
+        line.startswith(("would compute f", "computing f")) for line in lines
+    )
+
+
+def test_a_fit_and_a_feature_set_log_when_they_start(ledger, evaluation):
+    lines: list[str] = []
+    _run(ledger, evaluation, synthetic.featured(synthetic.ridge(1)), log=lines.append)
+    assert lines[0] == "computing features ridge_1m_lag tests.synthetic:lagged_f0"
+    assert lines[1].startswith("features ridge_1m_lag 1 columns ")
+    starts = [
+        i for i, line in enumerate(lines) if line.startswith("fitting ridge_1m_lag ")
+    ]
+    ends = [i for i, line in enumerate(lines) if line.startswith("fit ridge_1m_lag ")]
+    assert starts and len(starts) == len(ends)
+    assert all(s < e for s, e in zip(starts, ends, strict=True))
+
+
+def test_the_features_reason_names_the_moved_module(ledger, tmp_path):
+    code = tmp_path / "functions_feat.py"
+    code.write_text((REPO / "tests" / "synthetic.py").read_text())
+    module = cli._load(str(code))
+    evaluation = module.evaluation(module.dataset(ledger))
+    lag = module.featured(module.ridge(3))
+    runs.run(ledger, [lag], evaluation, code_root=tmp_path)
+    code.write_text(code.read_text().replace("[[np.nan], dataset", "[[0.0], dataset"))
+    lines: list[str] = []
+    report = runs.run(
+        ledger, [lag], evaluation, code_root=tmp_path, dry=True, log=lines.append
+    )
+    assert report.features_computed == 1 and not report.failed
+    would = [line for line in lines if line.startswith("would compute features")]
+    assert len(would) == 1 and re.search(
+        r": code changed: functions_feat\.py; probed at rows \[\d+(, \d+)?\] only$",
+        would[0],
+    )
+
+
+def test_lab_run_counts_feature_sets_in_its_summary(ledger, dataset, scratch, capsys):
+    module = scratch / "featured.py"
+    module.write_text(
+        "from tests import synthetic\n"
+        "pipelines = [synthetic.featured(synthetic.ridge(1))]\n"
+        "def evaluations(d):\n    return [synthetic.evaluation(d)]\n"
+    )
+    args = ["--root", str(ledger.root), "run", str(module)]
+    assert cli.main([*args, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert re.search(
+        r"^dry run: would compute features 1, fits \d+, predictions \d+, scores 1; "
+        r"reuse 0, 0, 0, 0$",
+        out,
+        re.M,
+    )
+    assert "probed on its first span only" in out
+    assert cli.main(args) == 0
+    out = capsys.readouterr().out
+    assert re.search(
+        r"^run \w+: features 1, fits \d+, predictions \d+, scores 1$", out, re.M
+    )
+    assert cli.main([*args, "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert re.search(
+        r"^dry run: would compute features 0, fits 0, predictions 0, scores 0; "
+        r"reuse 1, \d+, \d+, 1$",
+        out,
+        re.M,
+    )
+    assert cli.main(args) == 0
+    assert re.search(
+        r"^up to date: 1 scores; 1 feature sets, \d+ fits and \d+ predictions reused, "
+        r"nothing written$",
+        capsys.readouterr().out,
+        re.M,
+    )

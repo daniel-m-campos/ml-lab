@@ -43,15 +43,18 @@ from ml_lab.splits import Fold
 
 @dataclasses.dataclass
 class RunReport:
-    """What a run wrote; ``run`` is empty when every fit, prediction and score already
-    existed. In a dry run the computed counts are what a run would compute.
-    ``failed`` maps a failed pipeline's name to its error, ``failed_ids`` holds its id.
+    """What a run wrote; ``run`` is empty when every feature set, fit, prediction and
+    score already existed. In a dry run the computed counts are what a run would
+    compute. ``failed`` maps a failed pipeline's name to its error, ``failed_ids``
+    holds its id.
     """
 
     run: str = ""
+    features_computed: int = 0
     fits_computed: int = 0
     predictions_computed: int = 0
     scores_recorded: int = 0
+    features_reused: int = 0
     fits_reused: int = 0
     predictions_reused: int = 0
     scores_reused: int = 0
@@ -87,11 +90,17 @@ def run(
     dataset: ``fit`` up to the end of its last train segment with every column NaN
     outside the train segments, ``predict``, ``postprocess`` and the scorer's
     ``series`` up to the end of the fold's test range with unknown labels NaN. ``log``
-    receives one line per feature set, fit, prediction set and score as it is written.
-    A ``dry`` run computes every id, looks each one up and writes nothing; it logs what
-    it would compute and, for a fit, which inputs moved against the nearest earlier fit
-    of the same pipeline and label. ``planned`` carries the ids a dry run would
-    write across several calls, so shared work counts once. ``code_root`` is where
+    receives one line when a feature set or a fit starts and one per feature set, fit,
+    prediction set and score as it is written, so a log shows what is running and since
+    when. A ``dry`` run computes every id, looks each one up and writes nothing; it
+    logs what it would compute and, for a feature set or a fit, which inputs moved
+    against the nearest earlier one of the same function or pipeline. A feature set no
+    run has computed is computed and probed in a dry run too, since its ids depend on
+    its columns and its probe needs no fit, so a leak it reads is refused before any
+    fit is paid for, on the first probe span only to keep a dry run cheap; the full
+    probes and those of ``predict`` and ``postprocess`` run only in the real run.
+    ``planned`` carries the ids a dry run would write across several calls, so shared
+    work counts once. ``code_root`` is where
     repo modules are hashed from, the git root of the first pipeline's fit when not
     given.
 
@@ -299,6 +308,12 @@ Features = tuple[tuple[str, ...], pathlib.Path | None, str]
 """One computed feature set: its column names, the Parquet file they are read from
 (None in a dry run, which stores nothing) and the id of the ordered columns' bytes."""
 
+_PLANNED_FEATURES: dict[str, Features] = {}
+"""Feature sets a dry run computed in this process, by feature id, so a later dry run
+of the same features under another evaluation reuses the names and id instead of
+computing them again. The id covers the dataset, the function, its code and its
+environment, so an entry is right for as long as the process runs."""
+
 
 def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
     stage = context.stage(pipeline)
@@ -421,6 +436,7 @@ class _Stage:
         run_id = self.start()
         loaded = set(sys.modules)
         why = self._why(fold.label, train)
+        self.log(f"fitting {self.name} {fold.label}")
         started = time.perf_counter()
         model = _noted(
             f"fit on fold {fold.label}; {FIT_HINT}",
@@ -673,9 +689,11 @@ class _Stage:
 
     def _features(self, function: Callable, feature_id: str) -> Features:
         """One features function's columns, computed once per feature id over the
-        dataset without its targets, probed and stored; a dry run computes and stores
-        nothing, so the names and id are known. The probe cuts each of the five spans
-        between the sixths of the rows and the end by ``_cuts``.
+        dataset without its targets, probed and stored. A dry run computes and probes
+        them too, so the names and id are known and a leak is refused before any fit,
+        but stores nothing; what it computed is kept for the process, so a dry run of
+        the same features under another evaluation reuses it. The probe cuts each of
+        the five spans between the sixths of the rows and the end by ``_cuts``.
         """
         if feature_id in self.features:
             return self.features[feature_id]
@@ -684,7 +702,10 @@ class _Stage:
             payload = event["payload"]
             path = self.ledger.blobs / payload["blob"]["sha"]
             found = (tuple(payload["columns"]), path, payload["columns_id"])
+            self.report.features_reused += 1
             return self.features.setdefault(feature_id, found)
+        if self.dry and feature_id in self.planned and feature_id in _PLANNED_FEATURES:
+            return self.features.setdefault(feature_id, _PLANNED_FEATURES[feature_id])
         revealed = {k: v for k, v in self.targets.items() if v is not None}
         bare = Dataset(
             {
@@ -694,6 +715,8 @@ class _Stage:
             },
             self.dataset.ts,
         )
+        ref = identity.function_ref(function)
+        self.log(f"computing features {self.name} {ref}")
         loaded = set(sys.modules)
         started = time.perf_counter()
         columns = self._feature_columns(function, bare)
@@ -701,15 +724,65 @@ class _Stage:
         self._check_imports("features", loaded)
         self._unchanged("features")
         columns_id = _columns_id(columns)
+        probe_rows = self._probe_features(
+            function, bare, revealed, columns, spans=1 if self.dry else 5
+        )
         if self.dry:
-            return self.features.setdefault(
-                feature_id, (tuple(columns), None, columns_id)
+            self.log(
+                f"would compute features {self.name} {ref} {len(columns)} columns "
+                f"{duration:.1f}s: {self._features_why(function)}; probed at rows "
+                f"{probe_rows} only"
             )
+            self.report.features_computed += 1
+            self.planned.add(feature_id)
+            found = (tuple(columns), None, columns_id)
+            _PLANNED_FEATURES[feature_id] = found
+            return self.features.setdefault(feature_id, found)
+        run_id = self.start()
+        sha = self.ledger.put_blob(rows_save(Dataset(columns, None)))
+        self.ledger.append(
+            Event.FEATURES,
+            self.evaluation.dataset_id,
+            feature_id,
+            {
+                "pipeline": self.pipeline.id,
+                "run": run_id,
+                "features": identity.canonical(function),
+                "import_shas": identity.import_shas((function,), self.root),
+                "code_keys": identity.code_keys((function,), self.root),
+                "columns": list(columns),
+                "columns_id": columns_id,
+                "probe_rows": probe_rows,
+                "duration_s": duration,
+                "blob": {"sha": sha, "format": PARQUET},
+            },
+            id=feature_id,
+        )
+        self.report.features_computed += 1
+        self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
+        return self.features.setdefault(
+            feature_id, (tuple(columns), self.ledger.blobs / sha, columns_id)
+        )
+
+    def _probe_features(
+        self,
+        function: Callable,
+        bare: Dataset,
+        revealed: dict[str, Lag],
+        columns: dict[str, np.ndarray],
+        spans: int = 5,
+    ) -> list[int]:
+        """Recompute the columns on the rows before each probe cut of the first
+        ``spans`` of the five spans between the sixths of the rows and the end, with
+        the labels not yet known at the cut hidden, and refuse a column that moves; the
+        cuts. A dry run probes the first span only, the cheapest, which still catches
+        a column that reads past its row or its date's later rows.
+        """
         n = bare.rows
         sixths = [j * n // 6 for j in range(1, 7)]
         probe_rows = [
             at
-            for span in zip(sixths, sixths[1:], strict=False)
+            for span in list(zip(sixths, sixths[1:], strict=False))[:spans]
             for at in _cuts(bare, *span)
         ]
         for row in probe_rows:
@@ -736,30 +809,39 @@ class _Stage:
                         ) from error
                     raise
             del head
-        run_id = self.start()
-        sha = self.ledger.put_blob(rows_save(Dataset(columns, None)))
-        self.ledger.append(
-            Event.FEATURES,
-            self.evaluation.dataset_id,
-            feature_id,
-            {
-                "pipeline": self.pipeline.id,
-                "run": run_id,
-                "features": identity.canonical(function),
-                "import_shas": identity.import_shas((function,), self.root),
-                "code_keys": identity.code_keys((function,), self.root),
-                "columns": list(columns),
-                "columns_id": columns_id,
-                "probe_rows": probe_rows,
-                "duration_s": duration,
-                "blob": {"sha": sha, "format": PARQUET},
-            },
-            id=feature_id,
+        return probe_rows
+
+    def _features_why(self, function: Callable) -> str:
+        """Why a feature set is computed: the inputs that moved against the nearest
+        earlier computation of the same function, the one with the fewest moved.
+        """
+        rows = self.ledger.sql(
+            "SELECT stream AS dataset, json_extract(payload, '$.code_keys') AS "
+            "code_keys FROM event WHERE type = ? AND "
+            "json_extract(payload, '$.features.__function__') = ? "
+            "ORDER BY seq DESC LIMIT 64",
+            (Event.FEATURES, identity.function_ref(function)),
         )
-        self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
-        return self.features.setdefault(
-            feature_id, (tuple(columns), self.ledger.blobs / sha, columns_id)
-        )
+        if not rows:
+            return "no earlier features of this function"
+        now = identity.code_keys((function,), self.root)
+
+        def moved(row: dict[str, Any]) -> list[str]:
+            before = json.loads(row["code_keys"])
+            files = sorted(
+                k for k in set(before) | set(now) if before.get(k) != now.get(k)
+            )
+            return [
+                reason
+                for reason, differs in (
+                    ("dataset changed", row["dataset"] != self.evaluation.dataset_id),
+                    (f"code changed: {', '.join(files)}", bool(files)),
+                )
+                if differs
+            ]
+
+        nearest = min((moved(r) for r in rows), key=len)
+        return "; ".join(nearest) or "environment lock changed"
 
     def _feature_columns(
         self, function: Callable, bare: Dataset
