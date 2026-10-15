@@ -3349,3 +3349,27 @@ def test_lab_run_counts_feature_sets_in_its_summary(ledger, dataset, scratch, ca
         capsys.readouterr().out,
         re.M,
     )
+
+
+def test_a_run_reuses_the_feature_set_its_dry_run_computed(ledger, dataset, evaluation):
+    lag = synthetic.featured(synthetic.ridge(1))
+    n = load(ledger, dataset).rows
+    synthetic.FEATURE_CALLS.clear()
+    lines: list[str] = []
+    _run(ledger, evaluation, lag, dry=True, log=lines.append)
+    assert synthetic.FEATURE_CALLS.count(n) == 1
+    planned = ledger.root / "planned"
+    assert sorted(p.suffix for p in planned.iterdir()) == [".json", ".parquet"]
+    runs._PLANNED_FEATURES.clear()
+    lines.clear()
+    _run(ledger, evaluation, lag, dry=True, log=lines.append)
+    assert synthetic.FEATURE_CALLS.count(n) == 1
+    assert any(
+        line.endswith("computed and probed by an earlier dry run") for line in lines
+    )
+    lines.clear()
+    report = _run(ledger, evaluation, lag, log=lines.append)
+    assert report.features_computed == 1 and synthetic.FEATURE_CALLS.count(n) == 1
+    assert any(line.endswith(": from the dry run, probing") for line in lines)
+    assert _count(ledger, "event_feature") == 1 and not list(planned.iterdir())
+    assert report.scores_recorded == 1 and not report.failed

@@ -35,7 +35,16 @@ from typing import Any
 import numpy as np
 
 from ml_lab import formats, identity
-from ml_lab.dataset import Dataset, Lag, Range, load, resolve, row_mask, rows_save
+from ml_lab.dataset import (
+    Dataset,
+    Lag,
+    Range,
+    load,
+    resolve,
+    row_mask,
+    rows_load,
+    rows_save,
+)
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.splits import Fold
@@ -45,8 +54,11 @@ from ml_lab.splits import Fold
 class RunReport:
     """What a run wrote; ``run`` is empty when every feature set, fit, prediction and
     score already existed. In a dry run the computed counts are what a run would
-    compute. ``failed`` maps a failed pipeline's name to its error, ``failed_ids``
-    holds its id.
+    compute. Each count is per run: a feature set or fit two pipelines share counts
+    once, and one already in ``planned`` from an earlier call of the same dry run
+    counts in neither column, so the CLI's totals over several evaluations count
+    shared work once. ``failed`` maps a failed pipeline's name to its error,
+    ``failed_ids`` holds its id.
     """
 
     run: str = ""
@@ -312,7 +324,12 @@ _PLANNED_FEATURES: dict[str, Features] = {}
 """Feature sets a dry run computed in this process, by feature id, so a later dry run
 of the same features under another evaluation reuses the names and id instead of
 computing them again. The id covers the dataset, the function, its code and its
-environment, so an entry is right for as long as the process runs."""
+environment, so an entry is right for as long as the process runs. On disk the same
+sets live under the ledger's ``planned`` directory (``_planned_dir``), where a later
+process, dry or real, picks them up."""
+
+PLANNED_DAYS = 7
+"""How long a dry run's feature set waits under ``planned`` for a run to use it."""
 
 
 def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
@@ -716,23 +733,40 @@ class _Stage:
             self.dataset.ts,
         )
         ref = identity.function_ref(function)
-        self.log(f"computing features {self.name} {ref}")
+        planned = self._planned_features(feature_id)
+        if planned is not None and self.dry:
+            columns_id, columns, duration = planned
+            self.log(
+                f"would compute features {self.name} {ref} {len(columns)} columns: "
+                f"computed and probed by an earlier dry run"
+            )
+            self.report.features_computed += 1
+            self.planned.add(feature_id)
+            found = (tuple(columns), None, columns_id)
+            _PLANNED_FEATURES[feature_id] = found
+            return self.features.setdefault(feature_id, found)
         loaded = set(sys.modules)
-        started = time.perf_counter()
-        columns = self._feature_columns(function, bare)
-        duration = time.perf_counter() - started
-        self._check_imports("features", loaded)
-        self._unchanged("features")
+        if planned is None:
+            self.log(f"computing features {self.name} {ref}")
+            started = time.perf_counter()
+            columns = self._feature_columns(function, bare)
+            duration = time.perf_counter() - started
+        else:
+            self.log(f"features {self.name} {ref}: from the dry run, probing")
+            columns_id, columns, duration = planned
         columns_id = _columns_id(columns)
         probe_rows = self._probe_features(
             function, bare, revealed, columns, spans=1 if self.dry else 5
         )
+        self._check_imports("features", loaded)
+        self._unchanged("features")
         if self.dry:
             self.log(
                 f"would compute features {self.name} {ref} {len(columns)} columns "
                 f"{duration:.1f}s: {self._features_why(function)}; probed at rows "
                 f"{probe_rows} only"
             )
+            self._plan_features(feature_id, columns, columns_id, duration)
             self.report.features_computed += 1
             self.planned.add(feature_id)
             found = (tuple(columns), None, columns_id)
@@ -760,9 +794,63 @@ class _Stage:
         )
         self.report.features_computed += 1
         self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
+        for leftover in self._planned_dir().glob(f"{feature_id}.*"):
+            leftover.unlink(missing_ok=True)
         return self.features.setdefault(
             feature_id, (tuple(columns), self.ledger.blobs / sha, columns_id)
         )
+
+    def _planned_dir(self) -> pathlib.Path:
+        return self.ledger.root / "planned"
+
+    def _plan_features(
+        self,
+        feature_id: str,
+        columns: dict[str, np.ndarray],
+        columns_id: str,
+        duration: float,
+    ):
+        """Keep a dry run's feature set under ``planned``, outside the events and the
+        blob store, so the run that follows reads it instead of computing it again;
+        sets older than ``PLANNED_DAYS`` are dropped, since no run came for them.
+        """
+        planned = self._planned_dir()
+        planned.mkdir(exist_ok=True)
+        stale = time.time() - PLANNED_DAYS * 86400
+        for old in planned.iterdir():
+            if old.stat().st_mtime < stale:
+                old.unlink(missing_ok=True)
+        (planned / f"{feature_id}.parquet").write_bytes(
+            rows_save(Dataset(columns, None))
+        )
+        (planned / f"{feature_id}.json").write_text(
+            json.dumps(
+                {
+                    "columns": list(columns),
+                    "columns_id": columns_id,
+                    "duration_s": duration,
+                }
+            )
+        )
+
+    def _planned_features(
+        self, feature_id: str
+    ) -> tuple[str, dict[str, np.ndarray], float] | None:
+        """A feature set an earlier dry run left under ``planned``, when its columns
+        still hash to the id it was saved with; None otherwise.
+        """
+        meta = self._planned_dir() / f"{feature_id}.json"
+        data = self._planned_dir() / f"{feature_id}.parquet"
+        if not (meta.exists() and data.exists()):
+            return None
+        saved = json.loads(meta.read_text())
+        columns = rows_load(data).columns
+        if (
+            list(columns) != saved["columns"]
+            or _columns_id(columns) != saved["columns_id"]
+        ):
+            return None
+        return saved["columns_id"], columns, float(saved["duration_s"])
 
     def _probe_features(
         self,
