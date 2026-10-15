@@ -112,7 +112,7 @@ SQLite is the record; DuckDB is the analyst. `ATTACH 'ml_lab.sqlite' (TYPE sqlit
 lab ingest project/dataset.py <args>              # prints the dataset id
 lab run project/experiment.py                   # the newest dataset when the ledger holds one source; otherwise --dataset <source or id prefix>
 lab run project/experiment.py ideas/agent7.py   # pipelines from both, the evaluations from one
-lab run project/experiment.py --dry-run         # what a run would compute and why; writes nothing
+lab run project/experiment.py --dry-run         # what a run would compute and why; writes nothing, but computes and probes a new feature set
 sqlite3 -box $ML_LAB_ROOT/ml_lab.sqlite "..."
 ```
 

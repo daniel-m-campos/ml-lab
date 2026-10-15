@@ -326,17 +326,16 @@ def imported_dists(
     todo = {d for top in tops for d in owners.get(top, (top,))}
     found: dict[str, str] = {}
     while todo:
-        try:
-            dist = importlib.metadata.distribution(todo.pop())
-        except importlib.metadata.PackageNotFoundError:
+        facts = _distribution(todo.pop())
+        if facts is None:
             continue
-        name = dist.metadata["Name"]
+        dist, name, version, editable, requires = facts
         if name in found:
             continue
-        found[name] = dist.version + _editable_suffix(dist, modules)
-        for req in dist.requires or ():
-            if "extra ==" not in req:
-                todo.add(re.match(r"[A-Za-z0-9_.-]+", req).group())
+        found[name] = version + (
+            _editable_suffix(dist, name, modules) if editable else ""
+        )
+        todo.update(requires)
     return dict(sorted(found.items()))
 
 
@@ -470,6 +469,27 @@ def _is_editable(dist: importlib.metadata.Distribution) -> bool:
 
 
 @functools.cache
+def _distribution(
+    requirement: str,
+) -> tuple[importlib.metadata.Distribution, str, str, bool, frozenset[str]] | None:
+    """An installed distribution with its name, version, whether it is an editable
+    install and the names it requires outside extras, read once per process, since a
+    run hashes the same metadata for every stage of every pipeline and an install does
+    not move while a process runs. None when nothing installed answers to the name.
+    """
+    try:
+        dist = importlib.metadata.distribution(requirement)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    requires = frozenset(
+        re.match(r"[A-Za-z0-9_.-]+", req).group()
+        for req in dist.requires or ()
+        if "extra ==" not in req
+    )
+    return dist, dist.metadata["Name"], dist.version, _is_editable(dist), requires
+
+
+@functools.cache
 def _editable_source(path: pathlib.Path) -> bytes:
     """An editable module's source, read once per process, so one run fits under one
     lock however the install is edited meanwhile. The repo's own modules are read
@@ -479,16 +499,15 @@ def _editable_source(path: pathlib.Path) -> bytes:
 
 
 def _editable_suffix(
-    dist: importlib.metadata.Distribution, modules: Iterable[types.ModuleType]
+    dist: importlib.metadata.Distribution,
+    name: str,
+    modules: Iterable[types.ModuleType],
 ) -> str:
     """``+`` and a hash of the code keys of an editable install's modules among
     ``modules``, so an edit to a module no function reaches keeps the lock; every
     module of the install when none is among them, as for one reached only as a
-    requirement. Empty for an install that is not editable.
+    requirement. ``name`` is the install's distribution name.
     """
-    if not _is_editable(dist):
-        return ""
-    name = dist.metadata["Name"]
     files = {
         m.__name__: code_key(_editable_source(editable[1]))
         for m in modules
