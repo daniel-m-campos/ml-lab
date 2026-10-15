@@ -682,6 +682,9 @@ def test_one_lab_run_scores_every_pipeline_under_each_named_evaluation(
     assert cli.main(["--root", str(ledger.root), "run", str(sweep)]) == 0
     out = capsys.readouterr().out
     assert re.search(r"evaluation [0-9a-f]{16} c0\.001\n", out) and " c0.01\n" in out
+    assert [m.group(1) for m in re.finditer(r"pipeline [0-9a-f]{16} (\w+)\n", out)] == [
+        p.name for p in synthetic.pipelines[:2]
+    ]
     rows = ledger.sql(
         "SELECT evaluation_name AS e, COUNT(*) AS n FROM score_latest GROUP BY 1"
     )

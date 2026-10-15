@@ -121,6 +121,8 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     failed_ids: set[str] = set()
     planned: set[str] = set()
     total = runs.RunReport()
+    for pipeline in pipelines:
+        print(f"pipeline {pipeline.id} {pipeline.name}".rstrip())
     for evaluation in evaluations:
         print(f"evaluation {evaluation.id} {evaluation.name}".rstrip())
         live = [p for p in pipelines if p.id not in failed_ids]
