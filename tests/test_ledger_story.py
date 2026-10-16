@@ -315,6 +315,27 @@ def test_record_refuses_zero_rows(ledger):
         _record(ledger, _dataset(0))
 
 
+def test_record_names_its_cleaning_steps_in_the_recipe(ledger):
+    rows = _dataset()
+    dataset_id = record(
+        ledger, rows, source="s", targets=["y"], steps=(synthetic.generate,)
+    )
+    recipe = ledger.latest(Event.DATASET, dataset_id)["payload"]["recipe"]
+    (step,) = recipe["steps"]
+    assert step["function"] == "tests.synthetic:generate"
+    assert (
+        "tests/synthetic.py" in step["code_keys"] and "numpy" in step["distributions"]
+    )
+    steps = [np.sort, len]
+    recorded = record(ledger, _dataset(3), source="u", targets=["y"], steps=steps)
+    recipe = ledger.latest(Event.DATASET, recorded)["payload"]["recipe"]
+    assert [s["function"] for s in recipe["steps"]] == ["numpy:sort", "builtins:len"]
+    assert "numpy" in recipe["steps"][0]["distributions"]
+    assert dataset_id == record(ledger, rows, source="s", targets=["y"])
+    with pytest.raises(Refused, match="not a module-level function"):
+        record(ledger, rows, source="t", targets=["y"], steps=(lambda f: f,))
+
+
 def test_record_keeps_source_params_and_targets_as_the_recipe(ledger):
     dataset_id = record(ledger, _dataset(), source="s", targets=("y",))
     recipe = ledger.latest(Event.DATASET, dataset_id)["payload"]["recipe"]
