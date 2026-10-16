@@ -23,7 +23,8 @@ from __future__ import annotations
 import datetime
 import io
 import pathlib
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -268,11 +269,16 @@ def record(
     params: Mapping[str, Any] | None = None,
     reveal: Mapping[str, datetime.timedelta | np.timedelta64 | int] | None = None,
     sealed_from: int | str | None = None,
+    steps: Sequence[Callable] = (),
 ) -> str:
     """Check the targets and store the rows; returns the dataset id.
 
-    ``source`` and ``params`` name how the rows were made, cleaning included, so clean
-    before ``record`` and name the cleaning in ``params``. ``reveal`` maps a target to
+    ``source`` and ``params`` name how the rows were made. ``steps`` are the
+    module-level functions that made them, the cleaning included: each is recorded
+    in the recipe by its dotted path with the code keys of its module and the modules
+    it imports, so the log says which code dropped the rows, and an edit to it shows
+    in the recipe of the next ingest. The id stays the rows' hash, so an edit that
+    leaves the rows as they were records nothing new. ``reveal`` maps a target to
     when its label is known: a ``timedelta`` or ``numpy.timedelta64`` after its row's
     timestamp, or an ``int`` of later dates with rows (``1`` is the next trading day's
     open, ``2`` two trading dates later whatever the calendar gap). A features function
@@ -300,6 +306,8 @@ def record(
     labels = {t: _lag(reveal[t]) if t in reveal else None for t in targets}
     window = [str(d) for d in dates.span(dataset)] if has_clock else None
     recipe = {"source": source, "params": params or {}, "targets": labels}
+    if steps:
+        recipe["steps"] = [_step(step) for step in steps]
     missing = [t for t in targets if t not in dataset.columns]
     if missing:
         raise KeyError(f"targets not in dataset: {missing}")
@@ -330,6 +338,24 @@ def record(
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
     return dataset_id
+
+
+def _step(step: Callable) -> dict[str, Any]:
+    """A cleaning function as the recipe records it: its dotted path, the code keys
+    of its module's closure hashed from the git root that holds it, and the
+    distributions it imports with their versions, which is all a function of an
+    installed package records.
+    """
+    ref = identity.function_ref(step)
+    file = getattr(sys.modules[step.__module__], "__file__", None)
+    if not file:
+        return {"function": ref, "code_keys": {}, "distributions": {}}
+    root = identity.repo_root(pathlib.Path(file))
+    return {
+        "function": ref,
+        "code_keys": identity.code_keys((step,), root),
+        "distributions": identity.imported_dists((step,), root),
+    }
 
 
 def _numeric(dtype: np.dtype) -> bool:
