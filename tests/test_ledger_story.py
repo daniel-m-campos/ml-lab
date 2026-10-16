@@ -3693,3 +3693,39 @@ def test_a_predict_config_enters_the_prediction_id_and_shares_the_fit(
     up, down = (_load_predictions(ledger, r["id"]) for r in (rows[0], rows[folds]))
     assert rows[0]["fit"] == rows[folds]["fit"] and np.array_equal(up, -down)
     assert set(np.unique(up)) <= {-1.0, 0.0, 1.0}
+
+
+def test_a_train_view_copies_only_the_columns_a_fit_reads(monkeypatch):
+    wide = _dataset(40, **{f"w{i}": np.arange(40, dtype=float) for i in range(50)})
+    copies: list[str] = []
+    real = ml_lab.dataset._blank
+
+    def counted(values, keep):
+        copies.append(len(values))
+        return real(values, keep)
+
+    monkeypatch.setattr(ml_lab.dataset, "_blank", counted)
+    view = wide.train_view(((0, 10), (20, 30)))
+    assert view.rows == 40 and len(view.columns) == len(wide.columns)
+    assert list(view.columns) == list(wide.columns) and "w7" in view.columns
+    assert not copies
+    w7 = view.column("w7")
+    assert np.isnan(w7[10:20]).all() and np.isnan(w7[30:]).all()
+    assert (w7[:10] == np.arange(10)).all() and copies == [40]
+    assert np.array_equal(view.columns["w7"], w7, equal_nan=True) and copies == [40]
+    assert view.matrix(["w7", "w8"], (0, 5)).shape == (5, 2) and copies == [40, 40]
+    short = view.upto(25)
+    assert short.rows == 25 and len(copies) == 2
+    assert np.isnan(short.column("w9")[10:20]).all() and copies[-1] == 25
+    assert short.column("w7").shape == (25,) and len(copies) == 3
+    shorter = short.upto(5)
+    assert (shorter.column("w1") == np.arange(5)).all() and copies[-1] == 5
+    with pytest.raises(TypeError):
+        del view.columns["w1"]
+    view.columns["z"] = np.ones(40)
+    assert "z" in view.columns and len(view.columns) == len(wide.columns) + 1
+    assert list(view.columns)[-1] == "z" and view.matrix(["w1", "z"], (0, 3)).shape == (
+        3,
+        2,
+    )
+    assert "z" in view.upto(10).columns and view.upto(10).column("z").shape == (10,)

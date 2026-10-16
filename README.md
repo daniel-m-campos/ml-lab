@@ -206,7 +206,7 @@ Predictions are Parquet files under `blobs/sha256/`, named by `event_prediction.
 
 ## Trust boundary
 
-The guards see what a function receives. A function that reads a file, an environment variable, module globals set elsewhere, `.base` or `as_strided` on a view, or the feature store's path, or that caches across pipelines in a module global, or whose output depends on global random state, is outside the guards. The process is the trust boundary.
+The guards see what a function receives. A function that reads a file, an environment variable, module globals set elsewhere, `.base` or `as_strided` on a view, a train view's `columns._source`, or the feature store's path, or that caches across pipelines in a module global, or whose output depends on global random state, is outside the guards. The process is the trust boundary.
 
 ## Refusals you will meet
 
