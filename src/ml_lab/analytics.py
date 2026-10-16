@@ -11,11 +11,14 @@ Examples
 >>> result = paired(ledger, score_a, score_b, "pnl", block_rows=500)  # doctest: +SKIP
 >>> result.pooled_delta / result.se_block  # doctest: +SKIP
 2.1
+>>> paired_sets(ledger, evaluation, "sharpe", seeds_b, seeds_a).t  # doctest: +SKIP
+1.7
 """
 
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -100,6 +103,69 @@ def paired(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class SetPaired:
+    """Two sets of pipelines paired fold by fold on their set means.
+
+    Attributes
+    ----------
+    n_folds : int
+        Folds where every member of both sets has the metric.
+    delta_mean : float
+        The mean over folds of the first set's mean metric minus the second's.
+    delta_std : float | None
+        Its sample standard deviation over folds, None at one fold.
+    t : float | None
+        ``delta_mean * sqrt(n_folds) / delta_std``, None at one fold or zero spread.
+    wins : int | None
+        Folds the first set wins by the metric's direction, None without one.
+    fold_deltas : tuple[float, ...]
+        The per-fold differences of the set means, in fold order.
+    """
+
+    n_folds: int
+    delta_mean: float
+    delta_std: float | None
+    t: float | None
+    wins: int | None
+    fold_deltas: tuple[float, ...]
+
+
+def paired_sets(
+    ledger: Ledger,
+    evaluation: str,
+    metric: str,
+    pipelines: Sequence[str],
+    references: Sequence[str],
+) -> SetPaired:
+    """Pair a set of pipelines against a set of references under one evaluation:
+    a seed set against a seed set, or a post-process over seeds against the seeds.
+
+    Each fold's value for a set is the mean of its members' latest scores on
+    ``metric``, so the fold-paired t respects the folds the members share instead of
+    treating each member as another sample. Pipelines are ids; a member without a
+    latest score under the evaluation, or a fold a member lacks, is refused.
+    """
+    if not pipelines or not references:
+        raise Refused("paired_sets needs at least one pipeline id in each set")
+    values = _fold_values(ledger, evaluation, metric, [*pipelines, *references])
+    folds = sorted(next(iter(values.values())))
+    a = np.array([np.mean([values[p][f] for p in pipelines]) for f in folds])
+    b = np.array([np.mean([values[p][f] for p in references]) for f in folds])
+    d = a - b
+    direction = ledger.sql(
+        "SELECT direction FROM score_fold s JOIN score_latest l ON l.score = s.score "
+        "WHERE l.evaluation = ? AND s.metric = ? ORDER BY l.seq DESC LIMIT 1",
+        (evaluation, metric),
+    )[0]["direction"]
+    wins = None
+    if direction in ("max", "min"):
+        wins = int(((d > 0) if direction == "max" else (d < 0)).sum())
+    std = float(d.std(ddof=1)) if len(d) > 1 else None
+    t = float(d.mean() * np.sqrt(len(d)) / std) if std else None
+    return SetPaired(len(d), float(d.mean()), std, t, wins, tuple(map(float, d)))
+
+
 # Private Functions ====================================================================
 
 
@@ -112,6 +178,38 @@ def _series(ledger: Ledger, score: str, column: str) -> tuple[np.ndarray, list[i
     if column not in arrays:
         raise Refused(f"score {score} stores series {list(arrays)}, not {column}")
     return arrays[column], stored["fold_rows"]
+
+
+def _fold_values(
+    ledger: Ledger, evaluation: str, metric: str, pipelines: Sequence[str]
+) -> dict[str, dict[int, float]]:
+    """Per pipeline id, its latest score's metric per fold under the evaluation;
+    refused when one has no score or the folds differ.
+    """
+    marks = ", ".join("?" * len(pipelines))
+    rows = ledger.sql(
+        "SELECT l.pipeline, s.fold, s.value FROM score_latest l "
+        "JOIN score_fold s ON s.score = l.score "
+        f"WHERE l.evaluation = ? AND s.metric = ? AND l.pipeline IN ({marks})",
+        (evaluation, metric, *pipelines),
+    )
+    values: dict[str, dict[int, float]] = {p: {} for p in pipelines}
+    for row in rows:
+        if row["value"] is not None:
+            values[row["pipeline"]][row["fold"]] = row["value"]
+    missing = [p for p in pipelines if not values[p]]
+    if missing:
+        raise Refused(
+            f"no latest score of {metric} under evaluation {evaluation} for "
+            f"pipelines {missing}; pass pipeline ids the evaluation scored"
+        )
+    folds = {p: set(v) for p, v in values.items()}
+    if len({frozenset(f) for f in folds.values()}) > 1:
+        raise Refused(
+            f"the pipelines' scores of {metric} do not share one set of folds: "
+            + ", ".join(f"{p[:8]} has {sorted(f)}" for p, f in folds.items())
+        )
+    return values
 
 
 def _evaluation(ledger: Ledger, score: str) -> str:

@@ -467,6 +467,7 @@ def test_the_package_exports_what_a_project_imports():
         "Segments",
         "load",
         "paired",
+        "paired_sets",
         "record",
     ]
     assert ml_lab.record is record and ml_lab.Fold is splits.Fold
@@ -3510,3 +3511,43 @@ def test_a_run_records_the_gpus_nvidia_smi_reports(ledger, evaluation, monkeypat
     ]
     monkeypatch.setattr(runs, "_gpus", lambda: 1 / 0)
     assert "gpu_error" in runs._host()
+
+
+def test_paired_sets_pairs_the_fold_means_of_two_sets(ledger, evaluation):
+    one, three, six = synthetic.ridge(1), synthetic.ridge(3), synthetic.ridge(6)
+    _run(ledger, evaluation, one, three, six)
+    result = ml_lab.paired_sets(
+        ledger, evaluation.id, "pnl", [one.id, three.id], [six.id]
+    )
+    values = {}
+    for pipeline in (one, three, six):
+        rows = ledger.sql(
+            "SELECT s.value FROM score_fold s JOIN score_latest l ON l.score = s.score"
+            " WHERE l.pipeline = ? AND s.metric = 'pnl' ORDER BY s.fold",
+            (pipeline.id,),
+        )
+        values[pipeline.id] = np.array([r["value"] for r in rows])
+    d = (values[one.id] + values[three.id]) / 2 - values[six.id]
+    assert result.n_folds == len(d) and np.allclose(result.fold_deltas, d)
+    assert np.isclose(result.delta_mean, d.mean())
+    assert np.isclose(result.t, d.mean() * np.sqrt(len(d)) / d.std(ddof=1))
+    assert result.wins == int((d > 0).sum())
+    (row,) = ledger.sql(
+        "SELECT delta_mean, t FROM head_to_head WHERE pipeline = ? AND reference = ? "
+        "AND metric = 'pnl'",
+        (one.id, six.id),
+    )
+    single = ml_lab.paired_sets(ledger, evaluation.id, "pnl", [one.id], [six.id])
+    assert np.isclose(single.delta_mean, row["delta_mean"])
+    assert np.isclose(single.t, row["t"])
+    with pytest.raises(Refused, match="no latest score"):
+        ml_lab.paired_sets(ledger, evaluation.id, "pnl", [one.id], ["nope"])
+    with pytest.raises(Refused, match="at least one pipeline id in each set"):
+        ml_lab.paired_sets(ledger, evaluation.id, "pnl", [one.id], [])
+    nodir = dataclasses.replace(
+        evaluation,
+        scorer=dataclasses.replace(synthetic.sign_scorer, directions={}),
+        name="nodir",
+    )
+    _run(ledger, nodir, one, six)
+    assert ml_lab.paired_sets(ledger, nodir.id, "pnl", [one.id], [six.id]).wins is None
