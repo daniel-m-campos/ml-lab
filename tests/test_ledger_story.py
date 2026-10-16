@@ -2489,13 +2489,18 @@ def test_lab_run_flushes_each_progress_line(ledger, dataset, monkeypatch):
     assert cli.main(["--root", str(ledger.root), "run", "tests.synthetic"]) == 0
 
 
-def test_a_source_written_by_two_actors_needs_an_id(
+def test_a_source_written_by_two_actors_resolves_to_the_actors_own(
     ledger, dataset, evaluation, monkeypatch, capsys
 ):
     monkeypatch.setenv("ML_LAB_ACTOR", "other-agent")
     second = synthetic.dataset(ledger, seed=8)
     assert second != dataset
-    with pytest.raises(Refused, match="several actors") as info:
+    assert cli._dataset(ledger, "synthetic") == second
+    assert cli._dataset(ledger, None) == second
+    monkeypatch.setenv("ML_LAB_ACTOR", "tester")
+    assert cli._dataset(ledger, "synthetic") == dataset
+    monkeypatch.setenv("ML_LAB_ACTOR", "stranger")
+    with pytest.raises(Refused, match="several actors, none by stranger") as info:
         cli._dataset(ledger, "synthetic")
     assert dataset[:8] in str(info.value) and "other-agent" in str(info.value)
     with pytest.raises(Refused, match="several actors"):

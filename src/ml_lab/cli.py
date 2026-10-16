@@ -260,9 +260,10 @@ def _code_root(module: Any) -> pathlib.Path:
 
 def _dataset(ledger: Ledger, selector: str | None) -> str:
     """The dataset named by an id prefix or a source; with no selector, the newest,
-    provided every dataset in the ledger shares one source. A source resolves to its
-    newest dataset only while one actor wrote it: two studies under one source name
-    are refused with their ids, since the newest would silently be someone else's.
+    provided every dataset in the ledger shares one source. A source written by
+    several actors resolves to the newest dataset the running actor recorded under
+    it, and is refused with every actor's id when the running actor recorded none,
+    since the newest would silently be someone else's.
     """
     rows = ledger.sql("SELECT id, source, actor FROM event_dataset ORDER BY seq")
     by_source: dict[str, str] = {r["source"]: r["id"] for r in rows}
@@ -270,10 +271,14 @@ def _dataset(ledger: Ledger, selector: str | None) -> str:
         selector = rows[-1]["source"]
     named = [r for r in rows if r["source"] == selector]
     if len({r["actor"] for r in named}) > 1:
-        raise Refused(
-            f"source {selector} names datasets by several actors, pass an id: "
-            + ", ".join(f"{r['id'][:8]} ({r['actor']})" for r in named)
-        )
+        own = [r for r in named if r["actor"] == actor()]
+        if not own:
+            raise Refused(
+                f"source {selector} names datasets by several actors, none by "
+                f"{actor()}; pass an id: "
+                + ", ".join(f"{r['id'][:8]} ({r['actor']})" for r in named)
+            )
+        return own[-1]["id"]
     if selector in by_source:
         return by_source[selector]
     if selector:
