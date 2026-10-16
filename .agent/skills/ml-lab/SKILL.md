@@ -56,11 +56,11 @@ A fit is reused when the ledger holds one for the same data, declaration, code a
 
 ## Reading results
 
-Read the ledger with SQL, through its views, never by parsing logs. A name is a label, not an id: an edited pipeline gets a new id under the same name and the views list both, so filter on the pipeline ids `lab run` printed (also in `event_run.pipelines` under the run id it printed), and on the dataset's `source` to keep to one study. A view of the current declarations only is issue #25.
+Read the ledger with SQL, through its views, never by parsing logs. A name is a label, not an id: an edited pipeline gets a new id under the same name and the views list both, so filter on the pipeline ids `lab run` printed (also in `event_run.pipelines` under the run id it printed), or on `current = 1`, the ids the newest run that listed each name declared, and on the dataset's `source` to keep to one study.
 
 ```
-sqlite3 -readonly $ML_LAB_ROOT/ml_lab.sqlite "SELECT evaluation_name, name, metric, fold_mean, fold_std, n_folds, pooled, rank, pipeline FROM board WHERE source = '<source>' AND pipeline IN ('<id>', '<id>')"
-sqlite3 -readonly $ML_LAB_ROOT/ml_lab.sqlite "SELECT reference_name, name, metric, delta_mean, delta_std, wins, n_folds, t, pooled_delta FROM head_to_head WHERE source = '<source>' AND reference = '<reference id>' AND pipeline IN ('<id>', '<id>')"
+sqlite3 -readonly $ML_LAB_ROOT/ml_lab.sqlite "SELECT evaluation_name, name, metric, fold_mean, fold_std, n_folds, pooled, rank, pipeline FROM board WHERE source = '<source>' AND current = 1"
+sqlite3 -readonly $ML_LAB_ROOT/ml_lab.sqlite "SELECT evaluation_name, reference_name, name, metric, delta_mean, delta_std, wins, n_folds, t, pooled_delta FROM head_to_head WHERE source = '<source>' AND reference = '<reference id>' AND current = 1"
 ```
 
 `board` holds one row per pipeline, evaluation and metric; `head_to_head` holds the paired fold differences between a pipeline and a reference, with the paired t. `event_fit`, `event_feature`, `event_prediction`, `event_score` and `event_run` are the building blocks, and a run records the commit, dirty diff, host and the tool's commit.
