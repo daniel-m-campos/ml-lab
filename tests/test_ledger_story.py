@@ -466,6 +466,7 @@ def test_the_package_exports_what_a_project_imports():
         "Range",
         "Scorer",
         "Segments",
+        "inner_split",
         "load",
         "paired",
         "paired_sets",
@@ -3729,3 +3730,49 @@ def test_a_train_view_copies_only_the_columns_a_fit_reads(monkeypatch):
         2,
     )
     assert "z" in view.upto(10).columns and view.upto(10).column("z").shape == (10,)
+
+
+def test_inner_split_cuts_a_validation_tail_purged_as_the_evaluation_would(
+    ledger, dataset, evaluation
+):
+    data = load(ledger, dataset)
+    train = ((0, 2000),)
+    inner, valid = splits.inner_split(data, train, 0.1)
+    assert valid == (1800, 2000) and inner == ((0, 1800),)
+    assert splits.inner_split(data, train, 250)[1] == (1750, 2000)
+    assert splits.inner_split(data, train, 0.1, embargo_timestamps=2)[0] == ((0, 1798),)
+    data.reveal = {synthetic.TARGET: 1}
+    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1800),)
+    data.reveal = {synthetic.TARGET: 2}
+    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1780),)
+    data.reveal = {synthetic.TARGET: np.timedelta64(1, "D")}
+    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1781),)
+    data.reveal = {synthetic.TARGET: None}
+    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1800),)
+    data.reveal = {}
+    data.embargo_timestamps = 2
+    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1798),)
+    assert splits.inner_split(data, train, 0.1, embargo_timestamps=0)[0] == ((0, 1800),)
+    data.embargo_timestamps, data.embargo_rows = 0, 5
+    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1795),)
+    assert splits.inner_split(data, train, 0.1, embargo_timestamps=1)[0] == ((0, 1794),)
+    data.embargo_rows = 0
+    two = ((0, 500), (1000, 2000))
+    assert splits.inner_split(data, two, 0.5) == (
+        ((0, 500), (1000, 1250)),
+        (1250, 2000),
+    )
+    with pytest.raises(Refused, match="no inner train or no validation"):
+        splits.inner_split(data, two, 1000)
+    with pytest.raises(Refused, match="a count of rows, or a fraction"):
+        splits.inner_split(data, train, 1.5)
+    chooser = dataclasses.replace(
+        synthetic.ridge(1), fit=synthetic.inner_fit, name="inner"
+    )
+    report = _run(ledger, evaluation, chooser)
+    assert report.scores_recorded == 1 and not report.failed
+    for row in ledger.sql("SELECT train, facts FROM event_fit"):
+        facts, train = json.loads(row["facts"]), json.loads(row["train"])
+        assert facts["alpha"] in (0.1, 1.0, 10.0)
+        assert facts["validation"][1] == train[-1][1]
+        assert facts["inner"][-1][1] == facts["validation"][0] - 1
