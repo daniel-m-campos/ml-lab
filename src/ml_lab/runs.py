@@ -1632,7 +1632,9 @@ def _refuse_lazy_imports(
     if grown or lazy:
         raise Refused(
             f"{pipeline.name or pipeline.id}: {stage} imported lazily: modules "
-            f"{grown}, distributions {lazy}; import at module level"
+            f"{grown}, distributions {lazy}; import them at module level beside "
+            f"{stage}, so the lock covers them, or warm a library that imports on "
+            "first use there"
         )
 
 

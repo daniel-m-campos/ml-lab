@@ -214,4 +214,5 @@ The guards see what a function receives. A function that reads a file, an enviro
 - **"the model loaded from its saved bytes predicts differently"**: `save` loses what `predict` reads.
 - **"is defined in ..., which the fit function does not import"**: a params class outside the memo's reach.
 - **"is not a module-level function of ..."**: a lambda, closure or method in a slot.
+- **"imported lazily"**: an import inside a function body, or a library that imports on first use: a JIT's first compile pulls in its optional dependencies (numba loads cffi, pycparser and charset_normalizer), which the lock computed at declaration does not hold. Import the named distributions at module level beside the function, or warm the library up at import by calling the compiled function once on a tiny array, so what runs is what the lock covers.
 - **"yields other folds than evaluation ... recorded"**: a split's code moved its folds; rename it or change a field.
