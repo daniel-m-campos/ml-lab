@@ -469,6 +469,7 @@ def test_the_package_exports_what_a_project_imports():
         "inner_split",
         "load",
         "mean_blend",
+        "note",
         "paired",
         "paired_sets",
         "record",
@@ -3839,3 +3840,33 @@ def test_a_stateless_blend_records_no_fit_and_averages_its_members(
     assert first.predictions_computed == folds and second.predictions_computed == folds
     assert second.predictions_reused == 2 * folds
     assert runs._project_root([mean, one]) == runs._project_root([one]) == REPO
+
+
+def test_a_note_records_text_about_ids_the_log_holds(
+    ledger, dataset, evaluation, capsys
+):
+    one = synthetic.ridge(1)
+    _run(ledger, evaluation, one)
+    score = _latest(ledger, evaluation)["ridge_1m"]
+    root = ["--root", str(ledger.root)]
+    args = ["note", "ridge_1m is the reference", "--tag", "decision", "--about"]
+    assert cli.main([*root, *args, one.id, score, dataset]) == 0
+    note_id = capsys.readouterr().out.strip()
+    (row,) = ledger.sql("SELECT id, actor, tag, text, about FROM event_note")
+    assert row["id"] == note_id and row["actor"] == "tester"
+    assert row["tag"] == "decision" and row["text"] == "ridge_1m is the reference"
+    assert json.loads(row["about"]) == [one.id, score, dataset]
+    assert cli.main([*root, "note", "try a seed set", "--tag", "idea"]) == 0
+    assert _count(ledger, "event_note WHERE tag = 'idea'") == 1
+    assert cli.main([*root, *args, "nope"]) == 1
+    assert "ids ['nope'] are not in" in capsys.readouterr().err
+    fit = ledger.sql("SELECT id FROM event_fit LIMIT 1")[0]["id"]
+    for bad in (fit, "decision", note_id):
+        assert cli.main([*root, *args, bad]) == 1
+    assert cli.main([*root, *args, evaluation.id]) == 0
+    with pytest.raises(Refused, match="needs text"):
+        ml_lab.note(ledger, "  ")
+    with pytest.raises(Refused, match="lowercase"):
+        ml_lab.note(ledger, "x", tag="Decision")
+    assert cli.main(["--root", str(ledger.root / "nope"), "note", "x"]) == 1
+    assert "no ledger at" in capsys.readouterr().err

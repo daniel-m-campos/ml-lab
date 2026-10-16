@@ -24,6 +24,7 @@ import platform
 import re
 import sqlite3
 import time
+from collections.abc import Sequence
 from typing import Any, Final
 
 from ml_lab import identity
@@ -46,6 +47,7 @@ class Event:
     PREDICTIONS: Final = "predictions_computed"
     SCORE: Final = "score_recorded"
     FAILED: Final = "pipeline_failed"
+    NOTE: Final = "note_recorded"
 
 
 DDL = """
@@ -262,6 +264,10 @@ SELECT h.*,
   delta_mean * sqrt(n_folds) / delta_std AS t
 FROM h JOIN event a ON a.id = h.score JOIN event b ON b.id = h.reference_score;
 
+CREATE VIEW event_note AS SELECT seq, id, at, actor, key AS tag,
+  json_extract(payload,'$.text') AS text, json_extract(payload,'$.about') AS about
+FROM event WHERE type='note_recorded';
+
 CREATE VIEW event_failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run,
@@ -379,6 +385,36 @@ class Ledger:
 
     def get_blob(self, sha: str) -> bytes:
         return (self.blobs / sha).read_bytes()
+
+
+def note(
+    ledger: Ledger, text: str, *, about: Sequence[str] = (), tag: str = "note"
+) -> str:
+    """Record a note: an idea, a decision, a final refit, as text tagged by its kind,
+    about the ids it names (pipelines, evaluations, scores, runs, datasets). Each id
+    must be in the log; a note is a record, not a verdict, and nothing reads it but
+    ``event_note``. Returns the note's id.
+    """
+    if not text.strip():
+        raise Refused("a note needs text")
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", tag):
+        raise Refused(f"tag {tag!r}: lowercase letters, digits, _ or -")
+    unknown = [i for i in about if not ledger.sql(_ABOUT, (i, i))]
+    if unknown:
+        raise Refused(
+            f"ids {unknown} are not in {ledger.root.resolve()}; a note is about "
+            "dataset, pipeline, evaluation, run or score ids, as lab prints them"
+        )
+    return ledger.append(
+        Event.NOTE, "", tag, {"text": text, "about": list(about), "tag": tag}
+    )
+
+
+_ABOUT = (
+    "SELECT 1 FROM event WHERE (type IN ('dataset_recorded', 'run_started', "
+    "'score_recorded') AND id = ?) OR (type IN ('pipeline_declared', "
+    "'evaluation_declared') AND key = ?) LIMIT 1"
+)
 
 
 def actor() -> str:

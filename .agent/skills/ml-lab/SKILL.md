@@ -25,6 +25,7 @@ lab ingest <study>/dataset.py [args]                      # prints the dataset i
 lab run --dry-run <study>/experiment.py --dataset <src>   # what a run would compute and why
 lab run <study>/experiment.py --dataset <src>             # validation; prints each pipeline id, then the run id
 lab run <study>/test.py --dataset <src>                   # test, once, after the pick is written
+lab note "<text>" --tag decision --about <ids>           # an idea, decision or refit, about ids the log holds
 ```
 
 ## Layout that keeps the memo cheap
@@ -48,6 +49,7 @@ A fit is reused when the ledger holds one for the same data, declaration, code a
 ## Judging honestly
 
 - Fit the rule baselines first (zero, majority class, a one-feature rule, a linear model); one of them may be the thing to beat.
+- Record each idea, the pick and a final refit with `lab note --tag idea|decision|refit --about <ids>` as well as in `NOTES.md`, so the ledger says why a pipeline exists and what replaced what; `event_note` reads them back.
 - Before the first model, write the pick rule into `NOTES.md`: the reference, the primary metric and evaluation, the eligible candidates by name, the threshold (a paired t against the reference on `head_to_head`, with the direction), and how a more complex candidate replaces a simpler qualifier. Count the candidates against the threshold and state the family-wise false-pick chance. Anything added later is exploratory and cannot be picked.
 - Pair every comparison by fold or by day. Fold spread measures regime spread between folds, not the noise of a difference; the paired delta's standard error does.
 - Score the test evaluation once, at the end, on the reference and the qualifiers only, after the pick is written. If nothing qualifies, the pick is the reference and the test run is skipped. A holdout used to choose is no longer a holdout.
