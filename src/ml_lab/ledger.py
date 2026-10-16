@@ -94,7 +94,9 @@ CREATE VIEW event_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.resolution.path') AS resolution,
   json_extract(payload,'$.resolution.sha') AS resolution_sha,
   json_extract(payload,'$.editable') AS editable,
-  json_extract(payload,'$.pipelines') AS pipelines
+  json_extract(payload,'$.pipelines') AS pipelines,
+  json_extract(payload,'$.host.gpu') AS gpu,
+  json_extract(payload,'$.host.cuda') AS cuda
 FROM event WHERE type='run_started';
 
 CREATE VIEW event_feature AS SELECT seq, id, at, actor, host, stream AS dataset,

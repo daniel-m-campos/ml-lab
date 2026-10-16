@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -1658,10 +1659,58 @@ def _text_blob(ledger: Ledger, text: str) -> dict[str, str]:
 
 
 def _host() -> dict[str, Any]:
-    return {
+    """Host facts for a run: the machine, and its NVIDIA GPUs with the driver and
+    CUDA versions when ``nvidia-smi`` answers, so a GPU fit's provenance names the
+    device that produced it. Facts never abort a run: a device the parser cannot
+    read is recorded as far as it was read.
+    """
+    facts = {
         "hostname": platform.node(),
         "system": platform.system(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count() or 1,
         "python": platform.python_version(),
     }
+    try:
+        return {**facts, **_gpus()}
+    except Exception as error:  # noqa: BLE001
+        return {**facts, "gpu_error": repr(error)}
+
+
+def _gpus() -> dict[str, Any]:
+    query = _command(
+        "nvidia-smi",
+        "--query-gpu=name,driver_version,memory.total",
+        "--format=csv,noheader,nounits",
+    )
+    if query is None:
+        return {}
+    gpus = []
+    for line in query.splitlines():
+        parts = [p.strip() for p in line.strip().rstrip(",").rsplit(",", 2)]
+        if len(parts) == 3:
+            name, driver, memory = parts
+            gpus.append(
+                {
+                    "name": name,
+                    "driver": driver,
+                    "memory_mb": int(memory) if memory.isdigit() else None,
+                }
+            )
+    summary = _command("nvidia-smi") or ""
+    cuda = re.search(r"CUDA Version:\s*([\d.]+)", summary)
+    return {"gpu": gpus, "cuda": cuda.group(1) if cuda else None}
+
+
+def _command(*args: str) -> str | None:
+    """A command's stdout, or None when it is missing, fails or hangs."""
+    try:
+        out = subprocess.run(
+            args, capture_output=True, text=True, check=True, timeout=COMMAND_TIMEOUT_S
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout
+
+
+COMMAND_TIMEOUT_S = 5
