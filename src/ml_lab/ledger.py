@@ -99,6 +99,15 @@ CREATE VIEW event_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.host.cuda') AS cuda
 FROM event WHERE type='run_started';
 
+CREATE VIEW run_pipeline AS SELECT r.seq, r.id AS run, r.stream AS evaluation,
+  json_extract(p.value,'$.id') AS pipeline, json_extract(p.value,'$.name') AS name
+FROM event r, json_each(r.payload,'$.pipelines') p WHERE r.type='run_started';
+
+CREATE VIEW pipeline_current AS WITH newest AS MATERIALIZED (
+  SELECT evaluation, name, MAX(seq) AS seq FROM run_pipeline GROUP BY evaluation, name)
+SELECT r.evaluation, r.name, r.pipeline, r.run, r.seq FROM run_pipeline r
+JOIN newest n ON n.evaluation = r.evaluation AND n.name = r.name AND n.seq = r.seq;
+
 CREATE VIEW event_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.columns') AS columns,
@@ -165,14 +174,18 @@ JOIN (SELECT score, metric, COUNT(value) AS n_folds, AVG(value) AS fold_mean,
   ON f.score = e.id AND f.metric = m.key
 WHERE e.type='score_recorded';
 
-CREATE VIEW score_latest AS SELECT l.evaluation, e.name AS evaluation_name,
-  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq
+CREATE VIEW score_latest AS WITH c AS MATERIALIZED (
+  SELECT DISTINCT evaluation, pipeline FROM pipeline_current)
+SELECT l.evaluation, e.name AS evaluation_name,
+  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq,
+  CASE WHEN c.pipeline IS NOT NULL THEN 1 ELSE 0 END AS current
 FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq,
         ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM event_score) l
 JOIN event_pipeline p ON p.id = l.pipeline
 JOIN event_evaluation e ON e.id = l.evaluation
 JOIN event_dataset d ON d.id = e.dataset
+LEFT JOIN c ON c.evaluation = l.evaluation AND c.pipeline = l.pipeline
 WHERE l.rn = 1;
 
 CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, fit) AS (
@@ -199,17 +212,17 @@ CREATE VIEW board AS SELECT source, evaluation_name, name, actor, metric, direct
     THEN RANK() OVER (PARTITION BY evaluation, metric
     ORDER BY CASE direction WHEN 'max' THEN -fold_mean ELSE fold_mean END
       NULLS LAST) END AS rank,
-  fold_mean, fold_std, n_folds, pooled, evaluation, pipeline, score, run, seq
+  fold_mean, fold_std, n_folds, pooled, current, evaluation, pipeline, score, run, seq
 FROM (SELECT l.source, l.evaluation_name, l.name, l.actor, a.metric,
   FIRST_VALUE(a.direction) OVER (PARTITION BY l.evaluation, a.metric
     ORDER BY l.seq DESC) AS direction,
-  a.fold_mean, a.fold_std, a.n_folds, a.pooled,
+  a.fold_mean, a.fold_std, a.n_folds, a.pooled, l.current,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
 FROM score_latest l JOIN score_aggregate a ON a.score = l.score);
 
 CREATE VIEW pair_fold AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.actor, l.pipeline, l.name,
-    l.score, s.fold, s.label, s.metric, s.value,
+    l.score, l.current, s.fold, s.label, s.metric, s.value,
     FIRST_VALUE(s.direction) OVER (PARTITION BY l.evaluation, s.metric
       ORDER BY l.seq DESC) AS direction
   FROM score_latest l JOIN score_fold s ON s.score = l.score)
@@ -218,6 +231,7 @@ SELECT a.evaluation, a.evaluation_name, a.source, a.actor, a.metric, a.fold, a.l
   a.value, b.value AS reference_value, a.value - b.value AS delta,
   CASE a.direction WHEN 'max' THEN a.value > b.value
       WHEN 'min' THEN a.value < b.value END AS win,
+  a.current, b.current AS reference_current,
   a.score, b.score AS reference_score
 FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
   AND b.fold = a.fold AND b.metric = a.metric;
@@ -226,7 +240,7 @@ CREATE VIEW head_to_head AS WITH d AS (
   SELECT *, AVG(delta) OVER (PARTITION BY score, reference_score, metric) AS mean
   FROM pair_fold),
 h AS (SELECT evaluation, evaluation_name, source, actor, metric, pipeline, name,
-  score, reference, reference_name, reference_score,
+  score, reference, reference_name, reference_score, current, reference_current,
   COUNT(delta) AS n_folds, AVG(delta) AS delta_mean,
   CASE WHEN COUNT(delta) > 1
        THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(delta) - 1))

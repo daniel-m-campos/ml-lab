@@ -3551,3 +3551,84 @@ def test_paired_sets_pairs_the_fold_means_of_two_sets(ledger, evaluation):
     )
     _run(ledger, nodir, one, six)
     assert ml_lab.paired_sets(ledger, nodir.id, "pnl", [one.id], [six.id]).wins is None
+
+
+def test_current_marks_the_id_the_newest_run_declared_under_a_name(ledger, evaluation):
+    old = synthetic.ridge(1)
+    _run(ledger, evaluation, old, synthetic.ridge(6))
+    new = dataclasses.replace(old, params=synthetic.RidgeConfig(1, 2.0))
+    assert new.name == old.name and new.id != old.id
+    _run(ledger, evaluation, new, synthetic.ridge(6))
+    rows = ledger.sql(
+        "SELECT pipeline, current FROM board WHERE name = 'ridge_1m' "
+        "AND metric = 'pnl' ORDER BY seq"
+    )
+    assert [(r["pipeline"], r["current"]) for r in rows] == [(old.id, 0), (new.id, 1)]
+    assert (
+        _count(
+            ledger,
+            "board",
+        )
+        == 6
+        and _count(ledger, "board WHERE current = 1") == 4
+    )
+    pairs = ledger.sql(
+        "SELECT pipeline, current, reference_current FROM head_to_head "
+        "WHERE reference_name = 'ridge_6m' AND metric = 'pnl'"
+    )
+    assert {(r["pipeline"], r["current"], r["reference_current"]) for r in pairs} == {
+        (old.id, 0, 1),
+        (new.id, 1, 1),
+    }
+    (row,) = ledger.sql(
+        "SELECT pipeline FROM pipeline_current WHERE evaluation = ? AND name = ?",
+        (evaluation.id, "ridge_1m"),
+    )
+    assert row["pipeline"] == new.id
+    _run(ledger, evaluation, old, new, synthetic.ridge(3))
+    rows = ledger.sql(
+        "SELECT pipeline, current FROM board WHERE name = 'ridge_1m' "
+        "AND metric = 'pnl' ORDER BY seq"
+    )
+    assert [(r["pipeline"], r["current"]) for r in rows] == [(old.id, 1), (new.id, 1)]
+    other = dataclasses.replace(
+        evaluation, scorer_params=synthetic.SimConfig(0.01), name="other"
+    )
+    _run(ledger, other, dataclasses.replace(new, name="alias"))
+    rows = ledger.sql(
+        "SELECT evaluation_name, name, current FROM board WHERE pipeline = ? "
+        "AND metric = 'pnl' ORDER BY seq",
+        (new.id,),
+    )
+    assert [(r["evaluation_name"], r["current"]) for r in rows] == [
+        ("", 1),
+        ("other", 1),
+    ]
+    _run(
+        ledger,
+        evaluation,
+        dataclasses.replace(new, name="renamed"),
+        synthetic.ridge(12),
+    )
+    assert (
+        _count(
+            ledger,
+            "score_latest WHERE pipeline = ? AND evaluation = ?",
+            new.id,
+            evaluation.id,
+        )
+        == 1
+    )
+    (row,) = ledger.sql(
+        "SELECT name, current FROM board WHERE pipeline = ? AND evaluation = ? "
+        "AND metric = 'pnl'",
+        (new.id, evaluation.id),
+    )
+    assert row["name"] == "renamed" and row["current"] == 1
+    (pair,) = ledger.sql(
+        "SELECT n_folds FROM head_to_head WHERE pipeline = ? AND reference_name = "
+        "'ridge_6m' AND evaluation = ? AND metric = 'pnl'",
+        (new.id, evaluation.id),
+    )
+    folds = len(evaluation.split.folds(load(ledger, evaluation.dataset_id)))
+    assert pair["n_folds"] == folds
