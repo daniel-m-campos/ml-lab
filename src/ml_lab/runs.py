@@ -46,7 +46,7 @@ from ml_lab.dataset import (
     rows_load,
     rows_save,
 )
-from ml_lab.experiment import Evaluation, Pipeline
+from ml_lab.experiment import Evaluation, Fitted, Pipeline
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.splits import Fold
 
@@ -465,6 +465,10 @@ class _Stage:
             *inputs,
         )
         duration = time.perf_counter() - started
+        facts = None
+        if isinstance(model, Fitted):
+            facts = _facts(self.name, model.facts)
+            model = model.model
         blob = self._model_blob(model)
         self.models[fit_id] = self.pipeline.load(self.ledger.get_blob(blob["sha"]))
         self._check_imports("fit", loaded)
@@ -485,6 +489,7 @@ class _Stage:
                 "model": blob,
                 **({"members": member_fits} if self.members else {}),
                 **({"features": columns_id} if columns_id else {}),
+                **({"facts": facts} if facts is not None else {}),
             },
         )
         self.report.fits_computed += 1
@@ -1481,6 +1486,30 @@ def _declare_evaluation(
         },
         id=identity.content_hash({"id": evaluation.id, "name": evaluation.name}),
     )
+
+
+def _facts(name: str, facts: Any) -> dict[str, Any]:
+    """A fit's facts as the log stores them: a dict of JSON values."""
+    if not isinstance(facts, dict):
+        raise Refused(
+            f"{name}: fit returned Fitted with facts of type "
+            f"{type(facts).__name__}; facts are a dict of JSON values"
+        )
+    try:
+        return json.loads(json.dumps(facts, default=_fact))
+    except (TypeError, ValueError, Refused) as error:
+        raise Refused(f"{name}: fit facts are not JSON values: {error}") from error
+
+
+def _fact(value: Any) -> Any:
+    """A fact as JSON: an array or numpy scalar by its values, else as a declaration
+    canonicalises it.
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return identity.canonical(value)
 
 
 def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by: str):

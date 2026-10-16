@@ -173,6 +173,20 @@ class Pipeline:
 
 
 @dataclasses.dataclass(frozen=True)
+class Fitted:
+    """What ``fit`` returns when it has facts to record beside the model: the round
+    count an inner validation chose, the best iteration, a learned threshold. The
+    model is saved and loaded as if returned alone; ``facts`` is a dict of JSON
+    values recorded with the fit and shown as ``event_fit.facts``, so a per-fold
+    choice reads with SQL instead of from the model bytes. Facts are provenance,
+    not identity: they enter no id.
+    """
+
+    model: Any
+    facts: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
 class Evaluation:
     """How every pipeline on a dataset is scored: a split into folds, a scorer and its
     params. ``dataset_id`` may be a prefix of the id, resolved at run as ``lab run
