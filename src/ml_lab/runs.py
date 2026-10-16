@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 from collections import Counter
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -307,6 +308,7 @@ class _Run:
     planned: set[str]
     features: dict[str, Features] = dataclasses.field(default_factory=dict)
     stages: dict[str, _Stage] = dataclasses.field(default_factory=dict)
+    prepared: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def stage(self, pipeline: Pipeline) -> _Stage:
         """The run's one stage per pipeline id, so a shared member fits once."""
@@ -451,6 +453,8 @@ class _Stage:
         split = self.evaluation.split
         visible.embargo_timestamps = getattr(split, "embargo_timestamps", 0)
         visible.embargo_rows = getattr(split, "embargo_rows", 0)
+        if self.pipeline.prepare is not None:
+            visible.prepared = self._prepare(visible, fold, columns_id)
         inputs = (
             [
                 [
@@ -645,6 +649,37 @@ class _Stage:
             )
             self.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
         return pred_id
+
+    def _prepare(self, visible: Dataset, fold: Fold, columns_id: str | None) -> Any:
+        """What ``prepare`` builds for the fold's train range, once per run across
+        every pipeline declaring the same function, code, environment, dataset,
+        feature columns and train segments.
+        """
+        prepare = self.pipeline.prepare
+        if not hasattr(self, "prepare_key"):
+            self.prepare_key = {
+                "prepare": prepare,
+                "code_keys": identity.code_keys((prepare,), self.root),
+                "env_lock": identity.bytes_hash(
+                    _lock_text(identity.imported_dists((prepare,), self.root)).encode()
+                ),
+            }
+        key = identity.content_hash(
+            {
+                **self.prepare_key,
+                "dataset": self.evaluation.dataset_id,
+                "train": [list(seg) for seg in fold.train],
+                **({"features": columns_id} if columns_id else {}),
+            }
+        )
+        if key not in self.prepared:
+            started = time.perf_counter()
+            self.prepared[key] = _frozen(
+                _noted(f"prepare on fold {fold.label}", prepare, visible, fold.train)
+            )
+            duration = time.perf_counter() - started
+            self.log(f"prepare {self.name} {fold.label} {duration:.1f}s")
+        return self.prepared[key]
 
     def _record_fit(
         self, fit_id: str, fold: Fold, loaded: np.ndarray, predict: Callable
@@ -1537,6 +1572,41 @@ def _fact(value: Any) -> Any:
     return identity.canonical(value)
 
 
+def _frozen(prepared: Any, seen: set[int] | None = None, depth: int = 0) -> Any:
+    """A prepared object with every numpy array it holds, at any depth of dicts,
+    lists, tuples, sets, dataclasses and objects with a ``__dict__``, made
+    read-only, so a fit that writes into shared work raises instead of changing
+    what the next fit sees. An object that holds its arrays elsewhere (slots, C
+    state), a module or a class is handed over as it is, and nothing below
+    ``FREEZE_DEPTH`` levels is walked; the author keeps those read-only.
+    """
+    seen = set() if seen is None else seen
+    if id(prepared) in seen or depth > FREEZE_DEPTH:
+        return prepared
+    seen.add(id(prepared))
+    if isinstance(prepared, np.ndarray):
+        prepared.flags.writeable = False
+        return prepared
+    if isinstance(prepared, (types.ModuleType, type)):
+        return prepared
+    if isinstance(prepared, dict):
+        values = list(prepared.values())
+    elif isinstance(prepared, (list, tuple, set, frozenset)):
+        values = list(prepared)
+    elif dataclasses.is_dataclass(prepared) and not isinstance(prepared, type):
+        values = [getattr(prepared, f.name) for f in dataclasses.fields(prepared)]
+    elif hasattr(prepared, "__dict__") and not callable(prepared):
+        values = list(vars(prepared).values())
+    else:
+        return prepared
+    for value in values:
+        _frozen(value, seen, depth + 1)
+    return prepared
+
+
+FREEZE_DEPTH = 32
+
+
 def _project_root(pipelines: list[Pipeline]) -> pathlib.Path:
     """The git root of the first declared function outside this package, so a
     blend the tool ships (``mean_blend``) listed first does not make the tool's own
@@ -1566,6 +1636,11 @@ def _refuse_half_declared(p: Pipeline, name: str):
             raise Refused(
                 f"pipeline {label}: a stateless blend has no model, so no save, load "
                 "or format"
+            )
+        if p.params is not None or p.prepare is not None:
+            raise Refused(
+                f"pipeline {label}: a stateless blend has no fit to read params or "
+                "a prepare step; settings for its predict go in predict_config"
             )
         return
     if p.save is None or p.load is None:
@@ -1619,7 +1694,9 @@ def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
     return {
         "features": pipeline.feature_functions,
         "fit": tuple(
-            f for f in (pipeline.fit, pipeline.save, pipeline.load) if f is not None
+            f
+            for f in (pipeline.prepare, pipeline.fit, pipeline.save, pipeline.load)
+            if f is not None
         )
         + tuple(_held(pipeline.params)),
         "predict": (pipeline.predict, *_held(pipeline.predict_config)),
@@ -1649,7 +1726,7 @@ def _positional(func: Callable) -> int:
 
 UNTRACKED_DIFF_CAP = 1 << 20
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-_SLOTS = ("fit", "predict", "save", "load", "postprocess")
+_SLOTS = ("prepare", "fit", "predict", "save", "load", "postprocess")
 
 
 def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
