@@ -82,7 +82,8 @@ class WalkForward:
 @dataclasses.dataclass(frozen=True)
 class CalendarWalkForward:
     """Cutoffs on the dataset clock every ``step`` units, a unit being a calendar month
-    or a day the clock has rows on; train on everything before each cutoff minus
+    or a day the clock has rows on; train on everything before each cutoff, or with
+    ``train_units`` on the last that many units before it, a rolling window, minus
     ``embargo_timestamps`` distinct timestamps, which cuts the train side, and score the
     ``horizon``-th run of ``test_units`` units after it, so ``horizon=1`` scores the
     ``test_units`` units right after the cutoff. A validation range ends on a unit
@@ -100,6 +101,7 @@ class CalendarWalkForward:
     embargo_timestamps: int = 0
     end: str | None = None
     min_folds: int = 3
+    train_units: int | None = None
 
     def folds(self, dataset: Dataset) -> list[Fold]:
         _require(
@@ -107,6 +109,7 @@ class CalendarWalkForward:
             test_units=(self.test_units, 1),
             embargo_timestamps=(self.embargo_timestamps, 0),
             horizon=(self.horizon, 1),
+            train_units=(1 if self.train_units is None else self.train_units, 1),
         )
         stop = dates.as_date(self.end) if self.end else dates.span(dataset)[1]
         at = self._boundaries(dataset, stop)
@@ -121,7 +124,8 @@ class CalendarWalkForward:
                 dataset.index_of(at[c + reach - self.test_units]),
                 dataset.index_of(at[c + reach]),
             )
-            out.append(Fold(str(at[c]), ((0, cut),), test))
+            start = 0 if self.train_units is None else self._window(dataset, at[c])
+            out.append(Fold(str(at[c]), ((start, cut),), test))
         why = (
             f"{max(len(at) - 1, 0)} {self.unit}s from the first cutoff "
             f"{self.first_cutoff} to {stop}, {reach} needed per fold"
@@ -133,6 +137,16 @@ class CalendarWalkForward:
                 "a validation range that runs to the data's end, or use unit='day'"
             )
         return _at_least(out, self.min_folds, why)
+
+    def _window(self, dataset: Dataset, cutoff: datetime.date) -> int:
+        """The first row of the rolling window: ``train_units`` units before the
+        cutoff, months by the calendar, days by the clock's days with rows.
+        """
+        if self.unit == "month":
+            return dataset.index_of(dates.add_months(cutoff, -self.train_units))
+        days = np.unique(dataset._clock().astype("datetime64[D]")).astype(datetime.date)
+        at = int(np.searchsorted(days, cutoff))
+        return dataset.index_of(days[max(at - self.train_units, 0)])
 
     def _boundaries(self, dataset: Dataset, stop: datetime.date) -> list[datetime.date]:
         """Unit boundaries from the first cutoff to ``stop`` inclusive."""
@@ -256,7 +270,10 @@ def _at_least(folds: list[Fold], minimum: int, why: str = "") -> list[Fold]:
         )
     bare = [f.label for f in folds if all(lo >= hi for lo, hi in f.train)]
     if bare:
-        raise Refused(f"split yields folds with no train rows: {bare}; start later")
+        raise Refused(
+            f"split yields folds with no train rows: {bare}; start later, or with a "
+            "rolling window make it longer than the embargo"
+        )
     twice = sorted(
         {f.label for f in folds if [g.label for g in folds].count(f.label) > 1}
     )

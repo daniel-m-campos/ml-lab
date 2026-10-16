@@ -881,6 +881,28 @@ def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
     assert gaps == [2] * len(folds) and len(folds) == 4
 
 
+def test_a_calendar_split_rolls_a_train_window_of_whole_units():
+    d = np.arange(np.datetime64("2021-01-04"), np.datetime64("2022-06-25"))
+    d = d[np.is_busday(d)]
+    dataset = Dataset({"x": np.arange(d.size, dtype=float)}, d)
+    growing = splits.CalendarWalkForward("2021-06-01", end="2022-01-01")
+    rolling = dataclasses.replace(growing, train_units=3)
+    folds = rolling.folds(dataset)
+    assert [f.test for f in folds] == [f.test for f in growing.folds(dataset)]
+    for fold in folds:
+        cutoff = ml_lab.dates.as_date(fold.label)
+        start, end = fold.train[0]
+        assert start == dataset.index_of(ml_lab.dates.add_months(cutoff, -3))
+        assert end == dataset.index_of(cutoff)
+    days = splits.CalendarWalkForward("2021-06-01", unit="day", train_units=5)
+    for fold in days.folds(dataset)[:3]:
+        start, end = fold.train[0]
+        assert end - start == 5
+    assert rolling != growing and rolling.train_units == 3
+    with pytest.raises(Refused, match="train_units"):
+        dataclasses.replace(growing, train_units=0).folds(dataset)
+
+
 def test_a_month_split_that_drops_the_tail_says_how_to_score_it(ledger, dataset):
     data = load(ledger, dataset)
     split = splits.CalendarWalkForward(first_cutoff="2025-11-01", horizon=2)
