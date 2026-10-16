@@ -139,6 +139,7 @@ CREATE VIEW event_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.range[1]') AS range_end,
   json_extract(payload,'$.fold') AS fold,
   json_extract(payload,'$.blob.sha') AS blob, json_extract(payload,'$.raw') AS raw,
+  json_extract(payload,'$.predict_config') AS predict_config,
   json_extract(payload,'$.postprocess') AS postprocess
 FROM event WHERE type='predictions_computed';
 

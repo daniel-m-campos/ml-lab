@@ -88,12 +88,16 @@ class Pipeline:
     and costs only the columns it keeps. Their order is part of a fit's identity and
     of what the model sees (a booster samples and constrains features by position),
     so a reordering refits and may change results. ``fit(dataset, train, params)``
-    receives ``params``, ``predict(model, dataset, rows)`` the fold's test range.
+    receives ``params``, ``predict(model, dataset, rows)`` the fold's test range,
+    and with a ``predict_config`` (a rule baseline's feature and sign, a seeded random
+    baseline's seed) ``predict`` receives it as its last positional argument; it
+    enters the raw prediction's identity and not the fit's, so variants share fits.
     ``postprocess(predictions, dataset, rows, postprocess_config)`` is the cheap
     stateless stage after ``predict``: neutralise, clip, rank. ``postprocess_config``
     enters the prediction's identity and not the fit's. A pipeline with ``members`` is a
     blend: its ``predict`` takes a fourth argument, the members' predictions over the
-    test range as a list of arrays, and a ``fit`` with four positional parameters
+    test range as a list of arrays (a ``predict_config`` follows as the fifth), and a
+    ``fit`` with four positional parameters
     receives the members' predictions over the train segments as its fourth. Those are
     in-sample, so a weight learned on them overfits; a blend with fixed weights takes
     three and computes no train-segment predictions. A blend without its own
@@ -104,8 +108,9 @@ class Pipeline:
     postprocess_config=Clip(at=3.0), name="gbt_clip")`` shares every fit and raw
     prediction with ``p``, since the fit id reads ``fit_declaration`` and the raw
     prediction id excludes ``postprocess``. A params class must live in a module its
-    function imports (``params`` beside ``fit``, ``postprocess_config`` beside
-    ``postprocess``), so an edited default is caught by the memo.
+    function imports (``params`` beside ``fit``, ``predict_config`` beside
+    ``predict``, ``postprocess_config`` beside ``postprocess``), so an edited default
+    is caught by the memo.
     """
 
     fit: Callable
@@ -117,6 +122,7 @@ class Pipeline:
     features: Callable | tuple[Callable, ...] | None = None
     postprocess: Callable | None = None
     postprocess_config: Any = None
+    predict_config: Any = None
     members: tuple[Pipeline, ...] = ()
     name: str = dataclasses.field(default="", metadata={"label": True})
 

@@ -191,6 +191,8 @@ def run(
         for p in _nested(pipeline):
             shas = identity.import_shas((p.fit, p.save, p.load), root)
             _refuse_unseen_class(p.params, shas, root, "fit")
+            shas = identity.import_shas((p.predict,), root)
+            _refuse_unseen_class(p.predict_config, shas, root, "predict")
             if p.postprocess is not None:
                 shas = identity.import_shas((p.postprocess,), root)
                 _refuse_unseen_class(p.postprocess_config, shas, root, "postprocess")
@@ -514,6 +516,11 @@ class _Stage:
                 "code_keys": self.stage_keys["predict"],
                 "env_lock": identity.bytes_hash(self.locks["predict"].encode()),
                 **({"members": member_preds} if self.members else {}),
+                **(
+                    {"predict_config": self.pipeline.predict_config}
+                    if self.pipeline.predict_config is not None
+                    else {}
+                ),
             }
         )
         pred_id = raw_id
@@ -540,11 +547,17 @@ class _Stage:
             self.report.predictions_computed += 1 + (raw_missing and raw_id != pred_id)
             self.planned.update((raw_id, pred_id))
             return pred_id
+        config = self.pipeline.predict_config
         where: dict[str, Any] = {
             "fit": fit_id,
             "range": list(rows),
             "fold": index,
             **({"members": member_preds} if self.members else {}),
+            **(
+                {"predict_config": identity.canonical(config)}
+                if config is not None
+                else {}
+            ),
         }
         visible = self._visible(rows[1])
         if train:
@@ -559,6 +572,8 @@ class _Stage:
             def predict(model: Any, view: Dataset, part: Range) -> np.ndarray:
                 head = part[1] - rows[0]
                 extra = [[a[:head] for a in inputs]] if self.members else []
+                if config is not None:
+                    extra.append(config)
                 return np.asarray(
                     _noted(
                         f"predict on fold {fold.label}",
@@ -1560,7 +1575,7 @@ def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
             pipeline.load,
             *_held(pipeline.params),
         ),
-        "predict": (pipeline.predict,),
+        "predict": (pipeline.predict, *_held(pipeline.predict_config)),
         "postprocess": (post, *_held(pipeline.postprocess_config)) if post else (),
     }
 
