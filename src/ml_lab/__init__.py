@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ml_lab.analytics import paired
+from ml_lab.analytics import paired, paired_sets
 from ml_lab.dataset import Dataset, Range, Segments, load, record
 from ml_lab.experiment import Evaluation, Pipeline, Scorer
 from ml_lab.ledger import Ledger
@@ -20,5 +20,6 @@ __all__ = [
     "Segments",
     "load",
     "paired",
+    "paired_sets",
     "record",
 ]
