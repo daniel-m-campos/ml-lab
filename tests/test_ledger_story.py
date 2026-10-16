@@ -3662,3 +3662,34 @@ def test_a_fit_records_its_facts_beside_the_model(ledger, evaluation):
     bad = dataclasses.replace(plain, fit=synthetic.bad_facts_fit, name="bad_facts")
     report = _run(ledger, evaluation, bad)
     assert "facts are not JSON values" in report.failed["bad_facts"]
+
+
+def test_a_predict_config_enters_the_prediction_id_and_shares_the_fit(
+    ledger, evaluation
+):
+    base = synthetic.ridge(1)
+    plus = dataclasses.replace(
+        base,
+        predict=synthetic.sign_predict,
+        predict_config=synthetic.SignConfig("f0", 1.0),
+        name="sign_f0",
+    )
+    minus = dataclasses.replace(
+        plus, predict_config=synthetic.SignConfig("f0", -1.0), name="sign_f0_neg"
+    )
+    assert len({base.id, plus.id, minus.id}) == 3
+    first = _run(ledger, evaluation, base, plus)
+    second = _run(ledger, evaluation, minus)
+    folds = len(evaluation.split.folds(load(ledger, evaluation.dataset_id)))
+    assert first.fits_computed == folds and second.fits_computed == 0
+    assert second.fits_reused == folds and second.predictions_computed == folds
+    rows = ledger.sql(
+        "SELECT id, fit, predict_config FROM event_prediction "
+        "WHERE predict_config IS NOT NULL ORDER BY seq"
+    )
+    assert len(rows) == 2 * folds
+    configs = {json.loads(r["predict_config"]).get("sign", 1.0) for r in rows}
+    assert configs == {1.0, -1.0}
+    up, down = (_load_predictions(ledger, r["id"]) for r in (rows[0], rows[folds]))
+    assert rows[0]["fit"] == rows[folds]["fit"] and np.array_equal(up, -down)
+    assert set(np.unique(up)) <= {-1.0, 0.0, 1.0}

@@ -178,6 +178,19 @@ def scale(pred: np.ndarray, dataset: Dataset, rows: Range, factor: float) -> np.
 
 
 @dataclasses.dataclass(frozen=True)
+class SignConfig:
+    feature: str = "f0"
+    sign: float = 1.0
+
+
+def sign_predict(
+    model: RidgeModel, dataset: Dataset, rows: Range, config: SignConfig
+) -> np.ndarray:
+    """A rule baseline: the sign of one feature, set by its predict config."""
+    return config.sign * np.sign(dataset.column(config.feature, rows))
+
+
+@dataclasses.dataclass(frozen=True)
 class BlendConfig:
     shrink: float = 0.0
 
