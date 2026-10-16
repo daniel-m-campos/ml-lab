@@ -111,6 +111,17 @@ class Pipeline:
     declares the same functions. The members' fits and predictions are memoized on
     their own.
 
+    ``prepare(dataset, train) -> object`` is the fit-time preprocessing pipelines
+    share: a binned booster dataset, an encoded matrix, built once per train range,
+    feature columns and prepare code within a run and handed to every ``fit`` that
+    declares it as ``dataset.prepared``, so pipelines that differ in params pay for
+    it once. It has fold scope like ``fit``, enters the fit id with ``fit``'s code,
+    and is not recorded: a run rebuilds it. One object is shared by every fit in the
+    run, so it is read-only: the arrays it holds are frozen, a write raises, and an
+    opaque object must not be changed by ``fit``, or the fit recorded under one id
+    would depend on which pipelines ran beside it. A run holds one per train range
+    until it ends.
+
     Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip,
     postprocess_config=Clip(at=3.0), name="gbt_clip")`` shares every fit and raw
     prediction with ``p``, since the fit id reads ``fit_declaration`` and the raw
@@ -130,6 +141,7 @@ class Pipeline:
     postprocess: Callable | None = None
     postprocess_config: Any = None
     predict_config: Any = None
+    prepare: Callable | None = None
     members: tuple[Pipeline, ...] = ()
     name: str = dataclasses.field(default="", metadata={"label": True})
 
@@ -153,6 +165,7 @@ class Pipeline:
     def functions(self) -> tuple[Callable, ...]:
         stages = (
             *self.feature_functions,
+            self.prepare,
             self.fit,
             self.predict,
             self.save,
@@ -173,6 +186,7 @@ class Pipeline:
             "load": self.load,
             "format": self.format,
             "params": self.params,
+            **({"prepare": self.prepare} if self.prepare is not None else {}),
         }
 
     def with_params(self, **changes: Any) -> Pipeline:

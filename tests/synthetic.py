@@ -142,6 +142,27 @@ def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeMo
     return ridge_fit(dataset, train, config)
 
 
+PREPARE_CALLS: list[tuple[int, int]] = []
+
+
+def centred_prepare(dataset: Dataset, train: Segments) -> dict[str, np.ndarray]:
+    """The train matrix and target, centred: what a binning step would build."""
+    PREPARE_CALLS.append(train[-1])
+    x = dataset.matrix(FEATURES, train)
+    y = dataset.column(TARGET, train)
+    return {"x": x - x.mean(axis=0), "y": y - y.mean(), "x_mean": x.mean(axis=0)}
+
+
+def prepared_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+    """Ridge on the prepared matrix, so two alphas share the preparation."""
+    p = dataset.prepared
+    weights = np.linalg.solve(
+        p["x"].T @ p["x"] + config.alpha * np.eye(p["x"].shape[1]), p["x"].T @ p["y"]
+    )
+    y_mean = dataset.column(TARGET, train).mean()
+    return RidgeModel(weights, float(y_mean - p["x_mean"] @ weights))
+
+
 def lagged_mean_predict(
     model: None, dataset: Dataset, rows: Range, members: list[np.ndarray]
 ) -> np.ndarray:
@@ -152,6 +173,30 @@ def lagged_mean_predict(
 
 def lagged_f1_as_f0(dataset: Dataset) -> dict[str, np.ndarray]:
     return {"f0_lag": np.concatenate([[np.nan], dataset.columns["f1"][:-1]])}
+
+
+@dataclasses.dataclass(frozen=True)
+class Prepared:
+    x: np.ndarray
+    y: np.ndarray
+
+
+def dataclass_prepare(dataset: Dataset, train: Segments) -> Prepared:
+    p = centred_prepare(dataset, train)
+    return Prepared(p["x"], p["y"])
+
+
+def dataclass_mutating_fit(
+    dataset: Dataset, train: Segments, config: RidgeConfig
+) -> RidgeModel:
+    dataset.prepared.x[:] = 0.0
+    return ridge_fit(dataset, train, config)
+
+
+def mutating_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+    """Writes into the shared prepared matrix: refused by the frozen array."""
+    dataset.prepared["x"][:] = 0.0
+    return prepared_fit(dataset, train, config)
 
 
 def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:

@@ -3826,6 +3826,12 @@ def test_a_stateless_blend_records_no_fit_and_averages_its_members(
         _run(ledger, evaluation, dataclasses.replace(one, save=None))
     with pytest.raises(Refused, match="at least two members"):
         ml_lab.mean_blend(one)
+    with pytest.raises(Refused, match="no fit to read params"):
+        _run(
+            ledger,
+            evaluation,
+            dataclasses.replace(mean, params=synthetic.BlendConfig()),
+        )
     featured = dataclasses.replace(
         mean,
         predict=synthetic.lagged_mean_predict,
@@ -3870,3 +3876,68 @@ def test_a_note_records_text_about_ids_the_log_holds(
         ml_lab.note(ledger, "x", tag="Decision")
     assert cli.main(["--root", str(ledger.root / "nope"), "note", "x"]) == 1
     assert "no ledger at" in capsys.readouterr().err
+
+
+def test_a_prepare_step_is_built_once_per_train_range_and_shared(
+    ledger, dataset, evaluation
+):
+    plain = dataclasses.replace(synthetic.ridge(0), name="plain")
+    a = dataclasses.replace(
+        plain,
+        prepare=synthetic.centred_prepare,
+        fit=synthetic.prepared_fit,
+        name="prep_a",
+    )
+    b = dataclasses.replace(a, params=synthetic.RidgeConfig(0, 10.0), name="prep_b")
+    assert len({plain.id, a.id, b.id}) == 3
+    folds = len(evaluation.split.folds(load(ledger, dataset)))
+    synthetic.PREPARE_CALLS.clear()
+    assert not _run(ledger, evaluation, a, b, dry=True).failed
+    assert not synthetic.PREPARE_CALLS
+    report = _run(ledger, evaluation, plain, a, b)
+    assert not report.failed and report.fits_computed == 3 * folds
+    assert len(synthetic.PREPARE_CALLS) == folds
+    fits = {
+        r["pipeline"]: r["id"]
+        for r in ledger.sql(
+            "SELECT pipeline, id FROM event_fit WHERE label = ?", ("2025-05-01",)
+        )
+    }
+    assert len({fits[plain.id], fits[a.id], fits[b.id]}) == 3
+    preds = {
+        r["pipeline"]: _load_predictions(ledger, r["id"])
+        for r in ledger.sql(
+            "SELECT f.pipeline, p.id FROM event_prediction p JOIN event_fit f "
+            "ON f.id = p.fit WHERE p.fold = 0"
+        )
+    }
+    assert np.allclose(preds[plain.id], preds[a.id])
+    assert not np.allclose(preds[plain.id], preds[b.id])
+    again = _run(ledger, evaluation, a, b)
+    assert again.fits_reused == 2 * folds and len(synthetic.PREPARE_CALLS) == folds
+    with pytest.raises(Refused, match="module-level function"):
+        _run(ledger, evaluation, dataclasses.replace(a, prepare=lambda d, t: None))
+    mut = dataclasses.replace(a, fit=synthetic.mutating_fit, name="mut")
+    c = dataclasses.replace(a, params=synthetic.RidgeConfig(0, 0.5), name="prep_c")
+    report = _run(ledger, evaluation, mut, c)
+    assert "read-only" in report.failed["mut"] and report.scores_recorded == 1
+    dc = dataclasses.replace(
+        a,
+        prepare=synthetic.dataclass_prepare,
+        fit=synthetic.dataclass_mutating_fit,
+        name="dc",
+    )
+    assert "read-only" in _run(ledger, evaluation, dc).failed["dc"]
+    held = runs._frozen({"m": synthetic, "t": synthetic.Prepared, "a": np.ones(2)})
+    assert synthetic.FEATURE_CALLS is not None and not held["a"].flags.writeable
+    deep: list = []
+    node = deep
+    for _ in range(200):
+        node.append([])
+        node = node[0]
+    assert runs._frozen(deep) is deep
+    (row,) = ledger.sql(
+        "SELECT model FROM event_fit WHERE pipeline = ? AND label = ?",
+        (c.id, "2025-05-01"),
+    )
+    assert synthetic.ridge_load(ledger.get_blob(row["model"])).weights.any()

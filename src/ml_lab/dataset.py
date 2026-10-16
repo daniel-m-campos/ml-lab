@@ -48,7 +48,8 @@ class Dataset:
     ``stores`` through ``column`` and ``matrix``, so a column no function names costs
     no memory. ``reveal`` holds the targets' reveal lags and ``embargo_timestamps``
     and ``embargo_rows`` the evaluation's embargo on the view a fit receives, so
-    ``splits.inner_split`` purges what the evaluation would.
+    ``splits.inner_split`` purges what the evaluation would, and ``prepared`` what the
+    pipeline's ``prepare`` built for its train range.
     """
 
     def __init__(
@@ -69,6 +70,7 @@ class Dataset:
         self.reveal: dict[str, Lag] = {}
         self.embargo_timestamps = 0
         self.embargo_rows = 0
+        self.prepared: Any = None
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.isnat(self.ts).any():
             raise ValueError("timestamps must not contain NaT")
@@ -109,6 +111,7 @@ class Dataset:
         view.reveal = self.reveal
         view.embargo_timestamps = self.embargo_timestamps
         view.embargo_rows = self.embargo_rows
+        view.prepared = self.prepared
         return view
 
     def masked(self, reveal: dict[str, Lag], at: int) -> Dataset:
