@@ -2775,6 +2775,59 @@ def test_paired_sums_the_row_differences_of_two_scores(ledger, dataset, evaluati
         ml_lab.paired(ledger, a, other, "pnl")
 
 
+def test_paired_pairs_a_refit_cadence_twin_over_the_same_rows(
+    ledger, dataset, evaluation
+):
+    house = dataclasses.replace(
+        evaluation,
+        split=dataclasses.replace(evaluation.split, step=2, test_units=2),
+        name="house",
+    )
+    _run(ledger, house, synthetic.ridge(1), synthetic.ridge(6))
+    _run(ledger, evaluation, synthetic.ridge(1))
+    data = load(ledger, dataset)
+    assert [f.test for f in house.split.folds(data)] != [
+        f.test for f in evaluation.split.folds(data)
+    ]
+    slow, fast = _latest(ledger, house)["ridge_1m"], _latest(ledger, evaluation)
+    result = ml_lab.paired(ledger, slow, fast["ridge_1m"], "pnl")
+    assert result.n == data.rows - data.index_of("2025-05-01")
+    assert len(result.fold_deltas) == len(house.split.folds(data))
+    assert np.isclose(sum(result.fold_deltas), result.pooled_delta)
+    same = ml_lab.paired(ledger, slow, _latest(ledger, house)["ridge_6m"], "pnl")
+    (row,) = ledger.sql(
+        "SELECT delta FROM pair_fold WHERE score = ? AND reference_score = ? "
+        "AND metric = 'pnl' AND fold = 0",
+        (slow, _latest(ledger, house)["ridge_6m"]),
+    )
+    assert np.isclose(same.fold_deltas[0], row["delta"])
+    overlapping = dataclasses.replace(
+        evaluation,
+        split=dataclasses.replace(evaluation.split, step=1, test_units=2),
+        name="overlapping",
+    )
+    _run(ledger, overlapping, synthetic.ridge(1), synthetic.ridge(6))
+    both = _latest(ledger, overlapping)
+    paired = ml_lab.paired(ledger, both["ridge_1m"], both["ridge_6m"], "pnl")
+    assert paired.n > data.rows - data.index_of("2025-05-01")
+    with pytest.raises(Refused, match="not in row order"):
+        ml_lab.paired(ledger, both["ridge_1m"], slow, "pnl")
+    sweep = dataclasses.replace(
+        overlapping, scorer_params=synthetic.SimConfig(0.01), name="sweep"
+    )
+    _run(ledger, sweep, synthetic.ridge(1))
+    swept = ml_lab.paired(
+        ledger, both["ridge_1m"], _latest(ledger, sweep)["ridge_1m"], "pnl"
+    )
+    assert swept.n == paired.n
+    elsewhere = synthetic.evaluation(synthetic.dataset(ledger, seed=8))
+    _run(ledger, elsewhere, synthetic.ridge(1))
+    with pytest.raises(Refused, match="different datasets"):
+        ml_lab.paired(
+            ledger, fast["ridge_1m"], _latest(ledger, elsewhere)["ridge_1m"], "pnl"
+        )
+
+
 def test_head_to_head_is_the_fold_by_fold_difference_and_the_series_is_named(
     ledger, evaluation
 ):
