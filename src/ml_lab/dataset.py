@@ -24,7 +24,7 @@ import datetime
 import io
 import pathlib
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -92,7 +92,10 @@ class Dataset:
         the full dataset stay valid, and nothing after ``row`` can be read.
         """
         view = Dataset.__new__(Dataset)
-        view.columns = {k: v[:row] for k, v in self.columns.items()}
+        if isinstance(self.columns, _Blanked):
+            view.columns = self.columns.upto(row)
+        else:
+            view.columns = {k: v[:row] for k, v in self.columns.items()}
         view.ts = None if self.ts is None else self.ts[:row]
         view.computed_columns = self.computed_columns
         view.stores = self.stores
@@ -125,11 +128,13 @@ class Dataset:
     def train_view(self, train: Segments) -> Dataset:
         """The view a fit sees: every column, computed columns included, blank outside
         ``train``, so a fit reads no row of a range it is scored on. A blank is NaN, NaT
-        or None by dtype; an integer or boolean column becomes float.
+        or None by dtype; an integer or boolean column becomes float. A column is
+        copied when first read, so a fit that reads ten columns of two hundred pays
+        for ten.
         """
         view = self.upto(self.rows)
         view.keep = row_mask(self.rows, train)
-        view.columns = {n: _blank(a, view.keep) for n, a in view.columns.items()}
+        view.columns = _Blanked(view.columns, view.keep)
         return view
 
     def boundary(self, row: int, lo: int = 0) -> int | None:
@@ -245,6 +250,49 @@ def stratified_order(y: np.ndarray, seed: int = 0) -> np.ndarray:
     rank = np.empty(len(owner))
     rank[by_class] = np.arange(len(owner)) - np.searchsorted(grouped, grouped)
     return shuffled[np.lexsort((owner, rank / np.bincount(owner)[owner]))]
+
+
+class _Blanked(MutableMapping):
+    """A train view's columns: each is the source column blank outside ``keep``,
+    copied on its first read and kept, so a fit pays only for the columns it names.
+    ``upto`` is a further view, still unread, so a probe's shorter prefix copies
+    nothing either.
+    """
+
+    def __init__(self, source: Mapping[str, np.ndarray], keep: np.ndarray):
+        self._source = source
+        self._keep = keep
+        self._read: dict[str, np.ndarray] = {}
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        if name not in self._read:
+            self._read[name] = _blank(self._source[name], self._keep)
+        return self._read[name]
+
+    def __setitem__(self, name: str, values: np.ndarray):
+        self._read[name] = values
+
+    def __delitem__(self, name: str):
+        raise TypeError("a train view's columns cannot be removed")
+
+    def __iter__(self) -> Iterator[str]:
+        added = [n for n in self._read if n not in self._source]
+        return iter([*self._source, *added])
+
+    def __len__(self) -> int:
+        return len(self._source) + sum(n not in self._source for n in self._read)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._source or name in self._read
+
+    def upto(self, row: int) -> _Blanked:
+        if isinstance(self._source, _Blanked):
+            source = self._source.upto(row)
+        else:
+            source = {n: a[:row] for n, a in self._source.items()}
+        view = _Blanked(source, self._keep[:row])
+        view._read = {n: a[:row] for n, a in self._read.items()}
+        return view
 
 
 def _blank(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
