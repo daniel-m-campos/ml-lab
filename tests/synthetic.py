@@ -11,7 +11,7 @@ import numpy as np
 from ml_lab import formats
 from ml_lab.dataset import Dataset, Range, Segments, record
 from ml_lab.dates import add_months, as_date
-from ml_lab.experiment import Evaluation, Pipeline, Scorer
+from ml_lab.experiment import Evaluation, Fitted, Pipeline, Scorer
 from ml_lab.ledger import Ledger
 from ml_lab.splits import CalendarWalkForward
 
@@ -140,6 +140,26 @@ def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeMo
     if len(FLAKY_CALLS) == 3:
         raise RuntimeError("boom at the third fit")
     return ridge_fit(dataset, train, config)
+
+
+def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+    """Ridge with facts beside the model: what an inner choice would record."""
+    model = ridge_fit(dataset, train, config)
+    rows = sum(hi - lo for lo, hi in train)
+    return Fitted(
+        model,
+        {
+            "rows": rows,
+            "bias": model.bias,
+            "chosen": "ridge",
+            "weights": model.weights,
+            "n": np.int64(rows),
+        },
+    )
+
+
+def bad_facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+    return Fitted(ridge_fit(dataset, train, config), {"when": object()})
 
 
 def ridge_save(model: RidgeModel) -> bytes:

@@ -459,6 +459,7 @@ def test_the_package_exports_what_a_project_imports():
     assert sorted(ml_lab.__all__) == [
         "Dataset",
         "Evaluation",
+        "Fitted",
         "Fold",
         "Ledger",
         "Pipeline",
@@ -3632,3 +3633,32 @@ def test_current_marks_the_id_the_newest_run_declared_under_a_name(ledger, evalu
     )
     folds = len(evaluation.split.folds(load(ledger, evaluation.dataset_id)))
     assert pair["n_folds"] == folds
+
+
+def test_a_fit_records_its_facts_beside_the_model(ledger, evaluation):
+    plain = synthetic.ridge(1)
+    facts = dataclasses.replace(plain, fit=synthetic.facts_fit, name="facts")
+    _run(ledger, evaluation, plain, facts)
+    rows = ledger.sql(
+        "SELECT train, facts, model FROM event_fit WHERE pipeline = ? ORDER BY seq",
+        (facts.id,),
+    )
+    for row in rows:
+        recorded = json.loads(row["facts"])
+        train = json.loads(row["train"])
+        assert recorded["rows"] == sum(hi - lo for lo, hi in train)
+        assert recorded["chosen"] == "ridge" and isinstance(recorded["bias"], float)
+        assert len(recorded["weights"]) == 3 and recorded["n"] == recorded["rows"]
+        assert (
+            synthetic.ridge_load(ledger.get_blob(row["model"])).bias == recorded["bias"]
+        )
+    assert all(
+        r["facts"] is None
+        for r in ledger.sql(
+            "SELECT facts FROM event_fit WHERE pipeline = ?", (plain.id,)
+        )
+    )
+    assert _latest(ledger, evaluation).keys() == {"ridge_1m", "facts"}
+    bad = dataclasses.replace(plain, fit=synthetic.bad_facts_fit, name="bad_facts")
+    report = _run(ledger, evaluation, bad)
+    assert "facts are not JSON values" in report.failed["bad_facts"]

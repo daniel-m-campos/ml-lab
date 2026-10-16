@@ -129,7 +129,8 @@ CREATE VIEW event_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.model.sha') AS model,
   json_extract(payload,'$.model.format') AS format,
   json_extract(payload,'$.model.portable') AS portable,
-  json_extract(payload,'$.duration_s') AS duration_s
+  json_extract(payload,'$.duration_s') AS duration_s,
+  json_extract(payload,'$.facts') AS facts
 FROM event WHERE type='fit_computed';
 
 CREATE VIEW event_prediction AS SELECT seq, id, at, stream AS dataset,
