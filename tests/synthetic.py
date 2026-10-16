@@ -142,6 +142,18 @@ def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeMo
     return ridge_fit(dataset, train, config)
 
 
+def lagged_mean_predict(
+    model: None, dataset: Dataset, rows: Range, members: list[np.ndarray]
+) -> np.ndarray:
+    """A stateless blend that also reads its own computed column."""
+    lag = np.nan_to_num(dataset.column("f0_lag", rows))
+    return np.mean(np.stack(members, axis=0), axis=0) + 0.01 * lag
+
+
+def lagged_f1_as_f0(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.concatenate([[np.nan], dataset.columns["f1"][:-1]])}
+
+
 def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
     """Ridge with facts beside the model: what an inner choice would record."""
     model = ridge_fit(dataset, train, config)

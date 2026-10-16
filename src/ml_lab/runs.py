@@ -165,14 +165,9 @@ def run(
                         f"pipeline {p.name or name}: {slot} holds a "
                         f"{type(held).__name__}, not a function"
                     )
-        if pipeline.format not in formats.KNOWN:
-            raise Refused(
-                f"pipeline {name}: format {pipeline.format!r}, not one of "
-                f"{sorted(formats.KNOWN)}"
-            )
-    root = code_root or identity.repo_root(
-        pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
-    )
+        for p in _nested(pipeline):
+            _refuse_half_declared(p, name)
+    root = code_root or _project_root(pipelines)
     scoring = _scoring(evaluation)
     identity.refuse_unseen_code(
         [
@@ -189,8 +184,9 @@ def run(
     )
     for pipeline in pipelines:
         for p in _nested(pipeline):
-            shas = identity.import_shas((p.fit, p.save, p.load), root)
-            _refuse_unseen_class(p.params, shas, root, "fit")
+            if p.fit is not None:
+                shas = identity.import_shas((p.fit, p.save, p.load), root)
+                _refuse_unseen_class(p.params, shas, root, "fit")
             shas = identity.import_shas((p.predict,), root)
             _refuse_unseen_class(p.predict_config, shas, root, "predict")
             if p.postprocess is not None:
@@ -411,12 +407,20 @@ class _Stage:
     def _fit(self, fold: Fold, index: int) -> str:
         train = [list(seg) for seg in fold.train]
         member_fits = [m.fit(fold, index) for m in self.members]
+        columns_id = self._feature_columns_id()
+        if self.pipeline.fit is None:
+            return identity.content_hash(
+                {
+                    "stateless": True,
+                    "members": member_fits,
+                    **({"features": columns_id} if columns_id else {}),
+                }
+            )
         train_preds = (
             self._train_predictions(member_fits, fold, index)
             if self.members and _positional(self.pipeline.fit) > 3
             else []
         )
-        columns_id = self._feature_columns_id()
         fit_id = identity.content_hash(
             {
                 "dataset": self.evaluation.dataset_id,
@@ -1070,6 +1074,8 @@ class _Stage:
         """The fit's model loaded from its saved bytes once per run, or with ``fresh`` a
         new load, so a probe meets no state an earlier predict left in the model.
         """
+        if self.pipeline.fit is None:
+            return None
         if fresh or fit_id not in self.models:
             fit = self.ledger.latest(Event.FIT, fit_id)
             model = self.pipeline.load(
@@ -1531,6 +1537,45 @@ def _fact(value: Any) -> Any:
     return identity.canonical(value)
 
 
+def _project_root(pipelines: list[Pipeline]) -> pathlib.Path:
+    """The git root of the first declared function outside this package, so a
+    blend the tool ships (``mean_blend``) listed first does not make the tool's own
+    checkout the code root; the tool's root when every function is the tool's.
+    """
+    own = pathlib.Path(__file__).resolve().parent
+    for pipeline in pipelines:
+        for p in _nested(pipeline):
+            for function in p.functions:
+                file = getattr(sys.modules[function.__module__], "__file__", None)
+                if file and not pathlib.Path(file).resolve().is_relative_to(own):
+                    return identity.repo_root(pathlib.Path(file))
+    return identity.repo_root(own)
+
+
+def _refuse_half_declared(p: Pipeline, name: str):
+    """A pipeline fits with save, load and a known format, or is a stateless blend:
+    no fit, no save, load or format, and members.
+    """
+    label = p.name or name
+    if p.fit is None:
+        if not p.members:
+            raise Refused(
+                f"pipeline {label}: fit=None is a stateless blend, which needs members"
+            )
+        if p.save is not None or p.load is not None or p.format is not None:
+            raise Refused(
+                f"pipeline {label}: a stateless blend has no model, so no save, load "
+                "or format"
+            )
+        return
+    if p.save is None or p.load is None:
+        raise Refused(f"pipeline {label}: a fit needs save and load for its model")
+    if p.format not in formats.KNOWN:
+        raise Refused(
+            f"pipeline {label}: format {p.format!r}, not one of {sorted(formats.KNOWN)}"
+        )
+
+
 def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by: str):
     """A dataclass in a params object, at any depth, defined in a repo module its
     consumer does not import would let an edited default reuse a stale fit; refuse and
@@ -1573,12 +1618,10 @@ def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
     post = pipeline.postprocess
     return {
         "features": pipeline.feature_functions,
-        "fit": (
-            pipeline.fit,
-            pipeline.save,
-            pipeline.load,
-            *_held(pipeline.params),
-        ),
+        "fit": tuple(
+            f for f in (pipeline.fit, pipeline.save, pipeline.load) if f is not None
+        )
+        + tuple(_held(pipeline.params)),
         "predict": (pipeline.predict, *_held(pipeline.predict_config)),
         "postprocess": (post, *_held(pipeline.postprocess_config)) if post else (),
     }

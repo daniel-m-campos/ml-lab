@@ -21,7 +21,10 @@ import dataclasses
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 from ml_lab import identity
+from ml_lab.identity import Refused
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,9 +103,13 @@ class Pipeline:
     ``fit`` with four positional parameters
     receives the members' predictions over the train segments as its fourth. Those are
     in-sample, so a weight learned on them overfits; a blend with fixed weights takes
-    three and computes no train-segment predictions. A blend without its own
-    ``features`` sees its members' computed columns when every member declares the same
-    functions. The members' fits and predictions are memoized on their own.
+    three and computes no train-segment predictions, and a blend that learns nothing
+    declares ``fit=None`` with no ``save``, ``load`` or ``format``: a stateless
+    combiner whose ``predict`` receives ``None`` as the model, records no fit, and
+    whose predictions hash its members' fit ids; ``mean_blend`` declares one. A blend
+    without its own ``features`` sees its members' computed columns when every member
+    declares the same functions. The members' fits and predictions are memoized on
+    their own.
 
     Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip,
     postprocess_config=Clip(at=3.0), name="gbt_clip")`` shares every fit and raw
@@ -113,11 +120,11 @@ class Pipeline:
     is caught by the memo.
     """
 
-    fit: Callable
+    fit: Callable | None
     predict: Callable
-    save: Callable
-    load: Callable
-    format: str
+    save: Callable | None = None
+    load: Callable | None = None
+    format: str | None = None
     params: Any = None
     features: Callable | tuple[Callable, ...] | None = None
     postprocess: Callable | None = None
@@ -176,6 +183,22 @@ class Pipeline:
 
     def named(self, name: str) -> Pipeline:
         return dataclasses.replace(self, name=name)
+
+
+def mean_blend(*members: Pipeline, name: str = "") -> Pipeline:
+    """A stateless blend: the mean of its members' predictions, no fit recorded. A
+    seed set is ``mean_blend(*seeds, name="gbt_seed5")``.
+    """
+    if len(members) < 2:
+        raise Refused("mean_blend takes at least two members")
+    return Pipeline(fit=None, predict=mean_predict, members=members, name=name)
+
+
+def mean_predict(
+    model: None, dataset: Any, rows: tuple[int, int], members: list[Any]
+) -> Any:
+    """The members' predictions averaged, whatever their width."""
+    return np.mean(np.stack(members, axis=0), axis=0)
 
 
 @dataclasses.dataclass(frozen=True)

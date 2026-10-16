@@ -468,6 +468,7 @@ def test_the_package_exports_what_a_project_imports():
         "Segments",
         "inner_split",
         "load",
+        "mean_blend",
         "paired",
         "paired_sets",
         "record",
@@ -3776,3 +3777,65 @@ def test_inner_split_cuts_a_validation_tail_purged_as_the_evaluation_would(
         assert facts["alpha"] in (0.1, 1.0, 10.0)
         assert facts["validation"][1] == train[-1][1]
         assert facts["inner"][-1][1] == facts["validation"][0] - 1
+
+
+def test_a_stateless_blend_records_no_fit_and_averages_its_members(
+    ledger, dataset, evaluation
+):
+    one, three = synthetic.ridge(1), synthetic.ridge(3)
+    mean = ml_lab.mean_blend(one, three, name="mean")
+    folds = len(evaluation.split.folds(load(ledger, evaluation.dataset_id)))
+    dry = _run(ledger, evaluation, mean, dry=True)
+    assert dry.fits_computed == 2 * folds and dry.predictions_computed == 3 * folds
+    report = _run(ledger, evaluation, mean)
+    assert not report.failed and report.fits_computed == 2 * folds
+    assert _count(ledger, "event_fit") == 2 * folds
+    assert _count(ledger, "event_prediction") == 3 * folds
+    scores = _latest(ledger, evaluation)
+    assert set(scores) == {"mean"}
+    blend = ledger.sql(
+        "SELECT id, fit FROM event_prediction WHERE fit NOT IN "
+        "(SELECT id FROM event_fit) ORDER BY seq"
+    )
+    assert len(blend) == folds
+    members = {
+        r["fit"]: r["id"]
+        for r in ledger.sql("SELECT id, fit FROM event_prediction WHERE fold = 0")
+    }
+    first = [_load_predictions(ledger, p) for p in members.values()]
+    assert len(first) == 3
+    averaged = _load_predictions(ledger, blend[0]["id"])
+    others = [p for p in first if not np.array_equal(p, averaged)]
+    assert np.allclose(np.mean(np.stack(others, axis=0), axis=0), averaged)
+    costed = ledger.sql(
+        "SELECT COUNT(DISTINCT fit) AS n FROM score_fit WHERE score = ?",
+        (scores["mean"],),
+    )
+    assert costed[0]["n"] == 2 * folds
+    assert _run(ledger, evaluation, mean).fits_reused == 2 * folds
+    with pytest.raises(Refused, match="needs members"):
+        _run(
+            ledger,
+            evaluation,
+            dataclasses.replace(one, fit=None, save=None, load=None, format=None),
+        )
+    with pytest.raises(Refused, match="no save, load or format"):
+        _run(ledger, evaluation, dataclasses.replace(mean, format="zip"))
+    with pytest.raises(Refused, match="needs save and load"):
+        _run(ledger, evaluation, dataclasses.replace(one, save=None))
+    with pytest.raises(Refused, match="at least two members"):
+        ml_lab.mean_blend(one)
+    featured = dataclasses.replace(
+        mean,
+        predict=synthetic.lagged_mean_predict,
+        features=synthetic.lagged_f0,
+        name="lag",
+    )
+    other = dataclasses.replace(
+        featured, features=synthetic.lagged_f1_as_f0, name="lag_f1"
+    )
+    first = _run(ledger, evaluation, featured)
+    second = _run(ledger, evaluation, other)
+    assert first.predictions_computed == folds and second.predictions_computed == folds
+    assert second.predictions_reused == 2 * folds
+    assert runs._project_root([mean, one]) == runs._project_root([one]) == REPO

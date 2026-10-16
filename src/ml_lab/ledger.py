@@ -190,12 +190,19 @@ JOIN event_dataset d ON d.id = e.dataset
 LEFT JOIN c ON c.evaluation = l.evaluation AND c.pipeline = l.pipeline
 WHERE l.rn = 1;
 
-CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, fit) AS (
-  SELECT s.id, s.stream, json_extract(s.payload,'$.pipeline'),
-         json_extract(pr.payload,'$.fit')
-  FROM event s, json_each(s.payload,'$.predictions') p
-  JOIN event pr ON pr.type='predictions_computed' AND pr.id = p.value
-  WHERE s.type='score_recorded'
+CREATE VIEW score_fit AS WITH RECURSIVE
+preds(score, evaluation, pipeline, prediction) AS (
+  SELECT s.id, s.stream, json_extract(s.payload,'$.pipeline'), p.value
+  FROM event s, json_each(s.payload,'$.predictions') p WHERE s.type='score_recorded'
+  UNION
+  SELECT pp.score, pp.evaluation, pp.pipeline, m.value
+  FROM preds pp
+  JOIN event pr ON pr.type='predictions_computed' AND pr.id = pp.prediction,
+  json_each(pr.payload,'$.members') m),
+stands_on(score, evaluation, pipeline, fit) AS (
+  SELECT pp.score, pp.evaluation, pp.pipeline, json_extract(pr.payload,'$.fit')
+  FROM preds pp
+  JOIN event pr ON pr.type='predictions_computed' AND pr.id = pp.prediction
   UNION
   SELECT so.score, so.evaluation, so.pipeline, m.value
   FROM stands_on so
