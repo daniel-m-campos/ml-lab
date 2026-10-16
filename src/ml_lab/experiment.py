@@ -85,8 +85,10 @@ class Pipeline:
     The added columns are read through ``dataset.column`` and ``dataset.matrix`` by the
     names in ``dataset.computed_columns``; they are not in ``dataset.columns``, and a
     column no function reads is never loaded, so a learned selection lives in ``fit``
-    and costs only the columns it keeps. ``fit(dataset, train, params)`` receives
-    ``params``, ``predict(model, dataset, rows)`` the fold's test range.
+    and costs only the columns it keeps. Their order is part of a fit's identity and
+    of what the model sees (a booster samples and constrains features by position),
+    so a reordering refits and may change results. ``fit(dataset, train, params)``
+    receives ``params``, ``predict(model, dataset, rows)`` the fold's test range.
     ``postprocess(predictions, dataset, rows, postprocess_config)`` is the cheap
     stateless stage after ``predict``: neutralise, clip, rank. ``postprocess_config``
     enters the prediction's identity and not the fit's. A pipeline with ``members`` is a
