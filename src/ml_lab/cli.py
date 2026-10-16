@@ -39,7 +39,7 @@ from typing import Any
 
 from ml_lab import dataset, identity, runs
 from ml_lab.experiment import Evaluation, Pipeline
-from ml_lab.ledger import Ledger, Refused, actor
+from ml_lab.ledger import Ledger, Refused, actor, note
 
 DEFAULT_ROOT = ".ml-lab"
 
@@ -79,13 +79,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.set_defaults(handler=_run)
 
+    p = sub.add_parser(
+        "note", parents=[rooted], help="record an idea, decision or step as a note"
+    )
+    p.add_argument("text")
+    p.add_argument(
+        "--about",
+        nargs="*",
+        default=[],
+        help="ids the note is about, as lab run prints",
+    )
+    p.add_argument(
+        "--tag", default="note", help="its kind: note, idea, decision, refit"
+    )
+    p.set_defaults(handler=_note)
+
     args = parser.parse_args(argv)
     root = pathlib.Path(args.root)
     try:
         actor()
         if root.exists() and not root.is_dir():
             raise Refused(f"{root} is not a directory")
-        if args.command == "run" and not (root / "ml_lab.sqlite").exists():
+        if args.command != "ingest" and not (root / "ml_lab.sqlite").exists():
             raise Refused(
                 f"no ledger at {root.resolve()}; set ML_LAB_ROOT or --root, or lab "
                 "ingest to create one"
@@ -106,6 +121,11 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
         raise Refused(f"{args.module} declares no dataset(ledger, *args)")
     _code_root(module)
     print(ingest(ledger, *args.args))
+    return 0
+
+
+def _note(args: argparse.Namespace, ledger: Ledger) -> int:
+    print(note(ledger, args.text, about=args.about, tag=args.tag))
     return 0
 
 
