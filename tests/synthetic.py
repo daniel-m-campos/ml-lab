@@ -13,7 +13,7 @@ from ml_lab.dataset import Dataset, Range, Segments, record
 from ml_lab.dates import add_months, as_date
 from ml_lab.experiment import Evaluation, Fitted, Pipeline, Scorer
 from ml_lab.ledger import Ledger
-from ml_lab.splits import CalendarWalkForward
+from ml_lab.splits import CalendarWalkForward, inner_split
 
 FEATURES = ("f0", "f1", "f2")
 TARGET = "ret_1"
@@ -156,6 +156,21 @@ def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
             "n": np.int64(rows),
         },
     )
+
+
+def inner_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+    """Chooses alpha on an inner validation cut by the tool, refits on the whole
+    train range and records the choice, as an early-stopped booster would.
+    """
+    inner, valid = inner_split(dataset, train, 0.2)
+    errors = {}
+    for alpha in (0.1, 1.0, 10.0):
+        model = ridge_fit(dataset, inner, dataclasses.replace(config, alpha=alpha))
+        pred = ridge_predict(model, dataset, valid)
+        errors[alpha] = float(np.mean((pred - dataset.column(TARGET, valid)) ** 2))
+    best = min(errors, key=errors.get)
+    model = ridge_fit(dataset, train, dataclasses.replace(config, alpha=best))
+    return Fitted(model, {"alpha": best, "inner": inner, "validation": valid})
 
 
 def bad_facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:

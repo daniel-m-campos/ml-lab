@@ -16,6 +16,7 @@ Examples
 (1500, 2000)
 >>> BlockedKFold(n_splits=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
 'block 2'
+>>> inner, valid = inner_split(dataset, train, 0.1)  # inside fit  # doctest: +SKIP
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import datetime
 import numpy as np
 
 from ml_lab import dates
-from ml_lab.dataset import Dataset, Range, Segments
+from ml_lab.dataset import Dataset, Lag, Range, Segments
 from ml_lab.identity import Refused
 
 
@@ -216,6 +217,79 @@ class Holdout:
         )
         test = (min(cut + self.embargo_rows, n), n)
         return _at_least([Fold("holdout", ((0, cut),), test)], 1)
+
+
+def inner_split(
+    dataset: Dataset,
+    train: Segments,
+    validation: int | float,
+    embargo_timestamps: int | None = None,
+) -> tuple[Segments, Range]:
+    """Cut a fold's train segments, inside ``fit``, into an inner train and a
+    validation range, for early stopping or any choice made on held-out rows.
+
+    The validation range is the tail of the last train segment: ``validation`` rows,
+    or that fraction of the train rows when below 1, its start snapped to the first
+    row of its timestamp. The inner train is the train segments before it, purged as
+    the evaluation purges: the evaluation's embargo, read from the view a fit
+    receives (``embargo_rows`` rows before the validation start, snapped to a
+    timestamp as ``WalkForward`` snaps, then ``embargo_timestamps`` distinct
+    timestamps; passing ``embargo_timestamps`` overrides the timestamps only; a
+    ``group`` column is not honoured, so a grouped split cuts its own), and every
+    row whose label the dataset's reveal lags say is not known when the validation
+    starts, so a round count chosen here reads no label the fold's own test would
+    hide. Refused when either side is empty.
+    """
+    rows = sum(hi - lo for lo, hi in train)
+    if not train or rows == 0:
+        raise Refused("inner_split needs train segments with rows")
+    if isinstance(validation, float) and 0 < validation < 1:
+        held = int(round(validation * rows))
+    elif isinstance(validation, int) and not isinstance(validation, bool):
+        held = validation
+    else:
+        raise Refused(
+            f"validation {validation!r}: a count of rows, or a fraction in (0, 1)"
+        )
+    start, end = train[-1]
+    at = _snap(dataset, max(end - held, start))
+    if at <= start or at >= end:
+        raise Refused(
+            f"validation of {held} rows leaves no inner train or no validation in the "
+            f"last train segment {train[-1]}; ask for fewer rows or a smaller fraction"
+        )
+    cut = _snap(dataset, max(at - getattr(dataset, "embargo_rows", 0), 0))
+    if embargo_timestamps is None:
+        embargo_timestamps = getattr(dataset, "embargo_timestamps", 0)
+    for _ in range(embargo_timestamps):
+        if cut and dataset.ts is not None:
+            cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
+        elif cut:
+            cut -= 1
+    for lag in getattr(dataset, "reveal", {}).values():
+        cut = min(cut, _known_before(dataset, at, lag))
+    inner = tuple((lo, min(hi, cut)) for lo, hi in train if lo < cut)
+    if not inner:
+        raise Refused(
+            f"the embargo and reveal lags purge every inner train row before "
+            f"validation row {at}; ask for a smaller validation"
+        )
+    return inner, (at, end)
+
+
+def _known_before(dataset: Dataset, at: int, lag: Lag) -> int:
+    """The rows whose labels are known when row ``at`` starts: a prefix length, as
+    ``Dataset.masked`` hides them.
+    """
+    ts = dataset.ts
+    if ts is None:
+        return at
+    if lag is None:
+        return int(np.searchsorted(ts, ts[at], "left"))
+    if isinstance(lag, np.timedelta64):
+        return int(np.searchsorted(ts, ts[at] - lag, "right"))
+    day = np.unique(ts.astype("datetime64[D]"), return_inverse=True)[1]
+    return int(np.searchsorted(day, day[at] - lag, "right"))
 
 
 def _snap(dataset: Dataset, row: int, groups: np.ndarray | None = None) -> int:

@@ -46,7 +46,9 @@ class Dataset:
     ``computed_columns`` names the columns a pipeline's features functions added, in
     order; they are not in ``columns`` but read on demand from the Parquet file in
     ``stores`` through ``column`` and ``matrix``, so a column no function names costs
-    no memory.
+    no memory. ``reveal`` holds the targets' reveal lags and ``embargo_timestamps``
+    and ``embargo_rows`` the evaluation's embargo on the view a fit receives, so
+    ``splits.inner_split`` purges what the evaluation would.
     """
 
     def __init__(
@@ -64,6 +66,9 @@ class Dataset:
         self.stores = stores or {}
         self.cut: int | None = None
         self.keep: np.ndarray | None = None
+        self.reveal: dict[str, Lag] = {}
+        self.embargo_timestamps = 0
+        self.embargo_rows = 0
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.isnat(self.ts).any():
             raise ValueError("timestamps must not contain NaT")
@@ -101,6 +106,9 @@ class Dataset:
         view.stores = self.stores
         view.cut = min(row, self.rows)
         view.keep = None if self.keep is None else self.keep[:row]
+        view.reveal = self.reveal
+        view.embargo_timestamps = self.embargo_timestamps
+        view.embargo_rows = self.embargo_rows
         return view
 
     def masked(self, reveal: dict[str, Lag], at: int) -> Dataset:

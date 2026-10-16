@@ -443,6 +443,10 @@ class _Stage:
             )
             return fit_id
         visible = self._visible(max(hi for _, hi in fold.train)).train_view(fold.train)
+        visible.reveal = self.targets
+        split = self.evaluation.split
+        visible.embargo_timestamps = getattr(split, "embargo_timestamps", 0)
+        visible.embargo_rows = getattr(split, "embargo_rows", 0)
         inputs = (
             [
                 [
