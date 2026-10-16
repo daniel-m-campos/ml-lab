@@ -3402,3 +3402,36 @@ def test_a_run_reuses_the_feature_set_its_dry_run_computed(ledger, dataset, eval
     assert any(line.endswith(": from the dry run, probing") for line in lines)
     assert _count(ledger, "event_feature") == 1 and not list(planned.iterdir())
     assert report.scores_recorded == 1 and not report.failed
+
+
+def test_a_run_records_the_gpus_nvidia_smi_reports(ledger, evaluation, monkeypatch):
+    answers = {
+        "--query-gpu=name,driver_version,memory.total": (
+            "NVIDIA A100-SXM4-80GB, 550.54.15, 81920\n"
+        ),
+        None: "| NVIDIA-SMI 550.54.15  Driver Version: 550.54.15  CUDA Version: 12.4 |",
+    }
+    monkeypatch.setattr(
+        runs, "_command", lambda *args: answers[args[1] if len(args) > 1 else None]
+    )
+    _run(ledger, evaluation, synthetic.ridge(1))
+    (row,) = ledger.sql("SELECT gpu, cuda FROM event_run")
+    assert json.loads(row["gpu"]) == [
+        {"name": "NVIDIA A100-SXM4-80GB", "driver": "550.54.15", "memory_mb": 81920}
+    ]
+    assert row["cuda"] == "12.4"
+    monkeypatch.setattr(runs, "_command", lambda *args: None)
+    assert "gpu" not in runs._host()
+    answers["--query-gpu=name,driver_version,memory.total"] = (
+        "NVIDIA A100, PCIe, 550.54.15, 81920\n"
+        "NVIDIA A100 MIG 1g.10gb, 550.54.15, [N/A],\n\n"
+    )
+    monkeypatch.setattr(
+        runs, "_command", lambda *args: answers[args[1] if len(args) > 1 else None]
+    )
+    assert runs._host()["gpu"] == [
+        {"name": "NVIDIA A100, PCIe", "driver": "550.54.15", "memory_mb": 81920},
+        {"name": "NVIDIA A100 MIG 1g.10gb", "driver": "550.54.15", "memory_mb": None},
+    ]
+    monkeypatch.setattr(runs, "_gpus", lambda: 1 / 0)
+    assert "gpu_error" in runs._host()
