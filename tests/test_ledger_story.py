@@ -3936,8 +3936,26 @@ def test_a_prepare_step_is_built_once_per_train_range_and_shared(
         node.append([])
         node = node[0]
     assert runs._frozen(deep) is deep
+    with pytest.raises(Refused, match="timedelta64"):
+        identity.content_hash({"lag": np.timedelta64(1, "D")})
     (row,) = ledger.sql(
         "SELECT model FROM event_fit WHERE pipeline = ? AND label = ?",
         (c.id, "2025-05-01"),
     )
     assert synthetic.ridge_load(ledger.get_blob(row["model"])).weights.any()
+
+
+def test_a_planned_feature_file_that_cannot_be_read_is_recomputed(
+    ledger, dataset, evaluation
+):
+    lag = synthetic.featured(synthetic.ridge(1))
+    _run(ledger, evaluation, lag, dry=True)
+    planned = ledger.root / "planned"
+    for stale in planned.iterdir():
+        stale.write_bytes(b"not a file the run can read")
+    runs._PLANNED_FEATURES.clear()
+    synthetic.FEATURE_CALLS.clear()
+    report = _run(ledger, evaluation, lag)
+    assert not report.failed and report.features_computed == 1
+    assert synthetic.FEATURE_CALLS.count(load(ledger, dataset).rows) == 1
+    assert _count(ledger, "event_feature") == 1 and not list(planned.iterdir())
