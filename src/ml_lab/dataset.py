@@ -118,15 +118,7 @@ class Dataset:
         view = self.upto(self.rows)
         for name, lag in reveal.items():
             values = view.columns[name].astype(np.float64, copy=True)
-            if self.ts is None:
-                values[at:] = np.nan
-            elif lag is None:
-                values[self.ts >= self.ts[at]] = np.nan
-            elif isinstance(lag, np.timedelta64):
-                values[self.ts + lag > self.ts[at]] = np.nan
-            else:
-                day = np.unique(self.ts.astype("datetime64[D]"), return_inverse=True)[1]
-                values[day + lag > day[at]] = np.nan
+            values[known_before(self, at, lag) :] = np.nan
             view.columns[name] = values
         return view
 
@@ -279,6 +271,24 @@ class FitView:
 
     def column(self, name: str, rows: Rows | None = None) -> np.ndarray:
         return self.data.column(name, rows)
+
+
+def known_before(dataset: Dataset | FitView, at: int, lag: Lag) -> int:
+    """The rows whose labels are known when row ``at`` starts, as a prefix length: a
+    label with a time lag ``L`` is known from ``ts + L``, one with an integer lag ``n``
+    from the first row of the n-th later date that has rows, one without a lag only
+    after its own timestamp; without a clock, the rows before ``at``. ``masked`` hides
+    the rest, and ``splits.inner_split`` keeps no more.
+    """
+    ts = dataset.ts
+    if ts is None:
+        return at
+    if lag is None:
+        return int(np.searchsorted(ts, ts[at], "left"))
+    if isinstance(lag, np.timedelta64):
+        return int(np.searchsorted(ts, ts[at] - lag, "right"))
+    day = np.unique(ts.astype("datetime64[D]"), return_inverse=True)[1]
+    return int(np.searchsorted(day, day[at] - lag, "right"))
 
 
 def segments(rows: Rows) -> tuple[Range, ...]:
