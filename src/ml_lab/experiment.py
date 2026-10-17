@@ -21,7 +21,10 @@ import dataclasses
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 from ml_lab import identity
+from ml_lab.identity import Refused
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,36 +88,60 @@ class Pipeline:
     The added columns are read through ``dataset.column`` and ``dataset.matrix`` by the
     names in ``dataset.computed_columns``; they are not in ``dataset.columns``, and a
     column no function reads is never loaded, so a learned selection lives in ``fit``
-    and costs only the columns it keeps. ``fit(dataset, train, params)`` receives
-    ``params``, ``predict(model, dataset, rows)`` the fold's test range.
+    and costs only the columns it keeps. Their order is part of a fit's identity and
+    of what the model sees (a booster samples and constrains features by position),
+    so a reordering refits and may change results. ``fit(dataset, train, params)``
+    receives ``params``, ``predict(model, dataset, rows)`` the fold's test range,
+    and with a ``predict_config`` (a rule baseline's feature and sign, a seeded random
+    baseline's seed) ``predict`` receives it as its last positional argument; it
+    enters the raw prediction's identity and not the fit's, so variants share fits.
     ``postprocess(predictions, dataset, rows, postprocess_config)`` is the cheap
     stateless stage after ``predict``: neutralise, clip, rank. ``postprocess_config``
     enters the prediction's identity and not the fit's. A pipeline with ``members`` is a
     blend: its ``predict`` takes a fourth argument, the members' predictions over the
-    test range as a list of arrays, and a ``fit`` with four positional parameters
+    test range as a list of arrays (a ``predict_config`` follows as the fifth), and a
+    ``fit`` with four positional parameters
     receives the members' predictions over the train segments as its fourth. Those are
     in-sample, so a weight learned on them overfits; a blend with fixed weights takes
-    three and computes no train-segment predictions. A blend without its own
-    ``features`` sees its members' computed columns when every member declares the same
-    functions. The members' fits and predictions are memoized on their own.
+    three and computes no train-segment predictions, and a blend that learns nothing
+    declares ``fit=None`` with no ``save``, ``load`` or ``format``: a stateless
+    combiner whose ``predict`` receives ``None`` as the model, records no fit, and
+    whose predictions hash its members' fit ids; ``mean_blend`` declares one. A blend
+    without its own ``features`` sees its members' computed columns when every member
+    declares the same functions. The members' fits and predictions are memoized on
+    their own.
+
+    ``prepare(dataset, train) -> object`` is the fit-time preprocessing pipelines
+    share: a binned booster dataset, an encoded matrix, built once per train range,
+    feature columns and prepare code within a run and handed to every ``fit`` that
+    declares it as ``dataset.prepared``, so pipelines that differ in params pay for
+    it once. It has fold scope like ``fit``, enters the fit id with ``fit``'s code,
+    and is not recorded: a run rebuilds it. One object is shared by every fit in the
+    run, so it is read-only: the arrays it holds are frozen, a write raises, and an
+    opaque object must not be changed by ``fit``, or the fit recorded under one id
+    would depend on which pipelines ran beside it. A run holds one per train range
+    until it ends.
 
     Variants are ``dataclasses.replace``: ``replace(p, postprocess=clip,
     postprocess_config=Clip(at=3.0), name="gbt_clip")`` shares every fit and raw
     prediction with ``p``, since the fit id reads ``fit_declaration`` and the raw
     prediction id excludes ``postprocess``. A params class must live in a module its
-    function imports (``params`` beside ``fit``, ``postprocess_config`` beside
-    ``postprocess``), so an edited default is caught by the memo.
+    function imports (``params`` beside ``fit``, ``predict_config`` beside
+    ``predict``, ``postprocess_config`` beside ``postprocess``), so an edited default
+    is caught by the memo.
     """
 
-    fit: Callable
+    fit: Callable | None
     predict: Callable
-    save: Callable
-    load: Callable
-    format: str
+    save: Callable | None = None
+    load: Callable | None = None
+    format: str | None = None
     params: Any = None
     features: Callable | tuple[Callable, ...] | None = None
     postprocess: Callable | None = None
     postprocess_config: Any = None
+    predict_config: Any = None
+    prepare: Callable | None = None
     members: tuple[Pipeline, ...] = ()
     name: str = dataclasses.field(default="", metadata={"label": True})
 
@@ -138,6 +165,7 @@ class Pipeline:
     def functions(self) -> tuple[Callable, ...]:
         stages = (
             *self.feature_functions,
+            self.prepare,
             self.fit,
             self.predict,
             self.save,
@@ -158,6 +186,7 @@ class Pipeline:
             "load": self.load,
             "format": self.format,
             "params": self.params,
+            **({"prepare": self.prepare} if self.prepare is not None else {}),
         }
 
     def with_params(self, **changes: Any) -> Pipeline:
@@ -168,6 +197,36 @@ class Pipeline:
 
     def named(self, name: str) -> Pipeline:
         return dataclasses.replace(self, name=name)
+
+
+def mean_blend(*members: Pipeline, name: str = "") -> Pipeline:
+    """A stateless blend: the mean of its members' predictions, no fit recorded. A
+    seed set is ``mean_blend(*seeds, name="gbt_seed5")``.
+    """
+    if len(members) < 2:
+        raise Refused("mean_blend takes at least two members")
+    return Pipeline(fit=None, predict=mean_predict, members=members, name=name)
+
+
+def mean_predict(
+    model: None, dataset: Any, rows: tuple[int, int], members: list[Any]
+) -> Any:
+    """The members' predictions averaged, whatever their width."""
+    return np.mean(np.stack(members, axis=0), axis=0)
+
+
+@dataclasses.dataclass(frozen=True)
+class Fitted:
+    """What ``fit`` returns when it has facts to record beside the model: the round
+    count an inner validation chose, the best iteration, a learned threshold. The
+    model is saved and loaded as if returned alone; ``facts`` is a dict of JSON
+    values recorded with the fit and shown as ``event_fit.facts``, so a per-fold
+    choice reads with SQL instead of from the model bytes. Facts are provenance,
+    not identity: they enter no id.
+    """
+
+    model: Any
+    facts: dict[str, Any]
 
 
 @dataclasses.dataclass(frozen=True)

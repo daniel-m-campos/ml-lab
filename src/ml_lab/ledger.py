@@ -24,6 +24,7 @@ import platform
 import re
 import sqlite3
 import time
+from collections.abc import Sequence
 from typing import Any, Final
 
 from ml_lab import identity
@@ -46,6 +47,7 @@ class Event:
     PREDICTIONS: Final = "predictions_computed"
     SCORE: Final = "score_recorded"
     FAILED: Final = "pipeline_failed"
+    NOTE: Final = "note_recorded"
 
 
 DDL = """
@@ -94,8 +96,19 @@ CREATE VIEW event_run AS SELECT seq, id, at, actor, host, stream AS evaluation,
   json_extract(payload,'$.resolution.path') AS resolution,
   json_extract(payload,'$.resolution.sha') AS resolution_sha,
   json_extract(payload,'$.editable') AS editable,
-  json_extract(payload,'$.pipelines') AS pipelines
+  json_extract(payload,'$.pipelines') AS pipelines,
+  json_extract(payload,'$.host.gpu') AS gpu,
+  json_extract(payload,'$.host.cuda') AS cuda
 FROM event WHERE type='run_started';
+
+CREATE VIEW run_pipeline AS SELECT r.seq, r.id AS run, r.stream AS evaluation,
+  json_extract(p.value,'$.id') AS pipeline, json_extract(p.value,'$.name') AS name
+FROM event r, json_each(r.payload,'$.pipelines') p WHERE r.type='run_started';
+
+CREATE VIEW pipeline_current AS WITH newest AS MATERIALIZED (
+  SELECT evaluation, name, MAX(seq) AS seq FROM run_pipeline GROUP BY evaluation, name)
+SELECT r.evaluation, r.name, r.pipeline, r.run, r.seq FROM run_pipeline r
+JOIN newest n ON n.evaluation = r.evaluation AND n.name = r.name AND n.seq = r.seq;
 
 CREATE VIEW event_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
@@ -118,7 +131,8 @@ CREATE VIEW event_fit AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.model.sha') AS model,
   json_extract(payload,'$.model.format') AS format,
   json_extract(payload,'$.model.portable') AS portable,
-  json_extract(payload,'$.duration_s') AS duration_s
+  json_extract(payload,'$.duration_s') AS duration_s,
+  json_extract(payload,'$.facts') AS facts
 FROM event WHERE type='fit_computed';
 
 CREATE VIEW event_prediction AS SELECT seq, id, at, stream AS dataset,
@@ -127,6 +141,7 @@ CREATE VIEW event_prediction AS SELECT seq, id, at, stream AS dataset,
   json_extract(payload,'$.range[1]') AS range_end,
   json_extract(payload,'$.fold') AS fold,
   json_extract(payload,'$.blob.sha') AS blob, json_extract(payload,'$.raw') AS raw,
+  json_extract(payload,'$.predict_config') AS predict_config,
   json_extract(payload,'$.postprocess') AS postprocess
 FROM event WHERE type='predictions_computed';
 
@@ -163,22 +178,33 @@ JOIN (SELECT score, metric, COUNT(value) AS n_folds, AVG(value) AS fold_mean,
   ON f.score = e.id AND f.metric = m.key
 WHERE e.type='score_recorded';
 
-CREATE VIEW score_latest AS SELECT l.evaluation, e.name AS evaluation_name,
-  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq
+CREATE VIEW score_latest AS WITH c AS MATERIALIZED (
+  SELECT DISTINCT evaluation, pipeline FROM pipeline_current)
+SELECT l.evaluation, e.name AS evaluation_name,
+  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq,
+  CASE WHEN c.pipeline IS NOT NULL THEN 1 ELSE 0 END AS current
 FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq,
         ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM event_score) l
 JOIN event_pipeline p ON p.id = l.pipeline
 JOIN event_evaluation e ON e.id = l.evaluation
 JOIN event_dataset d ON d.id = e.dataset
+LEFT JOIN c ON c.evaluation = l.evaluation AND c.pipeline = l.pipeline
 WHERE l.rn = 1;
 
-CREATE VIEW score_fit AS WITH RECURSIVE stands_on(score, evaluation, pipeline, fit) AS (
-  SELECT s.id, s.stream, json_extract(s.payload,'$.pipeline'),
-         json_extract(pr.payload,'$.fit')
-  FROM event s, json_each(s.payload,'$.predictions') p
-  JOIN event pr ON pr.type='predictions_computed' AND pr.id = p.value
-  WHERE s.type='score_recorded'
+CREATE VIEW score_fit AS WITH RECURSIVE
+preds(score, evaluation, pipeline, prediction) AS (
+  SELECT s.id, s.stream, json_extract(s.payload,'$.pipeline'), p.value
+  FROM event s, json_each(s.payload,'$.predictions') p WHERE s.type='score_recorded'
+  UNION
+  SELECT pp.score, pp.evaluation, pp.pipeline, m.value
+  FROM preds pp
+  JOIN event pr ON pr.type='predictions_computed' AND pr.id = pp.prediction,
+  json_each(pr.payload,'$.members') m),
+stands_on(score, evaluation, pipeline, fit) AS (
+  SELECT pp.score, pp.evaluation, pp.pipeline, json_extract(pr.payload,'$.fit')
+  FROM preds pp
+  JOIN event pr ON pr.type='predictions_computed' AND pr.id = pp.prediction
   UNION
   SELECT so.score, so.evaluation, so.pipeline, m.value
   FROM stands_on so
@@ -197,17 +223,17 @@ CREATE VIEW board AS SELECT source, evaluation_name, name, actor, metric, direct
     THEN RANK() OVER (PARTITION BY evaluation, metric
     ORDER BY CASE direction WHEN 'max' THEN -fold_mean ELSE fold_mean END
       NULLS LAST) END AS rank,
-  fold_mean, fold_std, n_folds, pooled, evaluation, pipeline, score, run, seq
+  fold_mean, fold_std, n_folds, pooled, current, evaluation, pipeline, score, run, seq
 FROM (SELECT l.source, l.evaluation_name, l.name, l.actor, a.metric,
   FIRST_VALUE(a.direction) OVER (PARTITION BY l.evaluation, a.metric
     ORDER BY l.seq DESC) AS direction,
-  a.fold_mean, a.fold_std, a.n_folds, a.pooled,
+  a.fold_mean, a.fold_std, a.n_folds, a.pooled, l.current,
   l.evaluation, l.pipeline, l.score, l.run, l.seq
 FROM score_latest l JOIN score_aggregate a ON a.score = l.score);
 
 CREATE VIEW pair_fold AS WITH f AS MATERIALIZED (
   SELECT l.evaluation, l.evaluation_name, l.source, l.actor, l.pipeline, l.name,
-    l.score, s.fold, s.label, s.metric, s.value,
+    l.score, l.current, s.fold, s.label, s.metric, s.value,
     FIRST_VALUE(s.direction) OVER (PARTITION BY l.evaluation, s.metric
       ORDER BY l.seq DESC) AS direction
   FROM score_latest l JOIN score_fold s ON s.score = l.score)
@@ -216,6 +242,7 @@ SELECT a.evaluation, a.evaluation_name, a.source, a.actor, a.metric, a.fold, a.l
   a.value, b.value AS reference_value, a.value - b.value AS delta,
   CASE a.direction WHEN 'max' THEN a.value > b.value
       WHEN 'min' THEN a.value < b.value END AS win,
+  a.current, b.current AS reference_current,
   a.score, b.score AS reference_score
 FROM f a JOIN f b ON b.evaluation = a.evaluation AND b.pipeline <> a.pipeline
   AND b.fold = a.fold AND b.metric = a.metric;
@@ -224,7 +251,7 @@ CREATE VIEW head_to_head AS WITH d AS (
   SELECT *, AVG(delta) OVER (PARTITION BY score, reference_score, metric) AS mean
   FROM pair_fold),
 h AS (SELECT evaluation, evaluation_name, source, actor, metric, pipeline, name,
-  score, reference, reference_name, reference_score,
+  score, reference, reference_name, reference_score, current, reference_current,
   COUNT(delta) AS n_folds, AVG(delta) AS delta_mean,
   CASE WHEN COUNT(delta) > 1
        THEN sqrt(SUM((delta - mean) * (delta - mean)) / (COUNT(delta) - 1))
@@ -236,6 +263,10 @@ SELECT h.*,
     - json_extract(b.payload,'$.aggregate."' || h.metric || '"') AS pooled_delta,
   delta_mean * sqrt(n_folds) / delta_std AS t
 FROM h JOIN event a ON a.id = h.score JOIN event b ON b.id = h.reference_score;
+
+CREATE VIEW event_note AS SELECT seq, id, at, actor, key AS tag,
+  json_extract(payload,'$.text') AS text, json_extract(payload,'$.about') AS about
+FROM event WHERE type='note_recorded';
 
 CREATE VIEW event_failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
@@ -354,6 +385,36 @@ class Ledger:
 
     def get_blob(self, sha: str) -> bytes:
         return (self.blobs / sha).read_bytes()
+
+
+def note(
+    ledger: Ledger, text: str, *, about: Sequence[str] = (), tag: str = "note"
+) -> str:
+    """Record a note: an idea, a decision, a final refit, as text tagged by its kind,
+    about the ids it names (pipelines, evaluations, scores, runs, datasets). Each id
+    must be in the log; a note is a record, not a verdict, and nothing reads it but
+    ``event_note``. Returns the note's id.
+    """
+    if not text.strip():
+        raise Refused("a note needs text")
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", tag):
+        raise Refused(f"tag {tag!r}: lowercase letters, digits, _ or -")
+    unknown = [i for i in about if not ledger.sql(_ABOUT, (i, i))]
+    if unknown:
+        raise Refused(
+            f"ids {unknown} are not in {ledger.root.resolve()}; a note is about "
+            "dataset, pipeline, evaluation, run or score ids, as lab prints them"
+        )
+    return ledger.append(
+        Event.NOTE, "", tag, {"text": text, "about": list(about), "tag": tag}
+    )
+
+
+_ABOUT = (
+    "SELECT 1 FROM event WHERE (type IN ('dataset_recorded', 'run_started', "
+    "'score_recorded') AND id = ?) OR (type IN ('pipeline_declared', "
+    "'evaluation_declared') AND key = ?) LIMIT 1"
+)
 
 
 def actor() -> str:

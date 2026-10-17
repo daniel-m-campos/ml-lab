@@ -5,7 +5,7 @@ A local-first record of experimentation on frozen datasets with a fixed row orde
 - **Memo.** A fit, prediction or score is reused when the log holds one for the same data, declaration, code and environment. A rerun of an unchanged tree writes nothing.
 - **Identity from content.** A dataset id is its rows, a pipeline id its declaration. Edit code and the affected fits rerun; edit a comment and nothing does. A fit's code key covers its functions' modules and every module they import, so an edit anywhere in those files refits: keep pipeline families and shared constants in their own modules. Names are labels.
 - **Guards that refuse.** A function sees rows only up to where it may look; unknown labels are NaN; a fold that trains on labels revealed after its test range starts is refused; every prediction is recomputed on a shorter prefix and must agree.
-- **Provenance.** A score names its run, predictions and fits; a run records the commit, dirty diff, host and the tool's commit.
+- **Provenance.** A score names its run, predictions and fits; a run records the commit, dirty diff, host (GPUs, driver and CUDA version when `nvidia-smi` answers) and the tool's commit.
 
 ## Install
 
@@ -15,6 +15,8 @@ uv pip install -e ml-lab                 # Python 3.12, numpy, polars
 ```
 
 Development: `uv pip install -e ".[dev]"` and `pytest`.
+
+A study's code is hashed from the git repository `lab` runs in; a module reached from outside it must belong to an installed distribution, or the run is refused as code the memo cannot see. A study on `PYTHONPATH` alone is refused: install it editable (`uv pip install -e <study>`) or keep it in the repository. Prefer a path-based editable install, which static analysis resolves: hatchling and most build backends write one by default, and setuptools does with `--config-settings editable_mode=compat`; its default import-hook mode hides the package from pyright, which then needs the source directory in `extraPaths`.
 
 ## The smallest project
 
@@ -123,9 +125,9 @@ def evaluations(dataset: str) -> list[Evaluation]:
     ]
 ```
 
-- **`Dataset(columns, ts=None)`**: equal-length 1-D numpy columns in a fixed order, optional sorted `ts`; `ml_lab.dataset.from_frame(frame)` builds one from polars. Functions read it with `dataset.column(name, rows)` and `dataset.matrix(cols, rows)`. `record` stores the rows and returns an id that is a hash of them; `targets` names the labels the tool hides, and an empty `targets` is refused. Extra `lab ingest` arguments reach `dataset(ledger, *args)` as strings.
-- **`fit(dataset, train, params)`**: `train` is the train row segments. A fit sees targets and features as NaN outside its train segments, so it cannot read its validation block at all. Returns any object.
-- **`predict(model, dataset, rows)`**: one row per row of the range, `(rows,)` or `(rows, k)`. Unknown labels inside the range are NaN. The tool recomputes the range on a shorter prefix and refuses the function if earlier rows changed: a feature reading later rows or a non-deterministic model is caught with the first moved row. The prefixes end at two timestamps drawn by a hash of the range, the one after a date's open and any other inside it, and each is predicted by a model freshly loaded from its saved bytes, so neither the calendar nor state kept in the model hides a read.
+- **`Dataset(columns, ts=None)`**: equal-length 1-D numpy columns in a fixed order, optional sorted `ts`; `ml_lab.dataset.from_frame(frame)` builds one from polars. Functions read it with `dataset.column(name, rows)` and `dataset.matrix(cols, rows)`. `record` stores the rows and returns an id that is a hash of them; `targets` names the labels the tool hides, and an empty `targets` is refused. `steps=(clean, ...)` names the module-level functions that made the rows, the cleaning included, by dotted path and code keys in the recipe, so the log says which code dropped which rows. Extra `lab ingest` arguments reach `dataset(ledger, *args)` as strings.
+- **`fit(dataset, train, params)`**: `train` is the train row segments. A fit sees targets and features as NaN outside its train segments, so it cannot read its validation block at all. Returns any object, or `Fitted(model, facts)` to record a dict of JSON facts beside the model (the round count an inner validation chose, a learned threshold), shown as `event_fit.facts`. A choice made on held-out rows stays inside `fit`: `inner, valid = ml_lab.inner_split(dataset, train, 0.1)` cuts the train segments into an inner train and a validation tail, purged by the evaluation's embargo and the dataset's reveal lags, both read from the view the fit receives, for early stopping and the like.
+- **`predict(model, dataset, rows)`**: one row per row of the range, `(rows,)` or `(rows, k)`. Unknown labels inside the range are NaN. `Pipeline(predict_config=Rule(feature="f0"))` passes a frozen dataclass as the last argument, for a rule or seeded baseline; it enters the raw prediction id, not the fit's, so variants share fits. The tool recomputes the range on a shorter prefix and refuses the function if earlier rows changed: a feature reading later rows or a non-deterministic model is caught with the first moved row. The prefixes end at two timestamps drawn by a hash of the range, the one after a date's open and any other inside it, and each is predicted by a model freshly loaded from its saved bytes, so neither the calendar nor state kept in the model hides a read.
 - **`save(model)` and `load(payload)`**: bytes in the pipeline's `format`, one of `formats.KNOWN`. `arrow-arrays` and `zip` open without Python; for sklearn, `formats.pickle_save` and `formats.pickle_load` with `format=formats.Format.PICKLE`, marked non-portable. A fit is recorded only after the reloaded model predicts its first range as the fitted one did.
 - **`Scorer(series, metrics, directions)`**: `series(pred, dataset, rows, scorer_params)` returns the series stored for later paired tests. A series is `(rows,)` or `(rows, c)` with one row per scoring unit, a prediction or a day; `Scorer(columns=...)` names the columns. `metrics(series)` reduces a copy of it per fold (`fold_mean`, `fold_std`) and over the concatenated folds (`pooled`), so sorting it in place changes nothing stored. Only `series` enters the evaluation id; `metrics` and `directions` are code under the memo. Keep the scorer in its own module: a fit's memo covers every module its functions import.
 - **`Pipeline`**: functions, `format` and `params`, a frozen dataclass in a module `fit` imports, so an edited default refits. Its id is the declaration; `name` is a label. A lambda, closure or method is refused in a `Pipeline` slot or as `Scorer.series`; `metrics` may be a lambda. `with_params` and `named` make variants.
@@ -145,9 +147,10 @@ An evaluation is a split and a scorer over one dataset. The split turns the data
 
 Growing it:
 
-- `Pipeline(features=f)` with `f(dataset) -> {name: array}`: columns computed once per dataset, shared by every pipeline declaring `f`, read by the names in `dataset.computed_columns`, probed on shorter prefixes cut as `predict`'s are, in each of the last five sixths of the rows.
+- `Pipeline(features=f)` with `f(dataset) -> {name: array}`: columns computed once per dataset, shared by every pipeline declaring `f`, read by the names in `dataset.computed_columns`, probed on shorter prefixes cut as `predict`'s are, in each of the last five sixths of the rows. The order of the columns is part of a fit's identity and of what the model sees: a booster samples `feature_fraction` and places monotone constraints by position, so reordering features refits and changes results. Treat the order as a declared choice.
+- `Pipeline(prepare=bin_rows)` with `bin_rows(dataset, train) -> object`: fit-time preprocessing built once per train range and feature columns within a run and shared by every pipeline declaring it, read by `fit` as `dataset.prepared`; it enters the fit id and is not recorded. The object is shared and read-only: its arrays are frozen, and a fit must not change it.
 - `Pipeline(postprocess=clip, postprocess_config=Clip(at=3.0))`: a stateless stage after `predict`, called as `clip(pred, dataset, rows, config)`; its config enters the prediction id, not the fit's.
-- `Pipeline(members=(a, b))`: a blend whose `predict` takes the members' predictions as a fourth argument.
+- `Pipeline(members=(a, b))`: a blend whose `predict` takes the members' predictions as a fourth argument. `ml_lab.mean_blend(*seeds, name="gbt_seed5")` is a stateless one: `fit=None`, no model recorded, the mean of its members; declare your own with `Pipeline(fit=None, predict=combine, members=...)`.
 - A test set: `record(..., sealed_from=4000)`, a row (the first row of its timestamp) or a date, seals the tail. An evaluation whose folds validate or train past it is refused unless it is `Evaluation(sealed=True)`, so validate on `BlockedKFold(n_splits=4, train_size=0.8)` or a split that ends before it. A sealed evaluation validates the tail only and trains before it, or on tail rows an earlier fold of it validated, so `Holdout(train_size=0.8)` cuts at row 4000 of 5000. It scores each pipeline id once, checked before any fit: a rerun after a code or scorer edit is refused even when its predictions match, and the later of two concurrent runs fails. The pick is the pipeline list committed in `test.py` before the run:
 
 ```python
@@ -165,7 +168,7 @@ def evaluations(dataset: str) -> list[Evaluation]:
 
 ## Time series
 
-`Dataset(columns, ts)` adds a clock: sorted timestamps, several rows to a timestamp for a cross-section. Every row-based cut lands on the first row of its timestamp. `CalendarWalkForward(first_cutoff="2021-05-04")` cuts every month, or every day with rows with `unit="day"`, and scores the next `test_units` units after each cutoff; `horizon=3` is another evaluation that shares every fit. A label known after its row's timestamp declares a reveal lag, `record(..., reveal={"y": timedelta(days=1)})` or an integer count of later dates with rows (`1` is the next trading day's open); labels not yet known are NaN to `predict`. `embargo_timestamps` (or `embargo_rows`) drops the train rows just before each cutoff. `ml_lab.panel.Panel(dataset, key)` grids a cross-section by (time, key) inside a features function, with `pivot` and `unpivot`.
+`Dataset(columns, ts)` adds a clock: sorted timestamps, several rows to a timestamp for a cross-section. Every row-based cut lands on the first row of its timestamp. `CalendarWalkForward(first_cutoff="2021-05-04")` cuts every month, or every day with rows with `unit="day"`, and scores the next `test_units` units after each cutoff; `horizon=3` is another evaluation that shares every fit; `train_units=12` trains on a rolling window of the last twelve units before each cutoff instead of everything before it. A label known after its row's timestamp declares a reveal lag, `record(..., reveal={"y": timedelta(days=1)})` or an integer count of later dates with rows (`1` is the next trading day's open); labels not yet known are NaN to `predict`. `embargo_timestamps` (or `embargo_rows`) drops the train rows just before each cutoff. `ml_lab.panel.Panel(dataset, key)` grids a cross-section by (time, key) inside a features function, with `pivot` and `unpivot`.
 
 - **"folds train on labels revealed after their test range starts"**: the embargo is shorter than the reveal lag; the message says how many more timestamps to purge.
 - **"a month is whole or dropped"**: the last month runs past the data; set `end=` or use `unit="day"`.
@@ -178,6 +181,7 @@ lab ingest project/dataset.py 20                     # calls dataset(ledger, "20
 lab run project/experiment.py                        # the newest dataset when the ledger holds one source; otherwise --dataset <source or id prefix>
 lab run project/experiment.py ideas/agent7.py        # pipelines from both files, the evaluations from one
 lab run project/experiment.py --dry-run              # every id computed, nothing written: what would fit and why; a new feature set is computed and probed, and kept for the run that follows
+lab note "ridge_shrunk replaces ridge" --tag decision --about <pipeline id> <score id>   # a record about ids the log holds, read from event_note
 ```
 
 A pipeline that raises is recorded as a failure and the rest continue; `lab run` exits 1 naming it. Views over the log, in `ml_lab.sqlite`, for `sqlite3` or DuckDB:
@@ -190,7 +194,7 @@ SELECT name, reference_name, delta_mean, delta_std, t, wins, n_folds FROM head_t
 WHERE source = 'toy' AND reference_name = 'ridge' AND metric = 'mse';
 ```
 
-`board` holds the latest score per evaluation, pipeline and metric, whoever recorded it; `direction` is the newest score's for that evaluation and metric, and `rank` (1 is the best) and `head_to_head`'s `wins` follow it, so a scorer edit that flips a direction reorders every row. `head_to_head` pairs pipelines fold by fold: `delta_mean` is name minus reference, `t` is fold-paired, and `pair_fold` holds the per-fold rows. At one fold, `ml_lab.paired` pairs the stored series row by row:
+`board` holds the latest score per evaluation, pipeline and metric, whoever recorded it, and `current = 1` marks the ids the newest run that listed each name declared, so an edited pipeline's old id drops out of `WHERE current = 1` (a pipeline no run lists any more stays current under its last name); `direction` is the newest score's for that evaluation and metric, and `rank` (1 is the best) and `head_to_head`'s `wins` follow it, so a scorer edit that flips a direction reorders every row. `head_to_head` pairs pipelines fold by fold: `delta_mean` is name minus reference, `t` is fold-paired, and `pair_fold` holds the per-fold rows. `ml_lab.paired_sets(ledger, evaluation, metric, [ids], [reference ids])` pairs a set against a set on the fold means, for a seed set as the reference. At one fold, or between an evaluation and a refit-cadence twin whose finer folds cover the same rows, `ml_lab.paired` pairs the stored series row by row:
 
 ```python
 from ml_lab import Ledger, paired
@@ -200,11 +204,11 @@ score = {r["name"]: r["score"] for r in ledger.sql("SELECT name, score FROM boar
 paired(ledger, score["ridge_shrunk"], score["ridge"], "0", block_rows=250)
 ```
 
-Predictions are Parquet files under `blobs/sha256/`, named by `event_prediction.blob`. The event tables, views, blob formats, declined designs and what is deferred: [docs/spec.md](docs/spec.md).
+`ml_lab.note(ledger, text, about=[...], tag="decision")` writes what `lab note` writes, and `ml_lab.load(ledger, dataset_id)` reads a recorded dataset back. Predictions are Parquet files under `blobs/sha256/`, named by `event_prediction.blob`. The event tables, views, blob formats, declined designs and what is deferred: [docs/spec.md](docs/spec.md).
 
 ## Trust boundary
 
-The guards see what a function receives. A function that reads a file, an environment variable, module globals set elsewhere, `.base` or `as_strided` on a view, or the feature store's path, or that caches across pipelines in a module global, or whose output depends on global random state, is outside the guards. The process is the trust boundary.
+The guards see what a function receives. A function that reads a file, an environment variable, module globals set elsewhere, `.base` or `as_strided` on a view, a train view's `columns._source`, or the feature store's path, or that caches across pipelines in a module global, or whose output depends on global random state, is outside the guards. The process is the trust boundary.
 
 ## Refusals you will meet
 
@@ -212,4 +216,5 @@ The guards see what a function receives. A function that reads a file, an enviro
 - **"the model loaded from its saved bytes predicts differently"**: `save` loses what `predict` reads.
 - **"is defined in ..., which the fit function does not import"**: a params class outside the memo's reach.
 - **"is not a module-level function of ..."**: a lambda, closure or method in a slot.
+- **"imported lazily"**: an import inside a function body, or a library that imports on first use: a JIT's first compile pulls in its optional dependencies (numba loads cffi, pycparser and charset_normalizer), which the lock computed at declaration does not hold. Import the named distributions at module level beside the function, or warm the library up at import by calling the compiled function once on a tiny array, so what runs is what the lock covers.
 - **"yields other folds than evaluation ... recorded"**: a split's code moved its folds; rename it or change a field.

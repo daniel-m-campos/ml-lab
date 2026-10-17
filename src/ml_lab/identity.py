@@ -68,6 +68,11 @@ def canonical(obj: Any) -> Any:
     """Reduce a declaration to JSON-serializable values with a stable form."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
+    if isinstance(obj, (np.timedelta64, np.datetime64)):
+        raise Refused(
+            f"cannot serialize {type(obj).__name__} into a declaration; use an int "
+            "or a float in a named unit"
+        )
     if isinstance(obj, (np.integer, np.floating, np.bool_)):
         return obj.item()
     if callable(obj):

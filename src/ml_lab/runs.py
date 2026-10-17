@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -28,6 +29,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 from collections import Counter
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -45,7 +47,7 @@ from ml_lab.dataset import (
     rows_load,
     rows_save,
 )
-from ml_lab.experiment import Evaluation, Pipeline
+from ml_lab.experiment import Evaluation, Fitted, Pipeline
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.splits import Fold
 
@@ -164,14 +166,9 @@ def run(
                         f"pipeline {p.name or name}: {slot} holds a "
                         f"{type(held).__name__}, not a function"
                     )
-        if pipeline.format not in formats.KNOWN:
-            raise Refused(
-                f"pipeline {name}: format {pipeline.format!r}, not one of "
-                f"{sorted(formats.KNOWN)}"
-            )
-    root = code_root or identity.repo_root(
-        pathlib.Path(sys.modules[pipelines[0].fit.__module__].__file__)
-    )
+        for p in _nested(pipeline):
+            _refuse_half_declared(p, name)
+    root = code_root or _project_root(pipelines)
     scoring = _scoring(evaluation)
     identity.refuse_unseen_code(
         [
@@ -188,8 +185,11 @@ def run(
     )
     for pipeline in pipelines:
         for p in _nested(pipeline):
-            shas = identity.import_shas((p.fit, p.save, p.load), root)
-            _refuse_unseen_class(p.params, shas, root, "fit")
+            if p.fit is not None:
+                shas = identity.import_shas((p.fit, p.save, p.load), root)
+                _refuse_unseen_class(p.params, shas, root, "fit")
+            shas = identity.import_shas((p.predict,), root)
+            _refuse_unseen_class(p.predict_config, shas, root, "predict")
             if p.postprocess is not None:
                 shas = identity.import_shas((p.postprocess,), root)
                 _refuse_unseen_class(p.postprocess_config, shas, root, "postprocess")
@@ -308,6 +308,7 @@ class _Run:
     planned: set[str]
     features: dict[str, Features] = dataclasses.field(default_factory=dict)
     stages: dict[str, _Stage] = dataclasses.field(default_factory=dict)
+    prepared: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def stage(self, pipeline: Pipeline) -> _Stage:
         """The run's one stage per pipeline id, so a shared member fits once."""
@@ -408,12 +409,20 @@ class _Stage:
     def _fit(self, fold: Fold, index: int) -> str:
         train = [list(seg) for seg in fold.train]
         member_fits = [m.fit(fold, index) for m in self.members]
+        columns_id = self._feature_columns_id()
+        if self.pipeline.fit is None:
+            return identity.content_hash(
+                {
+                    "stateless": True,
+                    "members": member_fits,
+                    **({"features": columns_id} if columns_id else {}),
+                }
+            )
         train_preds = (
             self._train_predictions(member_fits, fold, index)
             if self.members and _positional(self.pipeline.fit) > 3
             else []
         )
-        columns_id = self._feature_columns_id()
         fit_id = identity.content_hash(
             {
                 "dataset": self.evaluation.dataset_id,
@@ -440,6 +449,12 @@ class _Stage:
             )
             return fit_id
         visible = self._visible(max(hi for _, hi in fold.train)).train_view(fold.train)
+        visible.reveal = self.targets
+        split = self.evaluation.split
+        visible.embargo_timestamps = getattr(split, "embargo_timestamps", 0)
+        visible.embargo_rows = getattr(split, "embargo_rows", 0)
+        if self.pipeline.prepare is not None:
+            visible.prepared = self._prepare(visible, fold, columns_id)
         inputs = (
             [
                 [
@@ -464,6 +479,10 @@ class _Stage:
             *inputs,
         )
         duration = time.perf_counter() - started
+        facts = None
+        if isinstance(model, Fitted):
+            facts = _facts(self.name, model.facts)
+            model = model.model
         blob = self._model_blob(model)
         self.models[fit_id] = self.pipeline.load(self.ledger.get_blob(blob["sha"]))
         self._check_imports("fit", loaded)
@@ -484,6 +503,7 @@ class _Stage:
                 "model": blob,
                 **({"members": member_fits} if self.members else {}),
                 **({"features": columns_id} if columns_id else {}),
+                **({"facts": facts} if facts is not None else {}),
             },
         )
         self.report.fits_computed += 1
@@ -508,6 +528,11 @@ class _Stage:
                 "code_keys": self.stage_keys["predict"],
                 "env_lock": identity.bytes_hash(self.locks["predict"].encode()),
                 **({"members": member_preds} if self.members else {}),
+                **(
+                    {"predict_config": self.pipeline.predict_config}
+                    if self.pipeline.predict_config is not None
+                    else {}
+                ),
             }
         )
         pred_id = raw_id
@@ -534,11 +559,17 @@ class _Stage:
             self.report.predictions_computed += 1 + (raw_missing and raw_id != pred_id)
             self.planned.update((raw_id, pred_id))
             return pred_id
+        config = self.pipeline.predict_config
         where: dict[str, Any] = {
             "fit": fit_id,
             "range": list(rows),
             "fold": index,
             **({"members": member_preds} if self.members else {}),
+            **(
+                {"predict_config": identity.canonical(config)}
+                if config is not None
+                else {}
+            ),
         }
         visible = self._visible(rows[1])
         if train:
@@ -553,6 +584,8 @@ class _Stage:
             def predict(model: Any, view: Dataset, part: Range) -> np.ndarray:
                 head = part[1] - rows[0]
                 extra = [[a[:head] for a in inputs]] if self.members else []
+                if config is not None:
+                    extra.append(config)
                 return np.asarray(
                     _noted(
                         f"predict on fold {fold.label}",
@@ -616,6 +649,37 @@ class _Stage:
             )
             self.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
         return pred_id
+
+    def _prepare(self, visible: Dataset, fold: Fold, columns_id: str | None) -> Any:
+        """What ``prepare`` builds for the fold's train range, once per run across
+        every pipeline declaring the same function, code, environment, dataset,
+        feature columns and train segments.
+        """
+        prepare = self.pipeline.prepare
+        if not hasattr(self, "prepare_key"):
+            self.prepare_key = {
+                "prepare": prepare,
+                "code_keys": identity.code_keys((prepare,), self.root),
+                "env_lock": identity.bytes_hash(
+                    _lock_text(identity.imported_dists((prepare,), self.root)).encode()
+                ),
+            }
+        key = identity.content_hash(
+            {
+                **self.prepare_key,
+                "dataset": self.evaluation.dataset_id,
+                "train": [list(seg) for seg in fold.train],
+                **({"features": columns_id} if columns_id else {}),
+            }
+        )
+        if key not in self.prepared:
+            started = time.perf_counter()
+            self.prepared[key] = _frozen(
+                _noted(f"prepare on fold {fold.label}", prepare, visible, fold.train)
+            )
+            duration = time.perf_counter() - started
+            self.log(f"prepare {self.name} {fold.label} {duration:.1f}s")
+        return self.prepared[key]
 
     def _record_fit(
         self, fit_id: str, fold: Fold, loaded: np.ndarray, predict: Callable
@@ -818,8 +882,11 @@ class _Stage:
         planned.mkdir(exist_ok=True)
         stale = time.time() - PLANNED_DAYS * 86400
         for old in planned.iterdir():
-            if old.stat().st_mtime < stale:
-                old.unlink(missing_ok=True)
+            try:
+                if old.stat().st_mtime < stale:
+                    old.unlink(missing_ok=True)
+            except OSError:
+                continue
         (planned / f"{feature_id}.parquet").write_bytes(
             rows_save(Dataset(columns, None))
         )
@@ -841,10 +908,11 @@ class _Stage:
         """
         meta = self._planned_dir() / f"{feature_id}.json"
         data = self._planned_dir() / f"{feature_id}.parquet"
-        if not (meta.exists() and data.exists()):
+        try:
+            saved = json.loads(meta.read_text())
+            columns = rows_load(data).columns
+        except (OSError, ValueError):
             return None
-        saved = json.loads(meta.read_text())
-        columns = rows_load(data).columns
         if (
             list(columns) != saved["columns"]
             or _columns_id(columns) != saved["columns_id"]
@@ -1045,6 +1113,8 @@ class _Stage:
         """The fit's model loaded from its saved bytes once per run, or with ``fresh`` a
         new load, so a probe meets no state an earlier predict left in the model.
         """
+        if self.pipeline.fit is None:
+            return None
         if fresh or fit_id not in self.models:
             fit = self.ledger.latest(Event.FIT, fit_id)
             model = self.pipeline.load(
@@ -1482,6 +1552,109 @@ def _declare_evaluation(
     )
 
 
+def _facts(name: str, facts: Any) -> dict[str, Any]:
+    """A fit's facts as the log stores them: a dict of JSON values."""
+    if not isinstance(facts, dict):
+        raise Refused(
+            f"{name}: fit returned Fitted with facts of type "
+            f"{type(facts).__name__}; facts are a dict of JSON values"
+        )
+    try:
+        return json.loads(json.dumps(facts, default=_fact))
+    except (TypeError, ValueError, Refused) as error:
+        raise Refused(f"{name}: fit facts are not JSON values: {error}") from error
+
+
+def _fact(value: Any) -> Any:
+    """A fact as JSON: an array or numpy scalar by its values, else as a declaration
+    canonicalises it.
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return identity.canonical(value)
+
+
+def _frozen(prepared: Any, seen: set[int] | None = None, depth: int = 0) -> Any:
+    """A prepared object with every numpy array it holds, at any depth of dicts,
+    lists, tuples, sets, dataclasses and objects with a ``__dict__``, made
+    read-only, so a fit that writes into shared work raises instead of changing
+    what the next fit sees. An object that holds its arrays elsewhere (slots, C
+    state), a module or a class is handed over as it is, and nothing below
+    ``FREEZE_DEPTH`` levels is walked; the author keeps those read-only.
+    """
+    seen = set() if seen is None else seen
+    if id(prepared) in seen or depth > FREEZE_DEPTH:
+        return prepared
+    seen.add(id(prepared))
+    if isinstance(prepared, np.ndarray):
+        prepared.flags.writeable = False
+        return prepared
+    if isinstance(prepared, (types.ModuleType, type)):
+        return prepared
+    if isinstance(prepared, dict):
+        values = list(prepared.values())
+    elif isinstance(prepared, (list, tuple, set, frozenset)):
+        values = list(prepared)
+    elif dataclasses.is_dataclass(prepared) and not isinstance(prepared, type):
+        values = [getattr(prepared, f.name) for f in dataclasses.fields(prepared)]
+    elif hasattr(prepared, "__dict__") and not callable(prepared):
+        values = list(vars(prepared).values())
+    else:
+        return prepared
+    for value in values:
+        _frozen(value, seen, depth + 1)
+    return prepared
+
+
+FREEZE_DEPTH = 32
+
+
+def _project_root(pipelines: list[Pipeline]) -> pathlib.Path:
+    """The git root of the first declared function outside this package, so a
+    blend the tool ships (``mean_blend``) listed first does not make the tool's own
+    checkout the code root; the tool's root when every function is the tool's.
+    """
+    own = pathlib.Path(__file__).resolve().parent
+    for pipeline in pipelines:
+        for p in _nested(pipeline):
+            for function in p.functions:
+                file = getattr(sys.modules[function.__module__], "__file__", None)
+                if file and not pathlib.Path(file).resolve().is_relative_to(own):
+                    return identity.repo_root(pathlib.Path(file))
+    return identity.repo_root(own)
+
+
+def _refuse_half_declared(p: Pipeline, name: str):
+    """A pipeline fits with save, load and a known format, or is a stateless blend:
+    no fit, no save, load or format, and members.
+    """
+    label = p.name or name
+    if p.fit is None:
+        if not p.members:
+            raise Refused(
+                f"pipeline {label}: fit=None is a stateless blend, which needs members"
+            )
+        if p.save is not None or p.load is not None or p.format is not None:
+            raise Refused(
+                f"pipeline {label}: a stateless blend has no model, so no save, load "
+                "or format"
+            )
+        if p.params is not None or p.prepare is not None:
+            raise Refused(
+                f"pipeline {label}: a stateless blend has no fit to read params or "
+                "a prepare step; settings for its predict go in predict_config"
+            )
+        return
+    if p.save is None or p.load is None:
+        raise Refused(f"pipeline {label}: a fit needs save and load for its model")
+    if p.format not in formats.KNOWN:
+        raise Refused(
+            f"pipeline {label}: format {p.format!r}, not one of {sorted(formats.KNOWN)}"
+        )
+
+
 def _refuse_unseen_class(obj: Any, shas: dict[str, str], root: pathlib.Path, by: str):
     """A dataclass in a params object, at any depth, defined in a repo module its
     consumer does not import would let an edited default reuse a stale fit; refuse and
@@ -1524,13 +1697,13 @@ def _stages(pipeline: Pipeline) -> dict[str, tuple[Any, ...]]:
     post = pipeline.postprocess
     return {
         "features": pipeline.feature_functions,
-        "fit": (
-            pipeline.fit,
-            pipeline.save,
-            pipeline.load,
-            *_held(pipeline.params),
-        ),
-        "predict": (pipeline.predict,),
+        "fit": tuple(
+            f
+            for f in (pipeline.prepare, pipeline.fit, pipeline.save, pipeline.load)
+            if f is not None
+        )
+        + tuple(_held(pipeline.params)),
+        "predict": (pipeline.predict, *_held(pipeline.predict_config)),
         "postprocess": (post, *_held(pipeline.postprocess_config)) if post else (),
     }
 
@@ -1557,7 +1730,7 @@ def _positional(func: Callable) -> int:
 
 UNTRACKED_DIFF_CAP = 1 << 20
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-_SLOTS = ("fit", "predict", "save", "load", "postprocess")
+_SLOTS = ("prepare", "fit", "predict", "save", "load", "postprocess")
 
 
 def _git(ledger: Ledger, root: pathlib.Path) -> dict[str, Any]:
@@ -1632,7 +1805,9 @@ def _refuse_lazy_imports(
     if grown or lazy:
         raise Refused(
             f"{pipeline.name or pipeline.id}: {stage} imported lazily: modules "
-            f"{grown}, distributions {lazy}; import at module level"
+            f"{grown}, distributions {lazy}; import them at module level beside "
+            f"{stage}, so the lock covers them, or warm a library that imports on "
+            "first use there"
         )
 
 
@@ -1656,10 +1831,58 @@ def _text_blob(ledger: Ledger, text: str) -> dict[str, str]:
 
 
 def _host() -> dict[str, Any]:
-    return {
+    """Host facts for a run: the machine, and its NVIDIA GPUs with the driver and
+    CUDA versions when ``nvidia-smi`` answers, so a GPU fit's provenance names the
+    device that produced it. Facts never abort a run: a device the parser cannot
+    read is recorded as far as it was read.
+    """
+    facts = {
         "hostname": platform.node(),
         "system": platform.system(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count() or 1,
         "python": platform.python_version(),
     }
+    try:
+        return {**facts, **_gpus()}
+    except Exception as error:  # noqa: BLE001
+        return {**facts, "gpu_error": repr(error)}
+
+
+def _gpus() -> dict[str, Any]:
+    query = _command(
+        "nvidia-smi",
+        "--query-gpu=name,driver_version,memory.total",
+        "--format=csv,noheader,nounits",
+    )
+    if query is None:
+        return {}
+    gpus = []
+    for line in query.splitlines():
+        parts = [p.strip() for p in line.strip().rstrip(",").rsplit(",", 2)]
+        if len(parts) == 3:
+            name, driver, memory = parts
+            gpus.append(
+                {
+                    "name": name,
+                    "driver": driver,
+                    "memory_mb": int(memory) if memory.isdigit() else None,
+                }
+            )
+    summary = _command("nvidia-smi") or ""
+    cuda = re.search(r"CUDA Version:\s*([\d.]+)", summary)
+    return {"gpu": gpus, "cuda": cuda.group(1) if cuda else None}
+
+
+def _command(*args: str) -> str | None:
+    """A command's stdout, or None when it is missing, fails or hangs."""
+    try:
+        out = subprocess.run(
+            args, capture_output=True, text=True, check=True, timeout=COMMAND_TIMEOUT_S
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return out.stdout
+
+
+COMMAND_TIMEOUT_S = 5

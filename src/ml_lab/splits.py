@@ -16,6 +16,7 @@ Examples
 (1500, 2000)
 >>> BlockedKFold(n_splits=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
 'block 2'
+>>> inner, valid = inner_split(dataset, train, 0.1)  # inside fit  # doctest: +SKIP
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import datetime
 import numpy as np
 
 from ml_lab import dates
-from ml_lab.dataset import Dataset, Range, Segments
+from ml_lab.dataset import Dataset, Lag, Range, Segments
 from ml_lab.identity import Refused
 
 
@@ -82,7 +83,8 @@ class WalkForward:
 @dataclasses.dataclass(frozen=True)
 class CalendarWalkForward:
     """Cutoffs on the dataset clock every ``step`` units, a unit being a calendar month
-    or a day the clock has rows on; train on everything before each cutoff minus
+    or a day the clock has rows on; train on everything before each cutoff, or with
+    ``train_units`` on the last that many units before it, a rolling window, minus
     ``embargo_timestamps`` distinct timestamps, which cuts the train side, and score the
     ``horizon``-th run of ``test_units`` units after it, so ``horizon=1`` scores the
     ``test_units`` units right after the cutoff. A validation range ends on a unit
@@ -100,6 +102,7 @@ class CalendarWalkForward:
     embargo_timestamps: int = 0
     end: str | None = None
     min_folds: int = 3
+    train_units: int | None = None
 
     def folds(self, dataset: Dataset) -> list[Fold]:
         _require(
@@ -107,6 +110,7 @@ class CalendarWalkForward:
             test_units=(self.test_units, 1),
             embargo_timestamps=(self.embargo_timestamps, 0),
             horizon=(self.horizon, 1),
+            train_units=(1 if self.train_units is None else self.train_units, 1),
         )
         stop = dates.as_date(self.end) if self.end else dates.span(dataset)[1]
         at = self._boundaries(dataset, stop)
@@ -121,7 +125,8 @@ class CalendarWalkForward:
                 dataset.index_of(at[c + reach - self.test_units]),
                 dataset.index_of(at[c + reach]),
             )
-            out.append(Fold(str(at[c]), ((0, cut),), test))
+            start = 0 if self.train_units is None else self._window(dataset, at[c])
+            out.append(Fold(str(at[c]), ((start, cut),), test))
         why = (
             f"{max(len(at) - 1, 0)} {self.unit}s from the first cutoff "
             f"{self.first_cutoff} to {stop}, {reach} needed per fold"
@@ -133,6 +138,16 @@ class CalendarWalkForward:
                 "a validation range that runs to the data's end, or use unit='day'"
             )
         return _at_least(out, self.min_folds, why)
+
+    def _window(self, dataset: Dataset, cutoff: datetime.date) -> int:
+        """The first row of the rolling window: ``train_units`` units before the
+        cutoff, months by the calendar, days by the clock's days with rows.
+        """
+        if self.unit == "month":
+            return dataset.index_of(dates.add_months(cutoff, -self.train_units))
+        days = np.unique(dataset._clock().astype("datetime64[D]")).astype(datetime.date)
+        at = int(np.searchsorted(days, cutoff))
+        return dataset.index_of(days[max(at - self.train_units, 0)])
 
     def _boundaries(self, dataset: Dataset, stop: datetime.date) -> list[datetime.date]:
         """Unit boundaries from the first cutoff to ``stop`` inclusive."""
@@ -204,6 +219,79 @@ class Holdout:
         return _at_least([Fold("holdout", ((0, cut),), test)], 1)
 
 
+def inner_split(
+    dataset: Dataset,
+    train: Segments,
+    validation: int | float,
+    embargo_timestamps: int | None = None,
+) -> tuple[Segments, Range]:
+    """Cut a fold's train segments, inside ``fit``, into an inner train and a
+    validation range, for early stopping or any choice made on held-out rows.
+
+    The validation range is the tail of the last train segment: ``validation`` rows,
+    or that fraction of the train rows when below 1, its start snapped to the first
+    row of its timestamp. The inner train is the train segments before it, purged as
+    the evaluation purges: the evaluation's embargo, read from the view a fit
+    receives (``embargo_rows`` rows before the validation start, snapped to a
+    timestamp as ``WalkForward`` snaps, then ``embargo_timestamps`` distinct
+    timestamps; passing ``embargo_timestamps`` overrides the timestamps only; a
+    ``group`` column is not honoured, so a grouped split cuts its own), and every
+    row whose label the dataset's reveal lags say is not known when the validation
+    starts, so a round count chosen here reads no label the fold's own test would
+    hide. Refused when either side is empty.
+    """
+    rows = sum(hi - lo for lo, hi in train)
+    if not train or rows == 0:
+        raise Refused("inner_split needs train segments with rows")
+    if isinstance(validation, float) and 0 < validation < 1:
+        held = int(round(validation * rows))
+    elif isinstance(validation, int) and not isinstance(validation, bool):
+        held = validation
+    else:
+        raise Refused(
+            f"validation {validation!r}: a count of rows, or a fraction in (0, 1)"
+        )
+    start, end = train[-1]
+    at = _snap(dataset, max(end - held, start))
+    if at <= start or at >= end:
+        raise Refused(
+            f"validation of {held} rows leaves no inner train or no validation in the "
+            f"last train segment {train[-1]}; ask for fewer rows or a smaller fraction"
+        )
+    cut = _snap(dataset, max(at - getattr(dataset, "embargo_rows", 0), 0))
+    if embargo_timestamps is None:
+        embargo_timestamps = getattr(dataset, "embargo_timestamps", 0)
+    for _ in range(embargo_timestamps):
+        if cut and dataset.ts is not None:
+            cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
+        elif cut:
+            cut -= 1
+    for lag in getattr(dataset, "reveal", {}).values():
+        cut = min(cut, _known_before(dataset, at, lag))
+    inner = tuple((lo, min(hi, cut)) for lo, hi in train if lo < cut)
+    if not inner:
+        raise Refused(
+            f"the embargo and reveal lags purge every inner train row before "
+            f"validation row {at}; ask for a smaller validation"
+        )
+    return inner, (at, end)
+
+
+def _known_before(dataset: Dataset, at: int, lag: Lag) -> int:
+    """The rows whose labels are known when row ``at`` starts: a prefix length, as
+    ``Dataset.masked`` hides them.
+    """
+    ts = dataset.ts
+    if ts is None:
+        return at
+    if lag is None:
+        return int(np.searchsorted(ts, ts[at], "left"))
+    if isinstance(lag, np.timedelta64):
+        return int(np.searchsorted(ts, ts[at] - lag, "right"))
+    day = np.unique(ts.astype("datetime64[D]"), return_inverse=True)[1]
+    return int(np.searchsorted(day, day[at] - lag, "right"))
+
+
 def _snap(dataset: Dataset, row: int, groups: np.ndarray | None = None) -> int:
     """The first row of ``row``'s group, when ``groups`` holds the groups' first rows,
     then of its timestamp, so a cut never splits a group or a cross-section.
@@ -256,7 +344,10 @@ def _at_least(folds: list[Fold], minimum: int, why: str = "") -> list[Fold]:
         )
     bare = [f.label for f in folds if all(lo >= hi for lo, hi in f.train)]
     if bare:
-        raise Refused(f"split yields folds with no train rows: {bare}; start later")
+        raise Refused(
+            f"split yields folds with no train rows: {bare}; start later, or with a "
+            "rolling window make it longer than the embargo"
+        )
     twice = sorted(
         {f.label for f in folds if [g.label for g in folds].count(f.label) > 1}
     )

@@ -23,7 +23,8 @@ from __future__ import annotations
 import datetime
 import io
 import pathlib
-from collections.abc import Mapping, Sequence
+import sys
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -45,7 +46,10 @@ class Dataset:
     ``computed_columns`` names the columns a pipeline's features functions added, in
     order; they are not in ``columns`` but read on demand from the Parquet file in
     ``stores`` through ``column`` and ``matrix``, so a column no function names costs
-    no memory.
+    no memory. ``reveal`` holds the targets' reveal lags and ``embargo_timestamps``
+    and ``embargo_rows`` the evaluation's embargo on the view a fit receives, so
+    ``splits.inner_split`` purges what the evaluation would, and ``prepared`` what the
+    pipeline's ``prepare`` built for its train range.
     """
 
     def __init__(
@@ -63,6 +67,10 @@ class Dataset:
         self.stores = stores or {}
         self.cut: int | None = None
         self.keep: np.ndarray | None = None
+        self.reveal: dict[str, Lag] = {}
+        self.embargo_timestamps = 0
+        self.embargo_rows = 0
+        self.prepared: Any = None
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.isnat(self.ts).any():
             raise ValueError("timestamps must not contain NaT")
@@ -91,12 +99,19 @@ class Dataset:
         the full dataset stay valid, and nothing after ``row`` can be read.
         """
         view = Dataset.__new__(Dataset)
-        view.columns = {k: v[:row] for k, v in self.columns.items()}
+        if isinstance(self.columns, _Blanked):
+            view.columns = self.columns.upto(row)
+        else:
+            view.columns = {k: v[:row] for k, v in self.columns.items()}
         view.ts = None if self.ts is None else self.ts[:row]
         view.computed_columns = self.computed_columns
         view.stores = self.stores
         view.cut = min(row, self.rows)
         view.keep = None if self.keep is None else self.keep[:row]
+        view.reveal = self.reveal
+        view.embargo_timestamps = self.embargo_timestamps
+        view.embargo_rows = self.embargo_rows
+        view.prepared = self.prepared
         return view
 
     def masked(self, reveal: dict[str, Lag], at: int) -> Dataset:
@@ -124,11 +139,13 @@ class Dataset:
     def train_view(self, train: Segments) -> Dataset:
         """The view a fit sees: every column, computed columns included, blank outside
         ``train``, so a fit reads no row of a range it is scored on. A blank is NaN, NaT
-        or None by dtype; an integer or boolean column becomes float.
+        or None by dtype; an integer or boolean column becomes float. A column is
+        copied when first read, so a fit that reads ten columns of two hundred pays
+        for ten.
         """
         view = self.upto(self.rows)
         view.keep = row_mask(self.rows, train)
-        view.columns = {n: _blank(a, view.keep) for n, a in view.columns.items()}
+        view.columns = _Blanked(view.columns, view.keep)
         return view
 
     def boundary(self, row: int, lo: int = 0) -> int | None:
@@ -246,6 +263,49 @@ def stratified_order(y: np.ndarray, seed: int = 0) -> np.ndarray:
     return shuffled[np.lexsort((owner, rank / np.bincount(owner)[owner]))]
 
 
+class _Blanked(MutableMapping):
+    """A train view's columns: each is the source column blank outside ``keep``,
+    copied on its first read and kept, so a fit pays only for the columns it names.
+    ``upto`` is a further view, still unread, so a probe's shorter prefix copies
+    nothing either.
+    """
+
+    def __init__(self, source: Mapping[str, np.ndarray], keep: np.ndarray):
+        self._source = source
+        self._keep = keep
+        self._read: dict[str, np.ndarray] = {}
+
+    def __getitem__(self, name: str) -> np.ndarray:
+        if name not in self._read:
+            self._read[name] = _blank(self._source[name], self._keep)
+        return self._read[name]
+
+    def __setitem__(self, name: str, values: np.ndarray):
+        self._read[name] = values
+
+    def __delitem__(self, name: str):
+        raise TypeError("a train view's columns cannot be removed")
+
+    def __iter__(self) -> Iterator[str]:
+        added = [n for n in self._read if n not in self._source]
+        return iter([*self._source, *added])
+
+    def __len__(self) -> int:
+        return len(self._source) + sum(n not in self._source for n in self._read)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._source or name in self._read
+
+    def upto(self, row: int) -> _Blanked:
+        if isinstance(self._source, _Blanked):
+            source = self._source.upto(row)
+        else:
+            source = {n: a[:row] for n, a in self._source.items()}
+        view = _Blanked(source, self._keep[:row])
+        view._read = {n: a[:row] for n, a in self._read.items()}
+        return view
+
+
 def _blank(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
     """A copy of ``values`` blank where ``keep`` is False."""
     kind = values.dtype.kind
@@ -268,11 +328,16 @@ def record(
     params: Mapping[str, Any] | None = None,
     reveal: Mapping[str, datetime.timedelta | np.timedelta64 | int] | None = None,
     sealed_from: int | str | None = None,
+    steps: Sequence[Callable] = (),
 ) -> str:
     """Check the targets and store the rows; returns the dataset id.
 
-    ``source`` and ``params`` name how the rows were made, cleaning included, so clean
-    before ``record`` and name the cleaning in ``params``. ``reveal`` maps a target to
+    ``source`` and ``params`` name how the rows were made. ``steps`` are the
+    module-level functions that made them, the cleaning included: each is recorded
+    in the recipe by its dotted path with the code keys of its module and the modules
+    it imports, so the log says which code dropped the rows, and an edit to it shows
+    in the recipe of the next ingest. The id stays the rows' hash, so an edit that
+    leaves the rows as they were records nothing new. ``reveal`` maps a target to
     when its label is known: a ``timedelta`` or ``numpy.timedelta64`` after its row's
     timestamp, or an ``int`` of later dates with rows (``1`` is the next trading day's
     open, ``2`` two trading dates later whatever the calendar gap). A features function
@@ -300,6 +365,8 @@ def record(
     labels = {t: _lag(reveal[t]) if t in reveal else None for t in targets}
     window = [str(d) for d in dates.span(dataset)] if has_clock else None
     recipe = {"source": source, "params": params or {}, "targets": labels}
+    if steps:
+        recipe["steps"] = [_step(step) for step in steps]
     missing = [t for t in targets if t not in dataset.columns]
     if missing:
         raise KeyError(f"targets not in dataset: {missing}")
@@ -330,6 +397,24 @@ def record(
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
     return dataset_id
+
+
+def _step(step: Callable) -> dict[str, Any]:
+    """A cleaning function as the recipe records it: its dotted path, the code keys
+    of its module's closure hashed from the git root that holds it, and the
+    distributions it imports with their versions, which is all a function of an
+    installed package records.
+    """
+    ref = identity.function_ref(step)
+    file = getattr(sys.modules[step.__module__], "__file__", None)
+    if not file:
+        return {"function": ref, "code_keys": {}, "distributions": {}}
+    root = identity.repo_root(pathlib.Path(file))
+    return {
+        "function": ref,
+        "code_keys": identity.code_keys((step,), root),
+        "distributions": identity.imported_dists((step,), root),
+    }
 
 
 def _numeric(dtype: np.dtype) -> bool:

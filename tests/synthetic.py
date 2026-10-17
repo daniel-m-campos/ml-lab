@@ -11,9 +11,9 @@ import numpy as np
 from ml_lab import formats
 from ml_lab.dataset import Dataset, Range, Segments, record
 from ml_lab.dates import add_months, as_date
-from ml_lab.experiment import Evaluation, Pipeline, Scorer
+from ml_lab.experiment import Evaluation, Fitted, Pipeline, Scorer
 from ml_lab.ledger import Ledger
-from ml_lab.splits import CalendarWalkForward
+from ml_lab.splits import CalendarWalkForward, inner_split
 
 FEATURES = ("f0", "f1", "f2")
 TARGET = "ret_1"
@@ -142,6 +142,98 @@ def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeMo
     return ridge_fit(dataset, train, config)
 
 
+PREPARE_CALLS: list[tuple[int, int]] = []
+
+
+def centred_prepare(dataset: Dataset, train: Segments) -> dict[str, np.ndarray]:
+    """The train matrix and target, centred: what a binning step would build."""
+    PREPARE_CALLS.append(train[-1])
+    x = dataset.matrix(FEATURES, train)
+    y = dataset.column(TARGET, train)
+    return {"x": x - x.mean(axis=0), "y": y - y.mean(), "x_mean": x.mean(axis=0)}
+
+
+def prepared_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+    """Ridge on the prepared matrix, so two alphas share the preparation."""
+    p = dataset.prepared
+    weights = np.linalg.solve(
+        p["x"].T @ p["x"] + config.alpha * np.eye(p["x"].shape[1]), p["x"].T @ p["y"]
+    )
+    y_mean = dataset.column(TARGET, train).mean()
+    return RidgeModel(weights, float(y_mean - p["x_mean"] @ weights))
+
+
+def lagged_mean_predict(
+    model: None, dataset: Dataset, rows: Range, members: list[np.ndarray]
+) -> np.ndarray:
+    """A stateless blend that also reads its own computed column."""
+    lag = np.nan_to_num(dataset.column("f0_lag", rows))
+    return np.mean(np.stack(members, axis=0), axis=0) + 0.01 * lag
+
+
+def lagged_f1_as_f0(dataset: Dataset) -> dict[str, np.ndarray]:
+    return {"f0_lag": np.concatenate([[np.nan], dataset.columns["f1"][:-1]])}
+
+
+@dataclasses.dataclass(frozen=True)
+class Prepared:
+    x: np.ndarray
+    y: np.ndarray
+
+
+def dataclass_prepare(dataset: Dataset, train: Segments) -> Prepared:
+    p = centred_prepare(dataset, train)
+    return Prepared(p["x"], p["y"])
+
+
+def dataclass_mutating_fit(
+    dataset: Dataset, train: Segments, config: RidgeConfig
+) -> RidgeModel:
+    dataset.prepared.x[:] = 0.0
+    return ridge_fit(dataset, train, config)
+
+
+def mutating_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+    """Writes into the shared prepared matrix: refused by the frozen array."""
+    dataset.prepared["x"][:] = 0.0
+    return prepared_fit(dataset, train, config)
+
+
+def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+    """Ridge with facts beside the model: what an inner choice would record."""
+    model = ridge_fit(dataset, train, config)
+    rows = sum(hi - lo for lo, hi in train)
+    return Fitted(
+        model,
+        {
+            "rows": rows,
+            "bias": model.bias,
+            "chosen": "ridge",
+            "weights": model.weights,
+            "n": np.int64(rows),
+        },
+    )
+
+
+def inner_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+    """Chooses alpha on an inner validation cut by the tool, refits on the whole
+    train range and records the choice, as an early-stopped booster would.
+    """
+    inner, valid = inner_split(dataset, train, 0.2)
+    errors = {}
+    for alpha in (0.1, 1.0, 10.0):
+        model = ridge_fit(dataset, inner, dataclasses.replace(config, alpha=alpha))
+        pred = ridge_predict(model, dataset, valid)
+        errors[alpha] = float(np.mean((pred - dataset.column(TARGET, valid)) ** 2))
+    best = min(errors, key=errors.get)
+    model = ridge_fit(dataset, train, dataclasses.replace(config, alpha=best))
+    return Fitted(model, {"alpha": best, "inner": inner, "validation": valid})
+
+
+def bad_facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+    return Fitted(ridge_fit(dataset, train, config), {"when": object()})
+
+
 def ridge_save(model: RidgeModel) -> bytes:
     return formats.arrays_save(
         {"weights": model.weights, "bias": np.array([model.bias])}
@@ -155,6 +247,19 @@ def ridge_load(payload: bytes) -> RidgeModel:
 
 def scale(pred: np.ndarray, dataset: Dataset, rows: Range, factor: float) -> np.ndarray:
     return pred * factor
+
+
+@dataclasses.dataclass(frozen=True)
+class SignConfig:
+    feature: str = "f0"
+    sign: float = 1.0
+
+
+def sign_predict(
+    model: RidgeModel, dataset: Dataset, rows: Range, config: SignConfig
+) -> np.ndarray:
+    """A rule baseline: the sign of one feature, set by its predict config."""
+    return config.sign * np.sign(dataset.column(config.feature, rows))
 
 
 @dataclasses.dataclass(frozen=True)
