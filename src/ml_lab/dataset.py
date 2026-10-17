@@ -20,6 +20,7 @@ Examples
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import io
 import pathlib
@@ -46,10 +47,8 @@ class Dataset:
     ``computed_columns`` names the columns a pipeline's features functions added, in
     order; they are not in ``columns`` but read on demand from the Parquet file in
     ``stores`` through ``column`` and ``matrix``, so a column no function names costs
-    no memory. ``reveal`` holds the targets' reveal lags and ``embargo_timestamps``
-    and ``embargo_rows`` the evaluation's embargo on the view a fit receives, so
-    ``splits.inner_split`` purges what the evaluation would, and ``prepared`` what the
-    pipeline's ``prepare`` built for its train range.
+    no memory. ``reveal`` holds the targets' reveal lags, recorded with the data and
+    set by ``load``. What a fold adds for one fit is not here: ``FitView`` carries it.
     """
 
     def __init__(
@@ -58,6 +57,7 @@ class Dataset:
         ts: np.ndarray | None = None,
         computed_columns: tuple[str, ...] = (),
         stores: dict[str, pathlib.Path] | None = None,
+        reveal: Mapping[str, Lag] | None = None,
     ):
         self.columns = {
             n: a.astype("datetime64[ns]", copy=False) if a.dtype.kind == "M" else a
@@ -67,10 +67,7 @@ class Dataset:
         self.stores = stores or {}
         self.cut: int | None = None
         self.keep: np.ndarray | None = None
-        self.reveal: dict[str, Lag] = {}
-        self.embargo_timestamps = 0
-        self.embargo_rows = 0
-        self.prepared: Any = None
+        self.reveal: dict[str, Lag] = dict(reveal or {})
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.isnat(self.ts).any():
             raise ValueError("timestamps must not contain NaT")
@@ -109,9 +106,6 @@ class Dataset:
         view.cut = min(row, self.rows)
         view.keep = None if self.keep is None else self.keep[:row]
         view.reveal = self.reveal
-        view.embargo_timestamps = self.embargo_timestamps
-        view.embargo_rows = self.embargo_rows
-        view.prepared = self.prepared
         return view
 
     def masked(self, reveal: dict[str, Lag], at: int) -> Dataset:
@@ -232,6 +226,59 @@ class Dataset:
         if self.ts is None:
             raise Refused("dataset has no timestamps; use a row-based split")
         return self.ts
+
+
+@dataclasses.dataclass(frozen=True)
+class FitView:
+    """What ``fit`` and ``prepare`` receive: the dataset blank outside the fold's train
+    segments, with the fold's context beside it. It reads as a ``Dataset`` through
+    ``column``, ``matrix``, ``columns``, ``ts``, ``rows``, ``index_of``, ``date_at``,
+    ``computed_columns`` and ``reveal``, and adds ``train``, the evaluation's
+    ``embargo_rows`` and ``embargo_timestamps`` (so ``splits.inner_split`` purges what
+    the evaluation would) and ``prepared``, what the pipeline's ``prepare`` built for
+    this train range.
+    """
+
+    data: Dataset
+    train: Segments
+    embargo_rows: int = 0
+    embargo_timestamps: int = 0
+    prepared: Any = None
+
+    def __repr__(self) -> str:
+        return f"FitView({self.data!r}, train={self.train})"
+
+    @property
+    def columns(self) -> Mapping[str, np.ndarray]:
+        return self.data.columns
+
+    @property
+    def ts(self) -> np.ndarray | None:
+        return self.data.ts
+
+    @property
+    def rows(self) -> int:
+        return self.data.rows
+
+    @property
+    def computed_columns(self) -> tuple[str, ...]:
+        return self.data.computed_columns
+
+    @property
+    def reveal(self) -> dict[str, Lag]:
+        return self.data.reveal
+
+    def index_of(self, when: str | datetime.date | datetime.datetime) -> int:
+        return self.data.index_of(when)
+
+    def date_at(self, row: int) -> datetime.date:
+        return self.data.date_at(row)
+
+    def matrix(self, cols: Sequence[str], rows: Rows | None = None) -> np.ndarray:
+        return self.data.matrix(cols, rows)
+
+    def column(self, name: str, rows: Rows | None = None) -> np.ndarray:
+        return self.data.column(name, rows)
 
 
 def segments(rows: Rows) -> tuple[Range, ...]:
@@ -440,6 +487,17 @@ def _sealed(dataset: Dataset, sealed_from: int | str | None) -> int | None:
     return int(row)
 
 
+def _stored_lag(stored: Any) -> Lag:
+    """A recipe's reveal lag back as a ``Lag``: seconds as a timedelta, ``{"dates":
+    n}`` as an int, None as None.
+    """
+    if stored is None:
+        return None
+    if isinstance(stored, dict):
+        return int(stored["dates"])
+    return np.timedelta64(round(stored * 1e9), "ns")
+
+
 def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str, int]:
     """Seconds for a time lag, ``{"dates": n}`` for a count of later dates."""
     time = isinstance(reveal, (datetime.timedelta, np.timedelta64))
@@ -494,11 +552,14 @@ def resolve(ledger: Ledger, prefix: str) -> str:
 
 
 def load(ledger: Ledger, dataset_id: str) -> Dataset:
-    """Load a recorded dataset's rows, resident."""
+    """Load a recorded dataset's rows, resident, with its targets' reveal lags."""
     event = ledger.latest(Event.DATASET, dataset_id)
     if event is None:
         raise KeyError(f"dataset {dataset_id} not found")
-    return rows_load(ledger.blobs / event["payload"]["blob"]["sha"])
+    dataset = rows_load(ledger.blobs / event["payload"]["blob"]["sha"])
+    targets = event["payload"]["recipe"]["targets"]
+    dataset.reveal = {name: _stored_lag(lag) for name, lag in targets.items()}
+    return dataset
 
 
 # Bytes ================================================================================

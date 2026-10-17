@@ -459,6 +459,7 @@ def test_the_package_exports_what_a_project_imports():
     assert sorted(ml_lab.__all__) == [
         "Dataset",
         "Evaluation",
+        "FitView",
         "Fitted",
         "Fold",
         "Ledger",
@@ -3738,36 +3739,46 @@ def test_inner_split_cuts_a_validation_tail_purged_as_the_evaluation_would(
     ledger, dataset, evaluation
 ):
     data = load(ledger, dataset)
-    train = ((0, 2000),)
-    inner, valid = splits.inner_split(data, train, 0.1)
-    assert valid == (1800, 2000) and inner == ((0, 1800),)
-    assert splits.inner_split(data, train, 250)[1] == (1750, 2000)
-    assert splits.inner_split(data, train, 0.1, embargo_timestamps=2)[0] == ((0, 1798),)
-    data.reveal = {synthetic.TARGET: 1}
-    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1800),)
-    data.reveal = {synthetic.TARGET: 2}
-    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1780),)
-    data.reveal = {synthetic.TARGET: np.timedelta64(1, "D")}
-    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1781),)
-    data.reveal = {synthetic.TARGET: None}
-    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1800),)
+    assert data.reveal == {synthetic.TARGET: None}
     data.reveal = {}
-    data.embargo_timestamps = 2
-    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1798),)
-    assert splits.inner_split(data, train, 0.1, embargo_timestamps=0)[0] == ((0, 1800),)
-    data.embargo_timestamps, data.embargo_rows = 0, 5
-    assert splits.inner_split(data, train, 0.1)[0] == ((0, 1795),)
-    assert splits.inner_split(data, train, 0.1, embargo_timestamps=1)[0] == ((0, 1794),)
-    data.embargo_rows = 0
+    train = ((0, 2000),)
+    view = ml_lab.FitView(data.train_view(train), train)
+    assert view.rows == data.rows and view.column("f0", (0, 3)).shape == (3,)
+    assert np.isnan(view.columns["f0"][2000:]).all() and view.reveal == {}
+    with pytest.raises(Refused, match="pass fit's dataset argument"):
+        splits.inner_split(data, train, 0.1)
+    inner, valid = splits.inner_split(view, train, 0.1)
+    assert valid == (1800, 2000) and inner == ((0, 1800),)
+    assert splits.inner_split(view, train, 250)[1] == (1750, 2000)
+    assert splits.inner_split(view, train, 0.1, embargo_timestamps=2)[0] == ((0, 1798),)
+    view.data.reveal = {synthetic.TARGET: 1}
+    assert splits.inner_split(view, train, 0.1)[0] == ((0, 1800),)
+    view.data.reveal = {synthetic.TARGET: 2}
+    assert splits.inner_split(view, train, 0.1)[0] == ((0, 1780),)
+    view.data.reveal = {synthetic.TARGET: np.timedelta64(1, "D")}
+    assert splits.inner_split(view, train, 0.1)[0] == ((0, 1781),)
+    view.data.reveal = {synthetic.TARGET: None}
+    assert splits.inner_split(view, train, 0.1)[0] == ((0, 1800),)
+    view.data.reveal = {}
+    stamped = dataclasses.replace(view, embargo_timestamps=2)
+    assert splits.inner_split(stamped, train, 0.1)[0] == ((0, 1798),)
+    assert splits.inner_split(stamped, train, 0.1, embargo_timestamps=0)[0] == (
+        (0, 1800),
+    )
+    rowed = dataclasses.replace(view, embargo_rows=5)
+    assert splits.inner_split(rowed, train, 0.1)[0] == ((0, 1795),)
+    assert splits.inner_split(rowed, train, 0.1, embargo_timestamps=1)[0] == (
+        (0, 1794),
+    )
     two = ((0, 500), (1000, 2000))
-    assert splits.inner_split(data, two, 0.5) == (
+    assert splits.inner_split(view, two, 0.5) == (
         ((0, 500), (1000, 1250)),
         (1250, 2000),
     )
     with pytest.raises(Refused, match="no inner train or no validation"):
-        splits.inner_split(data, two, 1000)
+        splits.inner_split(view, two, 1000)
     with pytest.raises(Refused, match="a count of rows, or a fraction"):
-        splits.inner_split(data, train, 1.5)
+        splits.inner_split(view, train, 1.5)
     chooser = dataclasses.replace(
         synthetic.ridge(1), fit=synthetic.inner_fit, name="inner"
     )
