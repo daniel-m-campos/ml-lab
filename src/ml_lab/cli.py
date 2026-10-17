@@ -182,11 +182,11 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
             f"total over {len(evaluations)} evaluations: {verb} {_counts(total)}; "
             f"reuse {_reuse(total)}"
         )
-    if args.dry_run:
+    if args.dry_run and total.features_computed:
         print(
-            "dry run: a new feature set was computed and probed on its first span "
-            "only; the full probes and those of predict and postprocess run only in "
-            "the real run"
+            "dry run: a new feature set is computed and probed on its first span "
+            "only, or taken from an earlier dry run; the full probes and those of "
+            "predict and postprocess run only in the real run"
         )
     if failed:
         print(f"failed, skipped in later evaluations: {', '.join(failed)}")

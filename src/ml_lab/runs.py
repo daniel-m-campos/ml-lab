@@ -882,8 +882,11 @@ class _Stage:
         planned.mkdir(exist_ok=True)
         stale = time.time() - PLANNED_DAYS * 86400
         for old in planned.iterdir():
-            if old.stat().st_mtime < stale:
-                old.unlink(missing_ok=True)
+            try:
+                if old.stat().st_mtime < stale:
+                    old.unlink(missing_ok=True)
+            except OSError:
+                continue
         (planned / f"{feature_id}.parquet").write_bytes(
             rows_save(Dataset(columns, None))
         )
@@ -905,10 +908,11 @@ class _Stage:
         """
         meta = self._planned_dir() / f"{feature_id}.json"
         data = self._planned_dir() / f"{feature_id}.parquet"
-        if not (meta.exists() and data.exists()):
+        try:
+            saved = json.loads(meta.read_text())
+            columns = rows_load(data).columns
+        except (OSError, ValueError):
             return None
-        saved = json.loads(meta.read_text())
-        columns = rows_load(data).columns
         if (
             list(columns) != saved["columns"]
             or _columns_id(columns) != saved["columns_id"]
