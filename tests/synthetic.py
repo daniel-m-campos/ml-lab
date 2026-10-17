@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from ml_lab import formats
-from ml_lab.dataset import Dataset, Range, Segments, record
+from ml_lab.dataset import Dataset, FitView, Range, Segments, record
 from ml_lab.dates import add_months, as_date
 from ml_lab.experiment import Evaluation, Fitted, Pipeline, Scorer
 from ml_lab.ledger import Ledger
@@ -76,7 +76,7 @@ class RidgeModel:
     bias: float
 
 
-def ridge_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+def ridge_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeModel:
     rows = train
     if dataset.ts is not None and config.train_window_months:
         start, end = train[0][0], train[-1][1]
@@ -128,13 +128,13 @@ FLAKY_CALLS: list[int] = []
 SEEN_ROWS: list[int] = []
 
 
-def peeking_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+def peeking_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Records how many rows it could see; the guard test reads it."""
     SEEN_ROWS.append(dataset.rows)
     return ridge_fit(dataset, train, config)
 
 
-def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+def flaky_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Raises on its third call ever; the test clears ``FLAKY_CALLS`` to arm it."""
     FLAKY_CALLS.append(train[-1][1])
     if len(FLAKY_CALLS) == 3:
@@ -145,7 +145,7 @@ def flaky_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeMo
 PREPARE_CALLS: list[tuple[int, int]] = []
 
 
-def centred_prepare(dataset: Dataset, train: Segments) -> dict[str, np.ndarray]:
+def centred_prepare(dataset: FitView, train: Segments) -> dict[str, np.ndarray]:
     """The train matrix and target, centred: what a binning step would build."""
     PREPARE_CALLS.append(train[-1])
     x = dataset.matrix(FEATURES, train)
@@ -153,7 +153,7 @@ def centred_prepare(dataset: Dataset, train: Segments) -> dict[str, np.ndarray]:
     return {"x": x - x.mean(axis=0), "y": y - y.mean(), "x_mean": x.mean(axis=0)}
 
 
-def prepared_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+def prepared_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Ridge on the prepared matrix, so two alphas share the preparation."""
     p = dataset.prepared
     weights = np.linalg.solve(
@@ -181,25 +181,25 @@ class Prepared:
     y: np.ndarray
 
 
-def dataclass_prepare(dataset: Dataset, train: Segments) -> Prepared:
+def dataclass_prepare(dataset: FitView, train: Segments) -> Prepared:
     p = centred_prepare(dataset, train)
     return Prepared(p["x"], p["y"])
 
 
 def dataclass_mutating_fit(
-    dataset: Dataset, train: Segments, config: RidgeConfig
+    dataset: FitView, train: Segments, config: RidgeConfig
 ) -> RidgeModel:
     dataset.prepared.x[:] = 0.0
     return ridge_fit(dataset, train, config)
 
 
-def mutating_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> RidgeModel:
+def mutating_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeModel:
     """Writes into the shared prepared matrix: refused by the frozen array."""
     dataset.prepared["x"][:] = 0.0
     return prepared_fit(dataset, train, config)
 
 
-def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+def facts_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     """Ridge with facts beside the model: what an inner choice would record."""
     model = ridge_fit(dataset, train, config)
     rows = sum(hi - lo for lo, hi in train)
@@ -215,7 +215,7 @@ def facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
     )
 
 
-def inner_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+def inner_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     """Chooses alpha on an inner validation cut by the tool, refits on the whole
     train range and records the choice, as an early-stopped booster would.
     """
@@ -230,7 +230,7 @@ def inner_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
     return Fitted(model, {"alpha": best, "inner": inner, "validation": valid})
 
 
-def bad_facts_fit(dataset: Dataset, train: Segments, config: RidgeConfig) -> Fitted:
+def bad_facts_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     return Fitted(ridge_fit(dataset, train, config), {"when": object()})
 
 
@@ -273,7 +273,7 @@ class BlendModel:
 
 
 def blend_fit(
-    dataset: Dataset, train: Segments, config: BlendConfig, members: list[np.ndarray]
+    dataset: FitView, train: Segments, config: BlendConfig, members: list[np.ndarray]
 ) -> BlendModel:
     """Least squares on the members' in-sample predictions, shrunk toward equal."""
     x = np.column_stack(members)
@@ -297,7 +297,7 @@ def blend_load(payload: bytes) -> BlendModel:
     return BlendModel(formats.arrays_load(payload)["weights"])
 
 
-def equal_fit(dataset: Dataset, train: Segments, config: BlendConfig) -> BlendModel:
+def equal_fit(dataset: FitView, train: Segments, config: BlendConfig) -> BlendModel:
     """Fixed equal weights: three parameters, so no in-sample member predictions."""
     return BlendModel(np.full(2, 0.5))
 
@@ -325,7 +325,7 @@ def peeking_predict(model: RidgeModel, dataset: Dataset, rows: Range) -> np.ndar
     return ridge_predict(model, dataset, rows) + dataset.column("f0", rows).mean()
 
 
-def self_editing_fit(dataset: Dataset, train: Segments, config: RidgeConfig):
+def self_editing_fit(dataset: FitView, train: Segments, config: RidgeConfig):
     """Appends a comment to its own module while fitting."""
     path = pathlib.Path(__file__)
     path.write_text(path.read_text() + "\n# edited during the run\n")
@@ -495,7 +495,7 @@ def label_one_row_back(dataset: Dataset) -> dict[str, np.ndarray]:
 
 
 def label_memory_fit(
-    dataset: Dataset, train: Segments, config: RidgeConfig
+    dataset: FitView, train: Segments, config: RidgeConfig
 ) -> RidgeModel:
     """Memorizes every label it can see, inside its train segments or not."""
     return RidgeModel(dataset.column(TARGET), 0.0)

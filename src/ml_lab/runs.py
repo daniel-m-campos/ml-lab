@@ -39,6 +39,7 @@ import numpy as np
 from ml_lab import formats, identity
 from ml_lab.dataset import (
     Dataset,
+    FitView,
     Lag,
     Range,
     load,
@@ -200,7 +201,7 @@ def run(
     )
     dataset = load(ledger, evaluation.dataset_id)
     recorded = ledger.latest(Event.DATASET, evaluation.dataset_id)["payload"]
-    targets = {name: _lag(lag) for name, lag in recorded["recipe"]["targets"].items()}
+    targets = dataset.reveal
     schedule = evaluation.split.folds(dataset)
     _refuse_overlap(schedule)
     _refuse_unrevealed(dataset, targets, schedule)
@@ -448,13 +449,16 @@ class _Stage:
                 f"would fit {self.name} {fold.label}: {self._why(fold.label, train)}"
             )
             return fit_id
-        visible = self._visible(max(hi for _, hi in fold.train)).train_view(fold.train)
-        visible.reveal = self.targets
         split = self.evaluation.split
-        visible.embargo_timestamps = getattr(split, "embargo_timestamps", 0)
-        visible.embargo_rows = getattr(split, "embargo_rows", 0)
+        visible = FitView(
+            self._visible(max(hi for _, hi in fold.train)).train_view(fold.train),
+            fold.train,
+            embargo_rows=getattr(split, "embargo_rows", 0),
+            embargo_timestamps=getattr(split, "embargo_timestamps", 0),
+        )
         if self.pipeline.prepare is not None:
-            visible.prepared = self._prepare(visible, fold, columns_id)
+            prepared = self._prepare(visible, fold, columns_id)
+            visible = dataclasses.replace(visible, prepared=prepared)
         inputs = (
             [
                 [
@@ -650,7 +654,7 @@ class _Stage:
             self.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
         return pred_id
 
-    def _prepare(self, visible: Dataset, fold: Fold, columns_id: str | None) -> Any:
+    def _prepare(self, visible: FitView, fold: Fold, columns_id: str | None) -> Any:
         """What ``prepare`` builds for the fold's train range, once per run across
         every pipeline declaring the same function, code, environment, dataset,
         feature columns and train segments.
@@ -728,7 +732,11 @@ class _Stage:
             names = tuple(n for columns, _, _ in sets for n in columns)
             stores = {n: path for columns, path, _ in sets for n in columns}
             self.featured = Dataset(
-                self.dataset.columns, self.dataset.ts, names, stores
+                self.dataset.columns,
+                self.dataset.ts,
+                names,
+                stores,
+                reveal=self.dataset.reveal,
             )
         return self.featured.upto(cut)
 
@@ -1469,15 +1477,6 @@ def _lag_text(lag: Lag) -> str:
     if isinstance(lag, np.timedelta64):
         return str(datetime.timedelta(seconds=float(lag / np.timedelta64(1, "s"))))
     return f"{lag} dates"
-
-
-def _lag(stored: Any) -> Lag:
-    """A recipe's reveal lag: seconds as a timedelta, ``{"dates": n}`` as an int."""
-    if stored is None:
-        return None
-    if isinstance(stored, dict):
-        return int(stored["dates"])
-    return np.timedelta64(round(stored * 1e9), "ns")
 
 
 def _columns_id(columns: dict[str, np.ndarray]) -> str:

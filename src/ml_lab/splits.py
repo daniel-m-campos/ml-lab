@@ -27,7 +27,7 @@ import datetime
 import numpy as np
 
 from ml_lab import dates
-from ml_lab.dataset import Dataset, Lag, Range, Segments
+from ml_lab.dataset import Dataset, FitView, Lag, Range, Segments
 from ml_lab.identity import Refused
 
 
@@ -220,7 +220,7 @@ class Holdout:
 
 
 def inner_split(
-    dataset: Dataset,
+    dataset: FitView,
     train: Segments,
     validation: int | float,
     embargo_timestamps: int | None = None,
@@ -228,18 +228,23 @@ def inner_split(
     """Cut a fold's train segments, inside ``fit``, into an inner train and a
     validation range, for early stopping or any choice made on held-out rows.
 
-    The validation range is the tail of the last train segment: ``validation`` rows,
-    or that fraction of the train rows when below 1, its start snapped to the first
-    row of its timestamp. The inner train is the train segments before it, purged as
-    the evaluation purges: the evaluation's embargo, read from the view a fit
-    receives (``embargo_rows`` rows before the validation start, snapped to a
+    ``dataset`` is the ``FitView`` a fit receives. The validation range is the tail
+    of the last train segment: ``validation`` rows, or that fraction of the train
+    rows when below 1, its start snapped to the first row of its timestamp. The inner
+    train is the train segments before it, purged as the evaluation purges: the
+    view's embargo (``embargo_rows`` rows before the validation start, snapped to a
     timestamp as ``WalkForward`` snaps, then ``embargo_timestamps`` distinct
     timestamps; passing ``embargo_timestamps`` overrides the timestamps only; a
     ``group`` column is not honoured, so a grouped split cuts its own), and every
-    row whose label the dataset's reveal lags say is not known when the validation
+    row whose label the view's reveal lags say is not known when the validation
     starts, so a round count chosen here reads no label the fold's own test would
-    hide. Refused when either side is empty.
+    hide. Refused when either side is empty, or when ``dataset`` is not the view.
     """
+    if not isinstance(dataset, FitView):
+        raise Refused(
+            "inner_split reads the embargo and reveal lags from the view a fit "
+            "receives; pass fit's dataset argument, a FitView"
+        )
     rows = sum(hi - lo for lo, hi in train)
     if not train or rows == 0:
         raise Refused("inner_split needs train segments with rows")
@@ -258,15 +263,15 @@ def inner_split(
             f"validation of {held} rows leaves no inner train or no validation in the "
             f"last train segment {train[-1]}; ask for fewer rows or a smaller fraction"
         )
-    cut = _snap(dataset, max(at - getattr(dataset, "embargo_rows", 0), 0))
+    cut = _snap(dataset, max(at - dataset.embargo_rows, 0))
     if embargo_timestamps is None:
-        embargo_timestamps = getattr(dataset, "embargo_timestamps", 0)
+        embargo_timestamps = dataset.embargo_timestamps
     for _ in range(embargo_timestamps):
         if cut and dataset.ts is not None:
             cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
         elif cut:
             cut -= 1
-    for lag in getattr(dataset, "reveal", {}).values():
+    for lag in dataset.reveal.values():
         cut = min(cut, _known_before(dataset, at, lag))
     inner = tuple((lo, min(hi, cut)) for lo, hi in train if lo < cut)
     if not inner:
