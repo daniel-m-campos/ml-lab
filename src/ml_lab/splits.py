@@ -27,7 +27,7 @@ import datetime
 import numpy as np
 
 from ml_lab import dates
-from ml_lab.dataset import Dataset, FitView, Lag, Range, Segments
+from ml_lab.dataset import Dataset, FitView, Range, Segments, known_before
 from ml_lab.identity import Refused
 
 
@@ -69,7 +69,7 @@ class WalkForward:
         out: list[Fold] = []
         cutoff = self.first_cutoff_rows
         while cutoff + self.horizon * self.test_rows <= dataset.rows:
-            end = _snap(dataset, max(cutoff - self.embargo_rows, 0))
+            end = purge(dataset, cutoff, embargo_rows=self.embargo_rows)
             start = (
                 0 if self.max_train_rows is None else max(end - self.max_train_rows, 0)
             )
@@ -117,10 +117,11 @@ class CalendarWalkForward:
         reach = self.horizon * self.test_units
         out: list[Fold] = []
         for c in range(0, len(at) - reach, self.step):
-            cut = dataset.index_of(at[c])
-            for _ in range(self.embargo_timestamps):
-                if cut:
-                    cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
+            cut = purge(
+                dataset,
+                dataset.index_of(at[c]),
+                embargo_timestamps=self.embargo_timestamps,
+            )
             test = (
                 dataset.index_of(at[c + reach - self.test_units]),
                 dataset.index_of(at[c + reach]),
@@ -263,16 +264,11 @@ def inner_split(
             f"validation of {held} rows leaves no inner train or no validation in the "
             f"last train segment {train[-1]}; ask for fewer rows or a smaller fraction"
         )
-    cut = _snap(dataset, max(at - dataset.embargo_rows, 0))
     if embargo_timestamps is None:
         embargo_timestamps = dataset.embargo_timestamps
-    for _ in range(embargo_timestamps):
-        if cut and dataset.ts is not None:
-            cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
-        elif cut:
-            cut -= 1
+    cut = purge(dataset, at, dataset.embargo_rows, embargo_timestamps)
     for lag in dataset.reveal.values():
-        cut = min(cut, _known_before(dataset, at, lag))
+        cut = min(cut, known_before(dataset, at, lag))
     inner = tuple((lo, min(hi, cut)) for lo, hi in train if lo < cut)
     if not inner:
         raise Refused(
@@ -282,22 +278,29 @@ def inner_split(
     return inner, (at, end)
 
 
-def _known_before(dataset: Dataset, at: int, lag: Lag) -> int:
-    """The rows whose labels are known when row ``at`` starts: a prefix length, as
-    ``Dataset.masked`` hides them.
+def purge(
+    dataset: Dataset | FitView,
+    cut: int,
+    embargo_rows: int = 0,
+    embargo_timestamps: int = 0,
+) -> int:
+    """The last train row before ``cut``: ``embargo_rows`` rows back, snapped to the
+    first row of its timestamp, then ``embargo_timestamps`` distinct timestamps back
+    (rows, without a clock). The walk-forward splits and ``inner_split`` cut the train
+    side with this one rule.
     """
-    ts = dataset.ts
-    if ts is None:
-        return at
-    if lag is None:
-        return int(np.searchsorted(ts, ts[at], "left"))
-    if isinstance(lag, np.timedelta64):
-        return int(np.searchsorted(ts, ts[at] - lag, "right"))
-    day = np.unique(ts.astype("datetime64[D]"), return_inverse=True)[1]
-    return int(np.searchsorted(day, day[at] - lag, "right"))
+    cut = _snap(dataset, max(cut - embargo_rows, 0))
+    for _ in range(embargo_timestamps):
+        if cut and dataset.ts is not None:
+            cut = int(np.searchsorted(dataset.ts, dataset.ts[cut - 1], "left"))
+        elif cut:
+            cut -= 1
+    return cut
 
 
-def _snap(dataset: Dataset, row: int, groups: np.ndarray | None = None) -> int:
+def _snap(
+    dataset: Dataset | FitView, row: int, groups: np.ndarray | None = None
+) -> int:
     """The first row of ``row``'s group, when ``groups`` holds the groups' first rows,
     then of its timestamp, so a cut never splits a group or a cross-section.
     """
