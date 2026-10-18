@@ -13,11 +13,10 @@ Examples
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import json
 import pathlib
 import sys
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from typing import Any
 
 from ml_lab import formats, identity
@@ -106,7 +105,7 @@ def refuse_half_declared(p: Pipeline, name: str):
     no fit, no save, load or format, and members.
     """
     label = p.name or name
-    if p.fit is None:
+    if p.stateless:
         if not p.members:
             raise Refused(
                 f"pipeline {label}: fit=None is a stateless blend, which needs members"
@@ -195,12 +194,6 @@ def nested(pipeline: Pipeline) -> Iterator[Pipeline]:
     yield pipeline
     for member in pipeline.members:
         yield from nested(member)
-
-
-def positional(func: Callable) -> int:
-    """Positional parameters of a function."""
-    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    return sum(p.kind in kinds for p in inspect.signature(func).parameters.values())
 
 
 SLOTS = ("prepare", "fit", "predict", "save", "load", "postprocess")
