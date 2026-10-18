@@ -83,15 +83,38 @@ class WalkForward:
 @dataclasses.dataclass(frozen=True)
 class CalendarWalkForward:
     """Cutoffs on the dataset clock every ``step`` units, a unit being a calendar month
-    or a day the clock has rows on; train on everything before each cutoff, or with
-    ``train_units`` on the last that many units before it, a rolling window, minus
-    ``embargo_timestamps`` distinct timestamps, which cuts the train side, and score the
-    ``horizon``-th run of ``test_units`` units after it, so ``horizon=1`` scores the
-    ``test_units`` units right after the cutoff. A validation range ends on a unit
-    boundary at or before ``end`` (the day after the data when ``end`` is not given);
-    the boundary after the last day is ``end`` itself, so the last trading day is
-    scored. Folds that reach past ``end`` are dropped, never cut, so a test period at
-    the end of the data stays unscored.
+    or a day the clock has rows on.
+
+    Each fold trains on everything before its cutoff, or with ``train_units`` on the
+    last that many units before it, minus ``embargo_timestamps`` distinct timestamps
+    from the train side, and scores the ``horizon``-th run of ``test_units`` units
+    after it. A validation range ends on a unit boundary at or before ``end``; the
+    boundary after the last day is ``end`` itself, so the last trading day is
+    scored. Folds that reach past ``end`` are dropped, never cut, so a test period
+    at the end of the data stays unscored.
+
+    Parameters
+    ----------
+    first_cutoff : str
+        The first cutoff date.
+    unit : str
+        ``"month"`` or ``"day"``.
+    step : int
+        Units between cutoffs.
+    test_units : int
+        Units each fold scores.
+    horizon : int
+        Which run of ``test_units`` after the cutoff is scored; 1 is the run right
+        after it.
+    embargo_timestamps : int
+        Distinct timestamps dropped from the train end before each cutoff.
+    end : str, optional
+        The last boundary; the day after the data when not given.
+    min_folds : int
+        The fewest folds the split may yield.
+    train_units : int, optional
+        A rolling window: the units of train before each cutoff; None trains from
+        the first row.
     """
 
     first_cutoff: str
@@ -227,19 +250,38 @@ def inner_split(
     embargo_timestamps: int | None = None,
 ) -> tuple[Segments, Range]:
     """Cut a fold's train segments, inside ``fit``, into an inner train and a
-    validation range, for early stopping or any choice made on held-out rows.
+    validation range.
 
-    ``dataset`` is the ``FitView`` a fit receives. The validation range is the tail
-    of the last train segment: ``validation`` rows, or that fraction of the train
-    rows when below 1, its start snapped to the first row of its timestamp. The inner
-    train is the train segments before it, purged as the evaluation purges: the
-    view's embargo (``embargo_rows`` rows before the validation start, snapped to a
-    timestamp as ``WalkForward`` snaps, then ``embargo_timestamps`` distinct
-    timestamps; passing ``embargo_timestamps`` overrides the timestamps only; a
-    ``group`` column is not honoured, so a grouped split cuts its own), and every
-    row whose label the view's reveal lags say is not known when the validation
-    starts, so a round count chosen here reads no label the fold's own test would
-    hide. Refused when either side is empty, or when ``dataset`` is not the view.
+    For early stopping or any choice made on held-out rows. The validation range is
+    the tail of the last train segment, its start snapped to the first row of its
+    timestamp. The inner train is the train segments before it, purged as the
+    evaluation purges: the view's embargo, then every row whose label the view's
+    reveal lags say is not known when the validation starts, so a round count chosen
+    here reads no label the fold's own test would hide. A ``group`` column is not
+    honoured, so a grouped split cuts its own.
+
+    Parameters
+    ----------
+    dataset : FitView
+        The view ``fit`` received; its embargo and reveal lags drive the purge.
+    train : Segments
+        The train segments to cut, normally ``fit``'s ``train`` argument.
+    validation : int | float
+        Rows in the validation range, or that fraction of the train rows when below
+        1.
+    embargo_timestamps : int, optional
+        Overrides the view's ``embargo_timestamps`` alone.
+
+    Returns
+    -------
+    tuple[Segments, Range]
+        The inner train segments and the validation range.
+
+    Raises
+    ------
+    Refused
+        When ``dataset`` is not a ``FitView``, ``train`` is empty, ``validation`` is
+        not a count or a fraction, or either side comes out empty.
     """
     if not isinstance(dataset, FitView):
         raise Refused(
@@ -284,10 +326,27 @@ def purge(
     embargo_rows: int = 0,
     embargo_timestamps: int = 0,
 ) -> int:
-    """The last train row before ``cut``: ``embargo_rows`` rows back, snapped to the
-    first row of its timestamp, then ``embargo_timestamps`` distinct timestamps back
-    (rows, without a clock). The walk-forward splits and ``inner_split`` cut the train
-    side with this one rule.
+    """The last train row before ``cut``, with the embargo applied.
+
+    ``embargo_rows`` rows back, snapped to the first row of its timestamp, then
+    ``embargo_timestamps`` distinct timestamps back (rows, without a clock). The
+    walk-forward splits and ``inner_split`` cut the train side with this one rule.
+
+    Parameters
+    ----------
+    dataset : Dataset | FitView
+        The rows and clock.
+    cut : int
+        The row the train must end before.
+    embargo_rows : int
+        Rows dropped before ``cut``.
+    embargo_timestamps : int
+        Distinct timestamps dropped after the row embargo.
+
+    Returns
+    -------
+    int
+        The train end, a row at or before ``cut``.
     """
     cut = _snap(dataset, max(cut - embargo_rows, 0))
     for _ in range(embargo_timestamps):

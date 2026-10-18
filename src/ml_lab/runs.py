@@ -655,9 +655,10 @@ class _Stage:
         return pred_id
 
     def _prepare(self, visible: FitView, fold: Fold, columns_id: str | None) -> Any:
-        """What ``prepare`` builds for the fold's train range, once per run across
-        every pipeline declaring the same function, code, environment, dataset,
-        feature columns and train segments.
+        """What ``prepare`` builds for the fold's train range.
+
+        Built once per run across every pipeline declaring the same function, code,
+        environment, dataset, feature columns and train segments.
         """
         prepare = self.pipeline.prepare
         if not hasattr(self, "prepare_key"):
@@ -1565,7 +1566,9 @@ def _facts(name: str, facts: Any) -> dict[str, Any]:
 
 
 def _fact(value: Any) -> Any:
-    """A fact as JSON: an array or numpy scalar by its values, else as a declaration
+    """A fact as JSON.
+
+    An array or numpy scalar by its values, anything else as a declaration
     canonicalises it.
     """
     if isinstance(value, np.ndarray):
@@ -1576,12 +1579,13 @@ def _fact(value: Any) -> Any:
 
 
 def _frozen(prepared: Any, seen: set[int] | None = None, depth: int = 0) -> Any:
-    """A prepared object with every numpy array it holds, at any depth of dicts,
-    lists, tuples, sets, dataclasses and objects with a ``__dict__``, made
-    read-only, so a fit that writes into shared work raises instead of changing
-    what the next fit sees. An object that holds its arrays elsewhere (slots, C
-    state), a module or a class is handed over as it is, and nothing below
-    ``FREEZE_DEPTH`` levels is walked; the author keeps those read-only.
+    """A prepared object with every numpy array it holds made read-only.
+
+    Walks dicts, lists, tuples, sets, dataclasses and objects with a ``__dict__``,
+    so a fit that writes into shared work raises instead of changing what the next
+    fit sees. An object that holds its arrays elsewhere (slots, C state), a module
+    or a class is handed over as it is, and nothing below ``FREEZE_DEPTH`` levels is
+    walked; the author keeps those read-only.
     """
     seen = set() if seen is None else seen
     if id(prepared) in seen or depth > FREEZE_DEPTH:
@@ -1611,9 +1615,10 @@ FREEZE_DEPTH = 32
 
 
 def _project_root(pipelines: list[Pipeline]) -> pathlib.Path:
-    """The git root of the first declared function outside this package, so a
-    blend the tool ships (``mean_blend``) listed first does not make the tool's own
-    checkout the code root; the tool's root when every function is the tool's.
+    """The git root of the first declared function outside this package.
+
+    A blend the tool ships (``mean_blend``) listed first must not make the tool's
+    own checkout the code root; the tool's root when every function is the tool's.
     """
     own = pathlib.Path(__file__).resolve().parent
     for pipeline in pipelines:
@@ -1830,10 +1835,12 @@ def _text_blob(ledger: Ledger, text: str) -> dict[str, str]:
 
 
 def _host() -> dict[str, Any]:
-    """Host facts for a run: the machine, and its NVIDIA GPUs with the driver and
-    CUDA versions when ``nvidia-smi`` answers, so a GPU fit's provenance names the
-    device that produced it. Facts never abort a run: a device the parser cannot
-    read is recorded as far as it was read.
+    """Host facts for a run.
+
+    The machine, and its NVIDIA GPUs with the driver and CUDA versions when
+    ``nvidia-smi`` answers, so a GPU fit's provenance names the device that produced
+    it. Facts never abort a run: a device the parser cannot read is recorded as far
+    as it was read.
     """
     facts = {
         "hostname": platform.node(),
@@ -1849,6 +1856,7 @@ def _host() -> dict[str, Any]:
 
 
 def _gpus() -> dict[str, Any]:
+    """The GPUs and CUDA version ``nvidia-smi`` reports; nothing without it."""
     query = _command(
         "nvidia-smi",
         "--query-gpu=name,driver_version,memory.total",

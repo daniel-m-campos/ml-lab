@@ -44,11 +44,32 @@ Lag = np.timedelta64 | int | None
 
 class Dataset:
     """Columns over rows in a fixed order, with date lookups when ``ts`` is given.
-    ``computed_columns`` names the columns a pipeline's features functions added, in
-    order; they are not in ``columns`` but read on demand from the Parquet file in
-    ``stores`` through ``column`` and ``matrix``, so a column no function names costs
-    no memory. ``reveal`` holds the targets' reveal lags, recorded with the data and
-    set by ``load``. What a fold adds for one fit is not here: ``FitView`` carries it.
+
+    Parameters
+    ----------
+    columns : dict[str, np.ndarray]
+        Equal-length 1-D arrays in a fixed order; a datetime array is held in
+        nanoseconds.
+    ts : np.ndarray, optional
+        Sorted timestamps, one per row, several rows to a timestamp for a
+        cross-section; None for a dataset without a clock.
+    computed_columns : tuple[str, ...], optional
+        The columns a pipeline's features functions added, in order. They are not in
+        ``columns``: ``column`` and ``matrix`` read them on demand from ``stores``,
+        so a column no function names costs no memory.
+    stores : dict[str, pathlib.Path], optional
+        The Parquet file each computed column is read from.
+    reveal : Mapping[str, Lag], optional
+        The targets' reveal lags, recorded with the data and set by ``load``.
+
+    Raises
+    ------
+    ValueError
+        When ``ts`` holds NaT or is not sorted.
+
+    Notes
+    -----
+    What a fold adds for one fit is not here: ``FitView`` carries it.
     """
 
     def __init__(
@@ -123,11 +144,22 @@ class Dataset:
         return view
 
     def train_view(self, train: Segments) -> Dataset:
-        """The view a fit sees: every column, computed columns included, blank outside
-        ``train``, so a fit reads no row of a range it is scored on. A blank is NaN, NaT
-        or None by dtype; an integer or boolean column becomes float. A column is
-        copied when first read, so a fit that reads ten columns of two hundred pays
-        for ten.
+        """The view a fit sees: every column blank outside ``train``.
+
+        Computed columns included, so a fit reads no row of a range it is scored on. A
+        blank is NaN, NaT or None by dtype; an integer or boolean column becomes float.
+        A column is copied when first read, so a fit that reads ten columns of two
+        hundred pays for ten.
+
+        Parameters
+        ----------
+        train : Segments
+            The train row segments to keep.
+
+        Returns
+        -------
+        Dataset
+            A view over the same rows; ``FitView`` wraps it for ``fit``.
         """
         view = self.upto(self.rows)
         view.keep = row_mask(self.rows, train)
@@ -223,12 +255,24 @@ class Dataset:
 @dataclasses.dataclass(frozen=True)
 class FitView:
     """What ``fit`` and ``prepare`` receive: the dataset blank outside the fold's train
-    segments, with the fold's context beside it. It reads as a ``Dataset`` through
-    ``column``, ``matrix``, ``columns``, ``ts``, ``rows``, ``index_of``, ``date_at``,
-    ``computed_columns`` and ``reveal``, and adds ``train``, the evaluation's
-    ``embargo_rows`` and ``embargo_timestamps`` (so ``splits.inner_split`` purges what
-    the evaluation would) and ``prepared``, what the pipeline's ``prepare`` built for
-    this train range.
+    segments, with the fold's context beside it.
+
+    It reads as a ``Dataset`` through ``column``, ``matrix``, ``columns``, ``ts``,
+    ``rows``, ``index_of``, ``date_at``, ``computed_columns`` and ``reveal``.
+
+    Attributes
+    ----------
+    data : Dataset
+        The dataset blank outside ``train``, from ``Dataset.train_view``.
+    train : Segments
+        The fold's train row segments.
+    embargo_rows : int
+        The evaluation split's row embargo, 0 when it has none.
+    embargo_timestamps : int
+        The evaluation split's timestamp embargo, 0 when it has none; with
+        ``embargo_rows`` what ``splits.inner_split`` purges by.
+    prepared : Any
+        What the pipeline's ``prepare`` built for this train range; None without one.
     """
 
     data: Dataset
@@ -242,43 +286,67 @@ class FitView:
 
     @property
     def columns(self) -> Mapping[str, np.ndarray]:
+        """The columns, blank outside ``train``."""
         return self.data.columns
 
     @property
     def ts(self) -> np.ndarray | None:
+        """The clock, or None without one."""
         return self.data.ts
 
     @property
     def rows(self) -> int:
+        """The rows visible."""
         return self.data.rows
 
     @property
     def computed_columns(self) -> tuple[str, ...]:
+        """The names of the computed columns."""
         return self.data.computed_columns
 
     @property
     def reveal(self) -> dict[str, Lag]:
+        """The targets' reveal lags."""
         return self.data.reveal
 
     def index_of(self, when: str | datetime.date | datetime.datetime) -> int:
+        """As ``Dataset.index_of``."""
         return self.data.index_of(when)
 
     def date_at(self, row: int) -> datetime.date:
+        """As ``Dataset.date_at``."""
         return self.data.date_at(row)
 
     def matrix(self, cols: Sequence[str], rows: Rows | None = None) -> np.ndarray:
+        """As ``Dataset.matrix``."""
         return self.data.matrix(cols, rows)
 
     def column(self, name: str, rows: Rows | None = None) -> np.ndarray:
+        """As ``Dataset.column``."""
         return self.data.column(name, rows)
 
 
 def known_before(dataset: Dataset | FitView, at: int, lag: Lag) -> int:
-    """The rows whose labels are known when row ``at`` starts, as a prefix length: a
-    label with a time lag ``L`` is known from ``ts + L``, one with an integer lag ``n``
-    from the first row of the n-th later date that has rows, one without a lag only
-    after its own timestamp; without a clock, the rows before ``at``. ``masked`` hides
-    the rest, and ``splits.inner_split`` keeps no more.
+    """The rows whose labels are known when row ``at`` starts, as a prefix length.
+
+    A label with a time lag ``L`` is known from ``ts + L``, one with an integer lag
+    ``n`` from the first row of the n-th later date that has rows, one without a lag
+    only after its own timestamp; without a clock, the rows before ``at``.
+    ``Dataset.masked`` hides the rest and ``splits.inner_split`` keeps no more.
+
+    Parameters
+    ----------
+    dataset : Dataset | FitView
+        The rows and clock.
+    at : int
+        The row the labels are read at.
+    lag : Lag
+        The target's reveal lag: a ``np.timedelta64``, an ``int`` of dates, or None.
+
+    Returns
+    -------
+    int
+        The count of leading rows whose labels are known.
     """
     ts = dataset.ts
     if ts is None:
@@ -321,10 +389,10 @@ def stratified_order(y: np.ndarray, seed: int = 0) -> np.ndarray:
 
 
 class _Blanked(MutableMapping):
-    """A train view's columns: each is the source column blank outside ``keep``,
-    copied on its first read and kept, so a fit pays only for the columns it names.
-    ``upto`` is a further view, still unread, so a probe's shorter prefix copies
-    nothing either.
+    """A train view's columns: each blank outside ``keep``, copied on its first read.
+
+    A fit pays only for the columns it names. ``upto`` is a further view, still
+    unread, so a probe's shorter prefix copies nothing either.
     """
 
     def __init__(self, source: Mapping[str, np.ndarray], keep: np.ndarray):
@@ -354,6 +422,7 @@ class _Blanked(MutableMapping):
         return name in self._source or name in self._read
 
     def upto(self, row: int) -> _Blanked:
+        """The first ``row`` rows, still unread."""
         if isinstance(self._source, _Blanked):
             source = self._source.upto(row)
         else:
@@ -387,23 +456,51 @@ def record(
     sealed_from: int | str | None = None,
     steps: Sequence[Callable] = (),
 ) -> str:
-    """Check the targets and store the rows; returns the dataset id.
+    """Check the targets and store the rows.
 
-    ``source`` and ``params`` name how the rows were made. ``steps`` are the
-    module-level functions that made them, the cleaning included: each is recorded
-    in the recipe by its dotted path with the code keys of its module and the modules
-    it imports, so the log says which code dropped the rows, and an edit to it shows
-    in the recipe of the next ingest. The id stays the rows' hash, so an edit that
-    leaves the rows as they were records nothing new. ``reveal`` maps a target to
-    when its label is known: a ``timedelta`` or ``numpy.timedelta64`` after its row's
-    timestamp, or an ``int`` of later dates with rows (``1`` is the next trading day's
-    open, ``2`` two trading dates later whatever the calendar gap). A features function
-    may read a revealed target, probed against that lag. ``sealed_from``, a row (the
-    first row of its timestamp) or a date (its first row at or after it), starts the
-    sealed tail that only an ``Evaluation(sealed=True)`` validates on, each pipeline
-    once, and that no fold trains on before such an evaluation tests it. Targets,
-    their lags and the sealed tail's first row are part of the dataset id. An empty
-    ``targets`` is refused.
+    Parameters
+    ----------
+    ledger : Ledger
+        Where the rows and the recipe are recorded.
+    dataset : Dataset
+        The rows, cleaned by the caller.
+    source : str
+        A label for where the rows came from; ``--dataset <source>`` resolves it.
+    targets : Sequence[str]
+        The label columns the tool hides from fits; at least one.
+    params : Mapping[str, Any], optional
+        How the rows were made, recorded in the recipe as provenance.
+    reveal : Mapping[str, timedelta | np.timedelta64 | int], optional
+        When each target's label is known: a timedelta after its row's timestamp, or
+        an int of later dates with rows (``1`` is the next trading day's open, ``2``
+        two trading dates later whatever the calendar gap). A features function may
+        read a revealed target, probed against that lag.
+    sealed_from : int | str, optional
+        The first row of the sealed tail, as a row (the first row of its timestamp)
+        or a date (its first row at or after it). Only an ``Evaluation(sealed=True)``
+        validates on the tail, each pipeline once, and no fold trains on it before
+        such an evaluation tests it.
+    steps : Sequence[Callable], optional
+        The module-level functions that made the rows, the cleaning included. Each
+        is recorded in the recipe by its dotted path with the code keys of its module
+        and the modules it imports, so the log says which code dropped the rows and
+        an edit shows in the next ingest's recipe.
+
+    Returns
+    -------
+    str
+        The dataset id: a hash of the ``ts`` bytes, the columns, the targets, their
+        lags and the sealed tail's first row, so an edit that leaves the rows as
+        they were records nothing new.
+
+    Raises
+    ------
+    Refused
+        When ``targets`` is empty.
+    ValueError, KeyError, TypeError
+        When the rows are empty, a lag has no clock or a bad kind, ``reveal`` names
+        a non-target, a target is missing or not numeric, a column is not 1-D, or
+        ``sealed_from`` leaves either side empty.
     """
     if not targets:
         raise Refused(
@@ -457,10 +554,11 @@ def record(
 
 
 def _step(step: Callable) -> dict[str, Any]:
-    """A cleaning function as the recipe records it: its dotted path, the code keys
-    of its module's closure hashed from the git root that holds it, and the
-    distributions it imports with their versions, which is all a function of an
-    installed package records.
+    """A cleaning function as the recipe records it.
+
+    Its dotted path, the code keys of its module's closure hashed from the git root
+    that holds it, and the distributions it imports with their versions, which is
+    all a function of an installed package records.
     """
     ref = identity.function_ref(step)
     file = getattr(sys.modules[step.__module__], "__file__", None)
@@ -562,7 +660,25 @@ def resolve(ledger: Ledger, prefix: str) -> str:
 
 
 def load(ledger: Ledger, dataset_id: str) -> Dataset:
-    """Load a recorded dataset's rows, resident, with its targets' reveal lags."""
+    """Load a recorded dataset's rows, resident, with its targets' reveal lags.
+
+    Parameters
+    ----------
+    ledger : Ledger
+        The ledger the dataset was recorded in.
+    dataset_id : str
+        The full dataset id.
+
+    Returns
+    -------
+    Dataset
+        The rows, with ``reveal`` set from the recipe.
+
+    Raises
+    ------
+    KeyError
+        When no dataset has the id.
+    """
     event = ledger.latest(Event.DATASET, dataset_id)
     if event is None:
         raise KeyError(f"dataset {dataset_id} not found")

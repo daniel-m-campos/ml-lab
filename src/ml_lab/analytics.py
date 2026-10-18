@@ -31,7 +31,7 @@ SEED = 0
 
 @dataclasses.dataclass(frozen=True)
 class Paired:
-    """The row differences of two series, summed, with their standard errors.
+    """Two series paired row by row: the summed differences and their standard errors.
 
     Attributes
     ----------
@@ -40,12 +40,12 @@ class Paired:
     pooled_delta : float
         The sum of the row differences, the first score's minus the second's.
     se_iid : float
-        ``sqrt(n) * d.std(ddof=1)``, its standard error with independent rows.
+        ``sqrt(n) * d.std(ddof=1)``: the standard error with independent rows.
     se_block : float | None
-        Its standard error by a paired block bootstrap over contiguous blocks of
-        ``block_rows`` rows, None without ``block_rows``.
+        The standard error by a paired block bootstrap over contiguous blocks of
+        ``block_rows`` rows; None without ``block_rows``.
     fold_deltas : tuple[float, ...]
-        The sum of the row differences within each of the first score's folds, so a
+        The row differences summed within each of the first score's folds, so a
         finer-grained twin regroups into the house folds when the house score is
         passed first.
     """
@@ -66,13 +66,33 @@ def paired(
 ) -> Paired:
     """Pair one column of two scores' series row by row.
 
-    The block bootstrap draws the blocks with replacement, ``RESAMPLES`` times under a
-    fixed seed, so one call returns one number; the last block may be short. Two
-    scores whose evaluations store the same folds (one evaluation, or a sweep of
-    its scorer params) pair as stored, overlapping test windows included; two whose
-    folds differ pair when their test ranges cover the same rows in row order, and
-    are refused otherwise, as are scores on different datasets and series that differ
-    in length.
+    Two scores of one evaluation, or of two evaluations with the same folds, pair as
+    stored, overlapping test windows included. Two scores of different evaluations
+    pair when their folds' test ranges cover the same rows in row order. The block
+    bootstrap draws blocks with replacement ``RESAMPLES`` times under a fixed seed,
+    so one call returns one number; the last block may be short.
+
+    Parameters
+    ----------
+    ledger : Ledger
+        The ledger holding both scores.
+    score_a, score_b : str
+        Score ids; the differences are ``score_a`` minus ``score_b``.
+    column : str
+        The series column to pair, as the scorer named it.
+    block_rows : int, optional
+        Rows per bootstrap block; None skips the block bootstrap.
+
+    Returns
+    -------
+    Paired
+        The paired differences with their standard errors.
+
+    Raises
+    ------
+    Refused
+        When a score or column is missing, the scores are on different datasets,
+        their folds cover different rows, or the series differ in length.
     """
     (a, rows_a), (b, rows_b) = (_series(ledger, s, column) for s in (score_a, score_b))
     if _dataset(ledger, score_a) != _dataset(ledger, score_b):
@@ -114,11 +134,11 @@ class SetPaired:
     delta_mean : float
         The mean over folds of the first set's mean metric minus the second's.
     delta_std : float | None
-        Its sample standard deviation over folds, None at one fold.
+        Its sample standard deviation over folds; None at one fold.
     t : float | None
-        ``delta_mean * sqrt(n_folds) / delta_std``, None at one fold or zero spread.
+        ``delta_mean * sqrt(n_folds) / delta_std``; None at one fold or zero spread.
     wins : int | None
-        Folds the first set wins by the metric's direction, None without one.
+        Folds the first set wins by the metric's direction; None without one.
     fold_deltas : tuple[float, ...]
         The per-fold differences of the set means, in fold order.
     """
@@ -138,13 +158,35 @@ def paired_sets(
     pipelines: Sequence[str],
     references: Sequence[str],
 ) -> SetPaired:
-    """Pair a set of pipelines against a set of references under one evaluation:
-    a seed set against a seed set, or a post-process over seeds against the seeds.
+    """Pair a set of pipelines against a set of references under one evaluation.
 
+    A seed set against a seed set, or a post-process over seeds against the seeds.
     Each fold's value for a set is the mean of its members' latest scores on
     ``metric``, so the fold-paired t respects the folds the members share instead of
-    treating each member as another sample. Pipelines are ids; a member without a
-    latest score under the evaluation, or a fold a member lacks, is refused.
+    treating each member as another sample.
+
+    Parameters
+    ----------
+    ledger : Ledger
+        The ledger holding the scores.
+    evaluation : str
+        The evaluation id both sets were scored under.
+    metric : str
+        The metric name, as the scorer's ``metrics`` returns it.
+    pipelines, references : Sequence[str]
+        Pipeline ids of the two sets; the differences are ``pipelines`` minus
+        ``references``.
+
+    Returns
+    -------
+    SetPaired
+        The fold-paired comparison of the two sets.
+
+    Raises
+    ------
+    Refused
+        When a set is empty, a member has no latest score under the evaluation, or
+        the members' scores do not share one set of folds.
     """
     if not pipelines or not references:
         raise Refused("paired_sets needs at least one pipeline id in each set")
@@ -183,8 +225,9 @@ def _series(ledger: Ledger, score: str, column: str) -> tuple[np.ndarray, list[i
 def _fold_values(
     ledger: Ledger, evaluation: str, metric: str, pipelines: Sequence[str]
 ) -> dict[str, dict[int, float]]:
-    """Per pipeline id, its latest score's metric per fold under the evaluation;
-    refused when one has no score or the folds differ.
+    """Per pipeline id, its latest score's metric per fold under the evaluation.
+
+    Refused when a pipeline has no such score or the folds differ.
     """
     marks = ", ".join("?" * len(pipelines))
     rows = ledger.sql(
@@ -213,10 +256,12 @@ def _fold_values(
 
 
 def _evaluation(ledger: Ledger, score: str) -> str:
+    """The evaluation id a score was recorded under."""
     return ledger.latest(Event.SCORE, score)["stream"]
 
 
 def _dataset(ledger: Ledger, score: str) -> str:
+    """The dataset id of a score's evaluation."""
     evaluation = ledger.latest(Event.EVALUATION, _evaluation(ledger, score))
     return evaluation["payload"]["dataset"]
 
@@ -230,8 +275,10 @@ def _tests(ledger: Ledger, score: str) -> list[list[int]]:
 
 
 def _covered(ledger: Ledger, score: str) -> list[list[int]]:
-    """The rows a score's folds test, as merged ranges; refused when the folds are
-    not in row order, since the series then does not read as one row sequence.
+    """The rows a score's folds test, as merged ranges.
+
+    Refused when the folds are not in row order, since the series then does not
+    read as one row sequence.
     """
     folds = ledger.latest(Event.EVALUATION, _evaluation(ledger, score))["payload"][
         "folds"

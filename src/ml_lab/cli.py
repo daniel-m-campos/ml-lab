@@ -125,6 +125,7 @@ def _ingest(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _note(args: argparse.Namespace, ledger: Ledger) -> int:
+    """Print the id of the note recorded."""
     print(note(ledger, args.text, about=args.about, tag=args.tag))
     return 0
 
@@ -279,7 +280,9 @@ def _code_root(module: Any) -> pathlib.Path:
 
 
 def _dataset(ledger: Ledger, selector: str | None) -> str:
-    """The dataset named by an id prefix or a source; with no selector, the newest,
+    """Resolve ``--dataset`` to one dataset id.
+
+    The selector is an id prefix or a source; with none, the newest dataset,
     provided every dataset in the ledger shares one source. A source written by
     several actors resolves to the newest dataset the running actor recorded under
     it, and is refused with every actor's id when the running actor recorded none,
