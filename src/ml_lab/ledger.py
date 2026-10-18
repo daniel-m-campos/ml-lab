@@ -390,10 +390,31 @@ class Ledger:
 def note(
     ledger: Ledger, text: str, *, about: Sequence[str] = (), tag: str = "note"
 ) -> str:
-    """Record a note: an idea, a decision, a final refit, as text tagged by its kind,
-    about the ids it names (pipelines, evaluations, scores, runs, datasets). Each id
-    must be in the log; a note is a record, not a verdict, and nothing reads it but
-    ``event_note``. Returns the note's id.
+    """Record a note: an idea, a decision, a final refit, about ids in the log.
+
+    A note is a record, not a verdict, and nothing reads it but ``event_note``.
+
+    Parameters
+    ----------
+    ledger : Ledger
+        Where the note is recorded.
+    text : str
+        The note.
+    about : Sequence[str], optional
+        Full ids of datasets, pipelines, evaluations, runs or scores the note is
+        about, as ``lab`` prints them; each must be in the log.
+    tag : str, optional
+        The note's kind: lowercase letters, digits, ``_`` or ``-``.
+
+    Returns
+    -------
+    str
+        The note's event id.
+
+    Raises
+    ------
+    Refused
+        When the text is blank, the tag is malformed, or an id is not in the log.
     """
     if not text.strip():
         raise Refused("a note needs text")
