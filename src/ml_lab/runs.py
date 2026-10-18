@@ -42,6 +42,7 @@ from ml_lab.dataset import (
     FitView,
     Lag,
     Range,
+    Segments,
     load,
     resolve,
     row_mask,
@@ -201,7 +202,7 @@ def run(
         evaluation, dataset_id=resolve(ledger, evaluation.dataset_id)
     )
     dataset = load(ledger, evaluation.dataset_id)
-    recorded = ledger.latest(Event.DATASET, evaluation.dataset_id)["payload"]
+    recorded = ledger.event(Event.DATASET, evaluation.dataset_id)["payload"]
     targets = dataset.reveal
     schedule = evaluation.split.folds(dataset)
     _refuse_overlap(schedule)
@@ -417,7 +418,7 @@ class _Stage:
 
     def fit(self, fold: Fold, index: int) -> str:
         """The fit id of the fold's train segments, computed once per run."""
-        train = tuple(tuple(segment) for segment in fold.train)
+        train: Segments = tuple((lo, hi) for lo, hi in fold.train)
         if train not in self.fits:
             self.fits[train] = self._fit(fold, index)
         return self.fits[train]
@@ -748,7 +749,12 @@ class _Stage:
                 for f, i in zip(self.feature_functions, self.feature_ids, strict=True)
             ]
             names = tuple(n for columns, _, _ in sets for n in columns)
-            stores = {n: path for columns, path, _ in sets for n in columns}
+            stores = {
+                n: path
+                for columns, path, _ in sets
+                for n in columns
+                if path is not None
+            }
             self.featured = Dataset(
                 self.dataset.columns,
                 self.dataset.ts,
@@ -813,7 +819,9 @@ class _Stage:
             return self.features.setdefault(feature_id, found)
         if self.dry and feature_id in self.planned and feature_id in _PLANNED_FEATURES:
             return self.features.setdefault(feature_id, _PLANNED_FEATURES[feature_id])
-        revealed = {k: v for k, v in self.targets.items() if v is not None}
+        revealed: dict[str, Lag] = {
+            k: v for k, v in self.targets.items() if v is not None
+        }
         bare = Dataset(
             {
                 k: v
@@ -1142,7 +1150,7 @@ class _Stage:
         if self.pipeline.fit is None:
             return None
         if fresh or fit_id not in self.models:
-            fit = self.ledger.latest(Event.FIT, fit_id)
+            fit = self.ledger.event(Event.FIT, fit_id)
             load = _declared(self.pipeline.load, self.name, "load")
             model = load(self.ledger.get_blob(fit["payload"]["model"]["sha"]))
             if fresh:
@@ -1410,7 +1418,7 @@ def _refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fo
             if not late.size:
                 continue
             leaky += 1
-            stamps = len(np.unique(dataset.ts[late]))
+            stamps = len(np.unique(dataset._clock()[late]))
             where = (
                 f"fold {fold.label} trains on rows {late[0]} to {late[-1]} whose "
                 f"{name} labels (reveal lag {_lag_text(targets[name])}) are not "
@@ -1504,7 +1512,7 @@ def _columns_id(columns: dict[str, np.ndarray]) -> str:
 
 
 def _load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
-    event = ledger.latest(Event.PREDICTIONS, pred_id)
+    event = ledger.event(Event.PREDICTIONS, pred_id)
     return formats.series_load(ledger.get_blob(event["payload"]["blob"]["sha"]))
 
 
@@ -1823,8 +1831,8 @@ def _refuse_lazy_imports(
     grown = sorted(
         n
         for n in new
-        if identity._module_path(sys.modules.get(n), root)
-        or identity.unseen(sys.modules.get(n), root)
+        if (m := sys.modules.get(n)) is not None
+        and (identity._module_path(m, root) or identity.unseen(m, root))
     )
     owners = identity.distribution_owners()
     tops = {name.partition(".")[0] for name in new}

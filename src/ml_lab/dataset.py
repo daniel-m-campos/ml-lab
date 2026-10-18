@@ -26,7 +26,7 @@ import io
 import pathlib
 import sys
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import polars as pl
@@ -109,8 +109,7 @@ class Dataset:
         return int(np.searchsorted(self._clock(), np.datetime64(when, "ns"), "left"))
 
     def date_at(self, row: int) -> datetime.date:
-        self._clock()
-        return self.ts[row].astype("datetime64[D]").astype(datetime.date)
+        return self._clock()[row].astype("datetime64[D]").astype(datetime.date)
 
     def upto(self, row: int) -> Dataset:
         """The first ``row`` rows as a view: positions are unchanged, so ranges into
@@ -361,7 +360,9 @@ def known_before(dataset: Dataset | FitView, at: int, lag: Lag) -> int:
 
 def segments(rows: Rows) -> tuple[Range, ...]:
     """A range or a tuple of ranges as a tuple of ranges."""
-    return (rows,) if isinstance(rows[0], (int, np.integer)) else rows
+    if isinstance(rows[0], (int, np.integer)):
+        return (cast(Range, rows),)
+    return cast(tuple[Range, ...], rows)
 
 
 def row_mask(size: int, rows: Rows) -> np.ndarray:
@@ -582,11 +583,12 @@ def _sealed(dataset: Dataset, sealed_from: int | str | None) -> int | None:
     """
     if sealed_from is None:
         return None
-    row = sealed_from
-    if not isinstance(row, (int, np.integer)):
+    if isinstance(sealed_from, str):
         row = dataset.index_of(sealed_from)
-    elif dataset.ts is not None and 0 < row < dataset.rows:
-        row = dataset.index_of(dataset.ts[row])
+    else:
+        row = int(sealed_from)
+        if dataset.ts is not None and 0 < row < dataset.rows:
+            row = dataset.index_of(dataset.ts[row])
     if not 0 < row < dataset.rows:
         raise Refused(
             f"sealed_from {sealed_from!r} is row {row} of {dataset.rows}; a sealed "
@@ -608,20 +610,21 @@ def _stored_lag(stored: Any) -> Lag:
 
 def _lag(reveal: datetime.timedelta | np.timedelta64 | int) -> float | dict[str, int]:
     """Seconds for a time lag, ``{"dates": n}`` for a count of later dates."""
-    time = isinstance(reveal, (datetime.timedelta, np.timedelta64))
-    if not time and not isinstance(reveal, (int, np.integer)):
+    if isinstance(reveal, (datetime.timedelta, np.timedelta64)):
+        seconds = float(reveal / np.timedelta64(1, "s"))
+        if seconds < 0:
+            raise ValueError(f"a reveal lag cannot be negative: {reveal!r}")
+        return seconds
+    if not isinstance(reveal, (int, np.integer)):
         raise TypeError(
             f"a reveal lag is a timedelta or an int, not {type(reveal).__name__}"
         )
-    if not time and reveal < 1:
+    if reveal < 1:
         raise Refused(
             "an integer lag counts later dates and starts at 1; a same-date reveal is "
             "a timedelta"
         )
-    lag = reveal / np.timedelta64(1, "s") if time else reveal
-    if lag < 0:
-        raise ValueError(f"a reveal lag cannot be negative: {reveal!r}")
-    return lag if time else {"dates": lag}
+    return {"dates": int(reveal)}
 
 
 def data_id(
@@ -705,13 +708,12 @@ def rows_save(dataset: Dataset) -> bytes:
 
 def rows_load(source: pathlib.Path | bytes) -> Dataset:
     """A stored dataset, read one column at a time so loading peaks near its size."""
-    if isinstance(source, bytes):
-        source = io.BytesIO(source)
-    names = list(pl.read_parquet_schema(source))
+    file = io.BytesIO(source) if isinstance(source, bytes) else source
+    names = list(pl.read_parquet_schema(file))
     columns = {
-        n: pl.read_parquet(source, columns=[n])[n].to_numpy() for n in names if n != TS
+        n: pl.read_parquet(file, columns=[n])[n].to_numpy() for n in names if n != TS
     }
-    ts = pl.read_parquet(source, columns=[TS])[TS].to_numpy() if TS in names else None
+    ts = pl.read_parquet(file, columns=[TS])[TS].to_numpy() if TS in names else None
     return Dataset(columns, ts)
 
 

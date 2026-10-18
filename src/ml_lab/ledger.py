@@ -360,8 +360,16 @@ class Ledger:
         ]
 
     def latest(self, type: str, key: str) -> dict[str, Any] | None:
+        """The newest event of a type under a key, or None."""
         rows = self.events(type=type, key=key)
         return rows[-1] if rows else None
+
+    def event(self, type: str, key: str) -> dict[str, Any]:
+        """The newest event of a type under a key, which the log must hold."""
+        found = self.latest(type, key)
+        if found is None:
+            raise KeyError(f"no {type} event under {key} in {self.root}")
+        return found
 
     def sql(self, query: str, params: tuple | list = ()) -> list[dict[str, Any]]:
         """Rows of any query or view as dicts."""
