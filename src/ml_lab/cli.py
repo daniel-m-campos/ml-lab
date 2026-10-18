@@ -35,7 +35,8 @@ import importlib
 import os
 import pathlib
 import sys
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, cast
 
 from ml_lab import dataset, identity, runs
 from ml_lab.experiment import Evaluation, Pipeline
@@ -242,9 +243,11 @@ def _experiments(
             f"{len(found)} modules declare evaluations across {args.experiments}; "
             "need one"
         )
-    evaluations = found[0]
-    if callable(evaluations):
-        evaluations = evaluations(_dataset(ledger, args.dataset))
+    declared = found[0]
+    evaluations = cast(
+        "Iterable[Evaluation]",
+        declared(_dataset(ledger, args.dataset)) if callable(declared) else declared,
+    )
     evaluations = [
         dataclasses.replace(e, dataset_id=dataset.resolve(ledger, e.dataset_id))
         for e in evaluations

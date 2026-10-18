@@ -56,7 +56,7 @@ def function_ref(func: Callable) -> str:
     """
     module = getattr(func, "__module__", None)
     name = getattr(func, "__qualname__", repr(func))
-    if getattr(sys.modules.get(module), name, None) is not func:
+    if getattr(sys.modules.get(module or ""), name, None) is not func:
         raise Refused(
             f"{name!r} is not a module-level function of {module}; a declaration "
             "names functions by their dotted path"
@@ -199,12 +199,17 @@ def imports(
         seen[module.__name__] = module
         path = _module_path(module, root)
         editable = None if path else _editable(module)
-        if path or editable:
-            source = path.read_bytes() if path else _editable_source(editable[1])
-            names = _imported_names(source, module.__package__)
-            queue.extend(sys.modules[n] for n in names if n in sys.modules)
+        if path:
+            source = path.read_bytes()
+        elif editable:
+            source = _editable_source(editable[1])
         elif not _namespace_under(module, root):
             continue
+        else:
+            source = None
+        if source is not None:
+            names = _imported_names(source, module.__package__)
+            queue.extend(sys.modules[n] for n in names if n in sys.modules)
         for value in vars(module).values():
             if isinstance(value, types.ModuleType):
                 queue.append(value)
@@ -262,6 +267,8 @@ def unseen(module: types.ModuleType | None, root: pathlib.Path) -> bool:
     files, or when it serves an editable install, whose lock hashes the file that ran.
     A ``calendar.py`` on the path, or a fork shadowing an installed package, is unseen.
     """
+    if module is None:
+        return False
     file = str(getattr(module, "__file__", None) or "")
     path = pathlib.Path(file).resolve()
     return (
@@ -395,7 +402,7 @@ def _module_path(module: types.ModuleType, root: pathlib.Path) -> pathlib.Path |
 
 @functools.cache
 def distribution_owners() -> dict[str, list[str]]:
-    return importlib.metadata.packages_distributions()
+    return dict(importlib.metadata.packages_distributions())
 
 
 def _stdlib(path: pathlib.Path) -> bool:
@@ -423,7 +430,7 @@ def _installed(name: str) -> frozenset[pathlib.Path]:
         dist = importlib.metadata.distribution(name)
     except importlib.metadata.PackageNotFoundError:
         return frozenset()
-    base = pathlib.Path(dist.locate_file("")).resolve()
+    base = pathlib.Path(str(dist.locate_file(""))).resolve()
     if dist.files is None:
         return frozenset({base})
     return frozenset(pathlib.Path(os.path.normpath(base / f)) for f in dist.files)
@@ -433,19 +440,21 @@ def _stale(module: types.ModuleType) -> bool:
     """Whether the module ran from cached bytecode that the importer took as fresh (its
     header matches the source's mtime and size) but that is not the source compiled.
     """
+    file = getattr(module, "__file__", None)
+    cached = getattr(module, "__cached__", None)
+    if not file or not cached:
+        return False
     try:
-        data = pathlib.Path(module.__cached__).read_bytes()
-        stat = pathlib.Path(module.__file__).stat()
-    except (AttributeError, TypeError, OSError):
+        data = pathlib.Path(cached).read_bytes()
+        stat = pathlib.Path(file).stat()
+    except OSError:
         return False
     header = [int.from_bytes(data[i : i + 4], "little") for i in (4, 8, 12)]
     fresh = [0, int(stat.st_mtime) & 0xFFFFFFFF, stat.st_size & 0xFFFFFFFF]
     if data[:4] != importlib.util.MAGIC_NUMBER or header != fresh:
         return False
-    source = pathlib.Path(module.__file__).read_bytes()
-    return marshal.loads(data[16:]) != compile(
-        source, module.__file__, "exec", dont_inherit=True
-    )
+    source = pathlib.Path(file).read_bytes()
+    return marshal.loads(data[16:]) != compile(source, file, "exec", dont_inherit=True)
 
 
 def _editable(module: types.ModuleType) -> tuple[str, pathlib.Path] | None:
@@ -487,9 +496,9 @@ def _distribution(
     except importlib.metadata.PackageNotFoundError:
         return None
     requires = frozenset(
-        re.match(r"[A-Za-z0-9_.-]+", req).group()
+        name.group()
         for req in dist.requires or ()
-        if "extra ==" not in req
+        if "extra ==" not in req and (name := re.match(r"[A-Za-z0-9_.-]+", req))
     )
     return dist, dist.metadata["Name"], dist.version, _is_editable(dist), requires
 
