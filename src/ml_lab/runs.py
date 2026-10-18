@@ -187,7 +187,8 @@ def run(
     for pipeline in pipelines:
         for p in _nested(pipeline):
             if p.fit is not None:
-                shas = identity.import_shas((p.fit, p.save, p.load), root)
+                model = (p.fit, p.save, p.load)
+                shas = identity.import_shas([f for f in model if f is not None], root)
                 _refuse_unseen_class(p.params, shas, root, "fit")
             shas = identity.import_shas((p.predict,), root)
             _refuse_unseen_class(p.predict_config, shas, root, "predict")
@@ -345,8 +346,22 @@ def _run_pipeline(context: _Run, folds: list[Fold], pipeline: Pipeline):
 
 class _Stage:
     """One pipeline's memoized features, fits and predictions; a blend holds one per
-    member.
+    member. The attributes declared first are the run's, copied in by ``__init__``.
     """
+
+    ledger: Ledger
+    dataset: Dataset
+    targets: dict[str, Lag]
+    evaluation: Evaluation
+    root: pathlib.Path
+    report: RunReport
+    start: Callable[[], str]
+    log: Callable[[str], None]
+    dry: bool
+    planned: set[str]
+    features: dict[str, Features]
+    stages: dict[str, _Stage]
+    prepared: dict[str, Any]
 
     def __init__(self, context: _Run, pipeline: Pipeline):
         vars(self).update(vars(context))
@@ -457,7 +472,7 @@ class _Stage:
             embargo_timestamps=getattr(split, "embargo_timestamps", 0),
         )
         if self.pipeline.prepare is not None:
-            prepared = self._prepare(visible, fold, columns_id)
+            prepared = self._prepare(self.pipeline.prepare, visible, fold, columns_id)
             visible = dataclasses.replace(visible, prepared=prepared)
         inputs = (
             [
@@ -488,7 +503,8 @@ class _Stage:
             facts = _facts(self.name, model.facts)
             model = model.model
         blob = self._model_blob(model)
-        self.models[fit_id] = self.pipeline.load(self.ledger.get_blob(blob["sha"]))
+        load = _declared(self.pipeline.load, self.name, "load")
+        self.models[fit_id] = load(self.ledger.get_blob(blob["sha"]))
         self._check_imports("fit", loaded)
         self._unchanged("fit")
         self.ledger.put_blob(self.locks["fit"].encode())
@@ -654,13 +670,14 @@ class _Stage:
             self.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
         return pred_id
 
-    def _prepare(self, visible: FitView, fold: Fold, columns_id: str | None) -> Any:
+    def _prepare(
+        self, prepare: Callable, visible: FitView, fold: Fold, columns_id: str | None
+    ) -> Any:
         """What ``prepare`` builds for the fold's train range.
 
         Built once per run across every pipeline declaring the same function, code,
         environment, dataset, feature columns and train segments.
         """
-        prepare = self.pipeline.prepare
         if not hasattr(self, "prepare_key"):
             self.prepare_key = {
                 "prepare": prepare,
@@ -759,8 +776,8 @@ class _Stage:
 
     def _model_blob(self, model: Any) -> dict[str, Any]:
         """The saved model; a zip is portable iff every member's format is."""
-        payload = self.pipeline.save(model)
-        used = {"model": self.pipeline.format}
+        payload = _declared(self.pipeline.save, self.name, "save")(model)
+        used = {"model": _declared(self.pipeline.format, self.name, "format")}
         if self.pipeline.format == formats.Format.ZIP:
             used = formats.zip_formats(payload)
             bad = sorted(
@@ -1126,9 +1143,8 @@ class _Stage:
             return None
         if fresh or fit_id not in self.models:
             fit = self.ledger.latest(Event.FIT, fit_id)
-            model = self.pipeline.load(
-                self.ledger.get_blob(fit["payload"]["model"]["sha"])
-            )
+            load = _declared(self.pipeline.load, self.name, "load")
+            model = load(self.ledger.get_blob(fit["payload"]["model"]["sha"]))
             if fresh:
                 return model
             self.models[fit_id] = model
@@ -1718,6 +1734,13 @@ def _scoring(evaluation: Evaluation) -> tuple[Any, ...]:
     """
     scorer = evaluation.scorer
     return (scorer.series, scorer.metrics, *_held(evaluation.scorer_params))
+
+
+def _declared[T](value: T | None, name: str, slot: str) -> T:
+    """A slot of a fitting pipeline, which ``_refuse_half_declared`` made sure of."""
+    if value is None:
+        raise Refused(f"pipeline {name}: {slot} is not declared")
+    return value
 
 
 def _nested(pipeline: Pipeline) -> Iterator[Pipeline]:
