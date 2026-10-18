@@ -122,48 +122,34 @@ PLANNED_DAYS = 7
 
 class Stage:
     """One pipeline's memoized features, fits and predictions; a blend holds one per
-    member. The attributes declared first are the run's, copied in by ``__init__``.
+    member. ``run`` is what every stage of the run shares.
     """
 
-    ledger: Ledger
-    dataset: Dataset
-    targets: dict[str, Lag]
-    evaluation: Evaluation
-    root: pathlib.Path
-    report: RunReport
-    start: Callable[[], str]
-    log: Callable[[str], None]
-    dry: bool
-    planned: set[str]
-    features: dict[str, Features]
-    stages: dict[str, Stage]
-    prepared: dict[str, Any]
-
-    def __init__(self, context: RunContext, pipeline: Pipeline):
-        vars(self).update(vars(context))
+    def __init__(self, run: RunContext, pipeline: Pipeline):
+        self.run = run
         self.pipeline = pipeline
         self.name = pipeline.name or pipeline.id
-        self.members = [context.stage(m) for m in pipeline.members]
+        self.members = [run.stage(m) for m in pipeline.members]
         self.feature_functions = pipeline.feature_functions
         shared = {m.feature_functions for m in self.members}
         if not self.feature_functions and len(shared) == 1:
             self.feature_functions = shared.pop()
-        self.shas = identity.import_shas(pipeline.functions, self.root)
+        self.shas = identity.import_shas(pipeline.functions, self.run.root)
         self.functions = {
             **stage_functions(pipeline),
             "features": self.feature_functions,
         }
         self.stage_shas = {
-            stage: identity.import_shas(functions, self.root)
+            stage: identity.import_shas(functions, self.run.root)
             for stage, functions in self.functions.items()
         }
         self.stage_keys = {
-            stage: identity.code_keys(functions, self.root)
+            stage: identity.code_keys(functions, self.run.root)
             for stage, functions in self.functions.items()
         }
-        self.dists = identity.imported_dists(pipeline.functions, self.root)
+        self.dists = identity.imported_dists(pipeline.functions, self.run.root)
         self.locks = {
-            stage: lock_text(identity.imported_dists(functions, self.root))
+            stage: lock_text(identity.imported_dists(functions, self.run.root))
             for stage, functions in self.functions.items()
         }
         self.env_lock = {
@@ -173,12 +159,12 @@ class Stage:
         self.feature_ids = [
             identity.content_hash(
                 {
-                    "dataset": self.evaluation.dataset_id,
+                    "dataset": self.run.evaluation.dataset_id,
                     "features": function,
-                    "code_keys": identity.code_keys((function,), self.root),
+                    "code_keys": identity.code_keys((function,), self.run.root),
                     "env_lock": identity.bytes_hash(
                         lock_text(
-                            identity.imported_dists((function,), self.root)
+                            identity.imported_dists((function,), self.run.root)
                         ).encode()
                     ),
                 }
@@ -217,7 +203,7 @@ class Stage:
         )
         fit_id = identity.content_hash(
             {
-                "dataset": self.evaluation.dataset_id,
+                "dataset": self.run.evaluation.dataset_id,
                 "pipeline": self.pipeline.fit_declaration,
                 "train": train,
                 "code_keys": self.stage_keys["fit"],
@@ -227,20 +213,20 @@ class Stage:
                 **({"features": columns_id} if columns_id else {}),
             }
         )
-        if fit_id in self.planned:
+        if fit_id in self.run.planned:
             return fit_id
-        if self.ledger.latest(Event.FIT, fit_id) is not None:
-            self.report.fits_reused += 1
-            self.planned.add(fit_id)
+        if self.run.ledger.latest(Event.FIT, fit_id) is not None:
+            self.run.report.fits_reused += 1
+            self.run.planned.add(fit_id)
             return fit_id
-        if self.dry:
-            self.planned.add(fit_id)
-            self.report.fits_computed += 1
-            self.log(
+        if self.run.dry:
+            self.run.planned.add(fit_id)
+            self.run.report.fits_computed += 1
+            self.run.log(
                 f"would fit {self.name} {fold.label}: {self._why(fold.label, train)}"
             )
             return fit_id
-        split = self.evaluation.split
+        split = self.run.evaluation.split
         visible = FitView(
             self._visible(max(hi for _, hi in fold.train)).train_view(fold.train),
             fold.train,
@@ -253,17 +239,17 @@ class Stage:
         inputs = (
             [
                 [
-                    np.concatenate([load_predictions(self.ledger, p) for p in ids])
+                    np.concatenate([load_predictions(self.run.ledger, p) for p in ids])
                     for ids in train_preds
                 ]
             ]
             if train_preds
             else []
         )
-        run_id = self.start()
+        run_id = self.run.start()
         loaded = set(sys.modules)
         why = self._why(fold.label, train)
-        self.log(f"fitting {self.name} {fold.label}")
+        self.run.log(f"fitting {self.name} {fold.label}")
         started = time.perf_counter()
         model = noted(
             f"fit on fold {fold.label}; {FIT_HINT}",
@@ -280,10 +266,10 @@ class Stage:
             model = model.model
         blob = self._model_blob(model)
         load = _declared(self.pipeline.load, self.name, "load")
-        self.models[fit_id] = load(self.ledger.get_blob(blob["sha"]))
+        self.models[fit_id] = load(self.run.ledger.get_blob(blob["sha"]))
         self._check_imports("fit", loaded)
         self._unchanged("fit")
-        self.ledger.put_blob(self.locks["fit"].encode())
+        self.run.ledger.put_blob(self.locks["fit"].encode())
         self.pending[fit_id] = (
             model,
             why,
@@ -302,7 +288,7 @@ class Stage:
                 **({"facts": facts} if facts is not None else {}),
             },
         )
-        self.report.fits_computed += 1
+        self.run.report.fits_computed += 1
         return fit_id
 
     def predictions(
@@ -342,18 +328,20 @@ class Stage:
                     "env_lock": identity.bytes_hash(self.locks["postprocess"].encode()),
                 }
             )
-        if pred_id in self.planned:
+        if pred_id in self.run.planned:
             return pred_id
-        if self.ledger.latest(Event.PREDICTIONS, pred_id):
-            self.report.predictions_reused += 1
-            self.planned.add(pred_id)
+        if self.run.ledger.latest(Event.PREDICTIONS, pred_id):
+            self.run.report.predictions_reused += 1
+            self.run.planned.add(pred_id)
             return pred_id
-        if self.dry:
-            raw_missing = raw_id not in self.planned and not self.ledger.latest(
+        if self.run.dry:
+            raw_missing = raw_id not in self.run.planned and not self.run.ledger.latest(
                 Event.PREDICTIONS, raw_id
             )
-            self.report.predictions_computed += 1 + (raw_missing and raw_id != pred_id)
-            self.planned.update((raw_id, pred_id))
+            self.run.report.predictions_computed += 1 + (
+                raw_missing and raw_id != pred_id
+            )
+            self.run.planned.update((raw_id, pred_id))
             return pred_id
         config = self.pipeline.predict_config
         where: dict[str, Any] = {
@@ -370,12 +358,12 @@ class Stage:
         visible = self._visible(rows[1])
         if train:
             visible = visible.train_view(fold.train)
-        visible = visible.masked(self.targets, rows[0])
-        self.start()
-        if self.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
-            raw = load_predictions(self.ledger, raw_id)
+        visible = visible.masked(self.run.targets, rows[0])
+        self.run.start()
+        if self.run.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
+            raw = load_predictions(self.run.ledger, raw_id)
         else:
-            inputs = [load_predictions(self.ledger, p) for p in member_preds]
+            inputs = [load_predictions(self.run.ledger, p) for p in member_preds]
 
             def predict(model: Any, view: Dataset, part: Range) -> np.ndarray:
                 head = part[1] - rows[0]
@@ -410,7 +398,7 @@ class Stage:
             if self.pipeline.postprocess is None and not train:
                 self._refuse_non_finite("predict", raw, fold, rows)
             raw = self._write(raw_id, raw, where)
-            self.log(f"predictions {self.name} rows {rows[0]}:{rows[1]}")
+            self.run.log(f"predictions {self.name} rows {rows[0]}:{rows[1]}")
         if self.pipeline.postprocess is not None:
             config = self.pipeline.postprocess_config
             postprocess = functools.partial(
@@ -443,7 +431,7 @@ class Stage:
                     "postprocess_config": identity.canonical(config),
                 },
             )
-            self.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
+            self.run.log(f"postprocess {self.name} rows {rows[0]}:{rows[1]}")
         return pred_id
 
     def _prepare(
@@ -457,27 +445,29 @@ class Stage:
         if not hasattr(self, "prepare_key"):
             self.prepare_key = {
                 "prepare": prepare,
-                "code_keys": identity.code_keys((prepare,), self.root),
+                "code_keys": identity.code_keys((prepare,), self.run.root),
                 "env_lock": identity.bytes_hash(
-                    lock_text(identity.imported_dists((prepare,), self.root)).encode()
+                    lock_text(
+                        identity.imported_dists((prepare,), self.run.root)
+                    ).encode()
                 ),
             }
         key = identity.content_hash(
             {
                 **self.prepare_key,
-                "dataset": self.evaluation.dataset_id,
+                "dataset": self.run.evaluation.dataset_id,
                 "train": [list(seg) for seg in fold.train],
                 **({"features": columns_id} if columns_id else {}),
             }
         )
-        if key not in self.prepared:
+        if key not in self.run.prepared:
             started = time.perf_counter()
-            self.prepared[key] = frozen(
+            self.run.prepared[key] = frozen(
                 noted(f"prepare on fold {fold.label}", prepare, visible, fold.train)
             )
             duration = time.perf_counter() - started
-            self.log(f"prepare {self.name} {fold.label} {duration:.1f}s")
-        return self.prepared[key]
+            self.run.log(f"prepare {self.name} {fold.label} {duration:.1f}s")
+        return self.run.prepared[key]
 
     def _record_fit(
         self, fit_id: str, fold: Fold, loaded: np.ndarray, predict: Callable
@@ -488,10 +478,12 @@ class Stage:
         fitted, why, payload = self.pending.pop(fit_id)
         again = np.asarray(predict(fitted))
         refuse_changed(f"{self.name}: fit {fold.label}", "prediction", again, loaded)
-        self.ledger.append(
-            Event.FIT, self.evaluation.dataset_id, fit_id, payload, id=fit_id
+        self.run.ledger.append(
+            Event.FIT, self.run.evaluation.dataset_id, fit_id, payload, id=fit_id
         )
-        self.log(f"fit {self.name} {fold.label} {payload['duration_s']:.1f}s: {why}")
+        self.run.log(
+            f"fit {self.name} {fold.label} {payload['duration_s']:.1f}s: {why}"
+        )
 
     def _train_predictions(
         self, member_fits: list[str], fold: Fold, index: int
@@ -503,7 +495,7 @@ class Stage:
 
     def _unchanged(self, stage: str):
         """Refuse to record a sha for code that is not the code that ran."""
-        now = identity.import_shas(self.functions[stage], self.root)
+        now = identity.import_shas(self.functions[stage], self.run.root)
         moved = sorted(
             k
             for k in set(now) | set(self.stage_shas[stage])
@@ -517,7 +509,7 @@ class Stage:
         on demand from their stored files.
         """
         if not self.feature_functions:
-            return self.dataset.upto(cut)
+            return self.run.dataset.upto(cut)
         if self.featured is None:
             sets = [
                 self._features(f, i)
@@ -531,11 +523,11 @@ class Stage:
                 if path is not None
             }
             self.featured = Dataset(
-                self.dataset.columns,
-                self.dataset.ts,
+                self.run.dataset.columns,
+                self.run.dataset.ts,
                 names,
                 stores,
-                reveal=self.dataset.reveal,
+                reveal=self.run.dataset.reveal,
             )
         return self.featured.upto(cut)
 
@@ -570,7 +562,7 @@ class Stage:
                     "one of formats.KNOWN other than zip"
                 )
         return {
-            "sha": self.ledger.put_blob(payload),
+            "sha": self.run.ledger.put_blob(payload),
             "format": self.pipeline.format,
             "portable": all(formats.KNOWN[f] for f in used.values()),
         }
@@ -583,80 +575,86 @@ class Stage:
         the same features under another evaluation reuses it. The probe cuts each of
         the five spans between the sixths of the rows and the end by ``cuts``.
         """
-        if feature_id in self.features:
-            return self.features[feature_id]
-        event = self.ledger.latest(Event.FEATURES, feature_id)
+        if feature_id in self.run.features:
+            return self.run.features[feature_id]
+        event = self.run.ledger.latest(Event.FEATURES, feature_id)
         if event is not None:
             payload = event["payload"]
-            path = self.ledger.blobs / payload["blob"]["sha"]
+            path = self.run.ledger.blobs / payload["blob"]["sha"]
             found = (tuple(payload["columns"]), path, payload["columns_id"])
-            self.report.features_reused += 1
-            return self.features.setdefault(feature_id, found)
-        if self.dry and feature_id in self.planned and feature_id in _PLANNED_FEATURES:
-            return self.features.setdefault(feature_id, _PLANNED_FEATURES[feature_id])
+            self.run.report.features_reused += 1
+            return self.run.features.setdefault(feature_id, found)
+        if (
+            self.run.dry
+            and feature_id in self.run.planned
+            and feature_id in _PLANNED_FEATURES
+        ):
+            return self.run.features.setdefault(
+                feature_id, _PLANNED_FEATURES[feature_id]
+            )
         revealed: dict[str, Lag] = {
-            k: v for k, v in self.targets.items() if v is not None
+            k: v for k, v in self.run.targets.items() if v is not None
         }
         bare = Dataset(
             {
                 k: v
-                for k, v in self.dataset.columns.items()
-                if k in revealed or k not in self.targets
+                for k, v in self.run.dataset.columns.items()
+                if k in revealed or k not in self.run.targets
             },
-            self.dataset.ts,
+            self.run.dataset.ts,
         )
         ref = identity.function_ref(function)
         planned = self._planned_features(feature_id)
-        if planned is not None and self.dry:
+        if planned is not None and self.run.dry:
             columns_id, columns, duration = planned
-            self.log(
+            self.run.log(
                 f"would compute features {self.name} {ref} {len(columns)} columns: "
                 f"computed and probed by an earlier dry run"
             )
-            self.report.features_computed += 1
-            self.planned.add(feature_id)
+            self.run.report.features_computed += 1
+            self.run.planned.add(feature_id)
             found = (tuple(columns), None, columns_id)
             _PLANNED_FEATURES[feature_id] = found
-            return self.features.setdefault(feature_id, found)
+            return self.run.features.setdefault(feature_id, found)
         loaded = set(sys.modules)
         if planned is None:
-            self.log(f"computing features {self.name} {ref}")
+            self.run.log(f"computing features {self.name} {ref}")
             started = time.perf_counter()
             columns = self._feature_columns(function, bare)
             duration = time.perf_counter() - started
         else:
-            self.log(f"features {self.name} {ref}: from the dry run, probing")
+            self.run.log(f"features {self.name} {ref}: from the dry run, probing")
             columns_id, columns, duration = planned
         columns_id = columns_hash(columns)
         probe_rows = self._probe_features(
-            function, bare, revealed, columns, spans=1 if self.dry else 5
+            function, bare, revealed, columns, spans=1 if self.run.dry else 5
         )
         self._check_imports("features", loaded)
         self._unchanged("features")
-        if self.dry:
-            self.log(
+        if self.run.dry:
+            self.run.log(
                 f"would compute features {self.name} {ref} {len(columns)} columns "
                 f"{duration:.1f}s: {self._features_why(function)}; probed at rows "
                 f"{probe_rows} only"
             )
             self._plan_features(feature_id, columns, columns_id, duration)
-            self.report.features_computed += 1
-            self.planned.add(feature_id)
+            self.run.report.features_computed += 1
+            self.run.planned.add(feature_id)
             found = (tuple(columns), None, columns_id)
             _PLANNED_FEATURES[feature_id] = found
-            return self.features.setdefault(feature_id, found)
-        run_id = self.start()
-        sha = self.ledger.put_blob(rows_save(Dataset(columns, None)))
-        self.ledger.append(
+            return self.run.features.setdefault(feature_id, found)
+        run_id = self.run.start()
+        sha = self.run.ledger.put_blob(rows_save(Dataset(columns, None)))
+        self.run.ledger.append(
             Event.FEATURES,
-            self.evaluation.dataset_id,
+            self.run.evaluation.dataset_id,
             feature_id,
             {
                 "pipeline": self.pipeline.id,
                 "run": run_id,
                 "features": identity.canonical(function),
-                "import_shas": identity.import_shas((function,), self.root),
-                "code_keys": identity.code_keys((function,), self.root),
+                "import_shas": identity.import_shas((function,), self.run.root),
+                "code_keys": identity.code_keys((function,), self.run.root),
                 "columns": list(columns),
                 "columns_id": columns_id,
                 "probe_rows": probe_rows,
@@ -665,16 +663,16 @@ class Stage:
             },
             id=feature_id,
         )
-        self.report.features_computed += 1
-        self.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
+        self.run.report.features_computed += 1
+        self.run.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
         for leftover in self._planned_dir().glob(f"{feature_id}.*"):
             leftover.unlink(missing_ok=True)
-        return self.features.setdefault(
-            feature_id, (tuple(columns), self.ledger.blobs / sha, columns_id)
+        return self.run.features.setdefault(
+            feature_id, (tuple(columns), self.run.ledger.blobs / sha, columns_id)
         )
 
     def _planned_dir(self) -> pathlib.Path:
-        return self.ledger.root / "planned"
+        return self.run.ledger.root / "planned"
 
     def _plan_features(
         self,
@@ -780,7 +778,7 @@ class Stage:
         """Why a feature set is computed: the inputs that moved against the nearest
         earlier computation of the same function, the one with the fewest moved.
         """
-        rows = self.ledger.sql(
+        rows = self.run.ledger.sql(
             "SELECT stream AS dataset, json_extract(payload, '$.code_keys') AS "
             "code_keys FROM event WHERE type = ? AND "
             "json_extract(payload, '$.features.__function__') = ? "
@@ -789,7 +787,7 @@ class Stage:
         )
         if not rows:
             return "no earlier features of this function"
-        now = identity.code_keys((function,), self.root)
+        now = identity.code_keys((function,), self.run.root)
 
         def moved(row: dict[str, Any]) -> list[str]:
             before = json.loads(row["code_keys"])
@@ -799,7 +797,10 @@ class Stage:
             return [
                 reason
                 for reason, differs in (
-                    ("dataset changed", row["dataset"] != self.evaluation.dataset_id),
+                    (
+                        "dataset changed",
+                        row["dataset"] != self.run.evaluation.dataset_id,
+                    ),
                     (f"code changed: {', '.join(files)}", bool(files)),
                 )
                 if differs
@@ -812,7 +813,7 @@ class Stage:
         self, function: Callable, bare: Dataset
     ) -> dict[str, np.ndarray]:
         out = function(bare)
-        clash = sorted(set(out) & set(self.dataset.columns))
+        clash = sorted(set(out) & set(self.run.dataset.columns))
         if clash:
             raise Refused(f"{self.name}: features redefine dataset columns {clash}")
         columns = {}
@@ -831,7 +832,7 @@ class Stage:
         of this pipeline, by id or name, and label, the one with the fewest moved, the
         newest among ties.
         """
-        rows = self.ledger.sql(
+        rows = self.run.ledger.sql(
             "SELECT f.dataset, f.train, f.code_keys, f.env_lock, (SELECT d.payload "
             "FROM event d WHERE d.type = 'pipeline_declared' AND d.key = f.pipeline "
             "LIMIT 1) AS declared FROM event_fit f JOIN event_pipeline p "
@@ -853,7 +854,10 @@ class Stage:
             return [
                 reason
                 for reason, differs in (
-                    ("dataset changed", row["dataset"] != self.evaluation.dataset_id),
+                    (
+                        "dataset changed",
+                        row["dataset"] != self.run.evaluation.dataset_id,
+                    ),
                     ("params changed", identity.content_hash(declared) != params),
                     (f"code changed: {', '.join(files)}", bool(files)),
                     (
@@ -916,7 +920,7 @@ class Stage:
         """Check each computation of a stage before its write, so an import on a later
         fold is named as one.
         """
-        refuse_lazy_imports(self.pipeline, self.root, self.dists, loaded, stage)
+        refuse_lazy_imports(self.pipeline, self.run.root, self.dists, loaded, stage)
 
     def _model(self, fit_id: str, fresh: bool = False) -> Any:
         """The fit's model loaded from its saved bytes once per run, or with ``fresh`` a
@@ -925,9 +929,9 @@ class Stage:
         if self.pipeline.fit is None:
             return None
         if fresh or fit_id not in self.models:
-            fit = self.ledger.event(Event.FIT, fit_id)
+            fit = self.run.ledger.event(Event.FIT, fit_id)
             load = _declared(self.pipeline.load, self.name, "load")
-            model = load(self.ledger.get_blob(fit["payload"]["model"]["sha"]))
+            model = load(self.run.ledger.get_blob(fit["payload"]["model"]["sha"]))
             if fresh:
                 return model
             self.models[fit_id] = model
@@ -936,17 +940,17 @@ class Stage:
     def _write(self, pred_id: str, pred: Any, payload: dict[str, Any]) -> np.ndarray:
         values = np.asarray(pred, dtype=np.float64)
         blob = {
-            "sha": self.ledger.put_blob(formats.series_save(values)),
+            "sha": self.run.ledger.put_blob(formats.series_save(values)),
             "format": PARQUET,
         }
-        self.ledger.append(
+        self.run.ledger.append(
             Event.PREDICTIONS,
-            self.evaluation.dataset_id,
+            self.run.evaluation.dataset_id,
             pred_id,
             {**payload, "blob": blob},
             id=pred_id,
         )
-        self.report.predictions_computed += 1
+        self.run.report.predictions_computed += 1
         return values
 
 
