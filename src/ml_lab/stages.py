@@ -100,7 +100,7 @@ class RunContext:
     log: Callable[[str], None]
     dry: bool
     planned: set[str]
-    features: dict[str, Features] = dataclasses.field(default_factory=dict)
+    features: dict[str, FeatureSet] = dataclasses.field(default_factory=dict)
     stages: dict[str, Stage] = dataclasses.field(default_factory=dict)
     prepared: dict[str, Any] = dataclasses.field(default_factory=dict)
 
@@ -111,9 +111,23 @@ class RunContext:
         return self.stages[pipeline.id]
 
 
-Features = tuple[tuple[str, ...], pathlib.Path | None, str]
-"""One computed feature set: its column names, the Parquet file they are read from
-(None in a dry run, which stores nothing) and the id of the ordered columns' bytes."""
+@dataclasses.dataclass(frozen=True)
+class FeatureSet:
+    """One computed feature set.
+
+    Attributes
+    ----------
+    columns : tuple[str, ...]
+        The column names, in order.
+    path : pathlib.Path | None
+        The Parquet file they are read from; None in a dry run, which stores nothing.
+    columns_id : str
+        The id of the ordered columns' bytes.
+    """
+
+    columns: tuple[str, ...]
+    path: pathlib.Path | None
+    columns_id: str
 
 
 PLANNED_DAYS = 7
@@ -173,7 +187,7 @@ class Stage:
         ]
         self.featured: Dataset | None = None
         self.models: dict[str, Any] = {}
-        self.pending: dict[str, tuple[Any, str, dict[str, Any]]] = {}
+        self.pending: dict[str, _Pending] = {}
         self.fits: dict[tuple[tuple[int, int], ...], str] = {}
         self.widths: dict[str, tuple[int, ...]] = {}
 
@@ -271,7 +285,7 @@ class Stage:
         self._check_imports("fit", loaded)
         self._unchanged("fit")
         self.run.ledger.put_blob(self.locks["fit"].encode())
-        self.pending[fit_id] = (
+        self.pending[fit_id] = _Pending(
             model,
             why,
             {
@@ -476,15 +490,18 @@ class Stage:
         """Append a fit once its reloaded model predicts its first range as the
         fitted one did, so a save that drops state is refused, not recorded.
         """
-        fitted, why, payload = self.pending.pop(fit_id)
-        again = np.asarray(predict(fitted))
+        pending = self.pending.pop(fit_id)
+        again = np.asarray(predict(pending.model))
         refuse_changed(f"{self.name}: fit {fold.label}", "prediction", again, loaded)
         self.run.ledger.append(
-            Event.FIT, self.run.evaluation.dataset_id, fit_id, payload, id=fit_id
+            Event.FIT,
+            self.run.evaluation.dataset_id,
+            fit_id,
+            pending.payload,
+            id=fit_id,
         )
-        self.run.log(
-            f"fit {self.name} {fold.label} {payload['duration_s']:.1f}s: {why}"
-        )
+        seconds = pending.payload["duration_s"]
+        self.run.log(f"fit {self.name} {fold.label} {seconds:.1f}s: {pending.why}")
 
     def _train_predictions(
         self, member_fits: list[str], fold: Fold, index: int
@@ -516,12 +533,9 @@ class Stage:
                 self._features(f, i)
                 for f, i in zip(self.feature_functions, self.feature_ids, strict=True)
             ]
-            names = tuple(n for columns, _, _ in sets for n in columns)
+            names = tuple(n for fs in sets for n in fs.columns)
             stores = {
-                n: path
-                for columns, path, _ in sets
-                for n in columns
-                if path is not None
+                n: fs.path for fs in sets for n in fs.columns if fs.path is not None
             }
             self.featured = Dataset(
                 self.run.dataset.columns,
@@ -540,13 +554,13 @@ class Stage:
             self._features(f, i)
             for f, i in zip(self.feature_functions, self.feature_ids, strict=True)
         ]
-        names = Counter(n for columns, _, _ in sets for n in columns)
+        names = Counter(n for fs in sets for n in fs.columns)
         twice = sorted(n for n, k in names.items() if k > 1)
         if twice:
             raise Refused(
                 f"{self.name}: features functions name the same columns {twice}"
             )
-        return identity.content_hash([i for _, _, i in sets]) if sets else None
+        return identity.content_hash([fs.columns_id for fs in sets]) if sets else None
 
     def _model_blob(self, model: Any) -> dict[str, Any]:
         """The saved model; a zip is portable iff every member's format is."""
@@ -568,7 +582,7 @@ class Stage:
             "portable": all(formats.KNOWN[f] for f in used.values()),
         }
 
-    def _features(self, function: Callable, feature_id: str) -> Features:
+    def _features(self, function: Callable, feature_id: str) -> FeatureSet:
         """One features function's columns, computed once per feature id over the
         dataset without its targets, probed and stored. A dry run computes and probes
         them too, so the names and id are known and a leak is refused before any fit,
@@ -582,7 +596,7 @@ class Stage:
         if event is not None:
             payload = event["payload"]
             path = self.run.ledger.blobs / payload["blob"]["sha"]
-            found = (tuple(payload["columns"]), path, payload["columns_id"])
+            found = FeatureSet(tuple(payload["columns"]), path, payload["columns_id"])
             self.run.report.features_reused += 1
             return self.run.features.setdefault(feature_id, found)
         if (
@@ -614,7 +628,7 @@ class Stage:
             )
             self.run.report.features_computed += 1
             self.run.planned.add(feature_id)
-            found = (tuple(columns), None, columns_id)
+            found = FeatureSet(tuple(columns), None, columns_id)
             _PLANNED_FEATURES[feature_id] = found
             return self.run.features.setdefault(feature_id, found)
         loaded = set(sys.modules)
@@ -641,7 +655,7 @@ class Stage:
             self._plan_features(feature_id, columns, columns_id, duration)
             self.run.report.features_computed += 1
             self.run.planned.add(feature_id)
-            found = (tuple(columns), None, columns_id)
+            found = FeatureSet(tuple(columns), None, columns_id)
             _PLANNED_FEATURES[feature_id] = found
             return self.run.features.setdefault(feature_id, found)
         run_id = self.run.start()
@@ -669,7 +683,8 @@ class Stage:
         for leftover in self._planned_dir().glob(f"{feature_id}.*"):
             leftover.unlink(missing_ok=True)
         return self.run.features.setdefault(
-            feature_id, (tuple(columns), self.run.ledger.blobs / sha, columns_id)
+            feature_id,
+            FeatureSet(tuple(columns), self.run.ledger.blobs / sha, columns_id),
         )
 
     def _planned_dir(self) -> pathlib.Path:
@@ -970,7 +985,18 @@ def load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
 # Private Functions ==================================================================
 
 
-_PLANNED_FEATURES: dict[str, Features] = {}
+@dataclasses.dataclass(frozen=True)
+class _Pending:
+    """A fit computed and not yet recorded: it is appended once its reloaded model
+    predicts its first range as the fitted one did.
+    """
+
+    model: Any
+    why: str
+    payload: dict[str, Any]
+
+
+_PLANNED_FEATURES: dict[str, FeatureSet] = {}
 """Feature sets a dry run computed in this process, by feature id, so a later dry run
 of the same features under another evaluation reuses the names and id instead of
 computing them again. The id covers the dataset, the function, its code and its
