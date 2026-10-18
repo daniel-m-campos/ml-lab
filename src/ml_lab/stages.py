@@ -36,7 +36,7 @@ from ml_lab.dataset import (
     rows_load,
     rows_save,
 )
-from ml_lab.declarations import positional, stage_functions
+from ml_lab.declarations import stage_functions
 from ml_lab.experiment import Evaluation, Fitted, Pipeline
 from ml_lab.guards import (
     cuts,
@@ -188,7 +188,7 @@ class Stage:
         train = [list(seg) for seg in fold.train]
         member_fits = [m.fit(fold, index) for m in self.members]
         columns_id = self._feature_columns_id()
-        if self.pipeline.fit is None:
+        if self.pipeline.stateless:
             return identity.content_hash(
                 {
                     "stateless": True,
@@ -196,9 +196,10 @@ class Stage:
                     **({"features": columns_id} if columns_id else {}),
                 }
             )
+        fit = _declared(self.pipeline.fit, self.name, "fit")
         train_preds = (
             self._train_predictions(member_fits, fold, index)
-            if self.members and positional(self.pipeline.fit) > 3
+            if self.pipeline.learns_from_members
             else []
         )
         fit_id = identity.content_hash(
@@ -253,7 +254,7 @@ class Stage:
         started = time.perf_counter()
         model = noted(
             f"fit on fold {fold.label}; {FIT_HINT}",
-            self.pipeline.fit,
+            fit,
             visible,
             fold.train,
             self.pipeline.params,
@@ -926,7 +927,7 @@ class Stage:
         """The fit's model loaded from its saved bytes once per run, or with ``fresh`` a
         new load, so a probe meets no state an earlier predict left in the model.
         """
-        if self.pipeline.fit is None:
+        if self.pipeline.stateless:
             return None
         if fresh or fit_id not in self.models:
             fit = self.run.ledger.event(Event.FIT, fit_id)

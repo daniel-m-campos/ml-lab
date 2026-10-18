@@ -18,6 +18,7 @@ Examples
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from collections.abc import Callable
 from typing import Any
 
@@ -166,6 +167,20 @@ class Pipeline:
         return identity.content_hash(self)
 
     @property
+    def stateless(self) -> bool:
+        """Whether the pipeline is a stateless blend: ``fit=None``, so no model."""
+        return self.fit is None
+
+    @property
+    def learns_from_members(self) -> bool:
+        """Whether ``fit`` receives the members' in-sample predictions: a blend whose
+        ``fit`` takes a fourth positional parameter.
+        """
+        if self.fit is None or not self.members:
+            return False
+        return _positional(self.fit) > 3
+
+    @property
     def feature_functions(self) -> tuple[Callable, ...]:
         """The features functions as a tuple, however declared."""
         if self.features is None:
@@ -208,6 +223,12 @@ class Pipeline:
 
     def named(self, name: str) -> Pipeline:
         return dataclasses.replace(self, name=name)
+
+
+def _positional(func: Callable) -> int:
+    """Positional parameters of a function."""
+    kinds = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    return sum(p.kind in kinds for p in inspect.signature(func).parameters.values())
 
 
 def mean_blend(*members: Pipeline, name: str = "") -> Pipeline:
