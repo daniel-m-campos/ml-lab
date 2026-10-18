@@ -34,7 +34,18 @@ import polars as pl
 import pytest
 
 import ml_lab
-from ml_lab import cli, dates, formats, identity, runs, splits
+from ml_lab import (
+    cli,
+    dates,
+    declarations,
+    formats,
+    guards,
+    identity,
+    provenance,
+    runs,
+    splits,
+    stages,
+)
 from ml_lab.dataset import (
     Dataset,
     Range,
@@ -49,7 +60,7 @@ from ml_lab.dataset import (
 from ml_lab.experiment import Evaluation, Pipeline, Scorer
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.panel import Panel
-from ml_lab.runs import _load_predictions
+from ml_lab.stages import load_predictions
 from tests import synthetic
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -1354,7 +1365,7 @@ def test_a_fit_and_an_in_sample_member_see_no_column_outside_the_train_segments(
     (member,) = ledger.sql(
         "SELECT id FROM event_prediction WHERE fold = 1 AND range_start = ?", (hi,)
     )
-    assert (_load_predictions(ledger, member["id"]) == lo).all()
+    assert (load_predictions(ledger, member["id"]) == lo).all()
 
 
 def test_a_kfold_fit_that_memorizes_labels_replays_none(ledger, dataset):
@@ -1367,7 +1378,7 @@ def test_a_kfold_fit_that_memorizes_labels_replays_none(ledger, dataset):
     )
     assert not _run(ledger, evaluation, peek).failed
     for e in ledger.events(Event.PREDICTIONS):
-        assert not np.nan_to_num(_load_predictions(ledger, e["id"])).any()
+        assert not np.nan_to_num(load_predictions(ledger, e["id"])).any()
 
 
 def test_a_fold_training_on_an_unrevealed_label_is_refused(ledger):
@@ -1513,14 +1524,14 @@ def test_the_probe_predicts_with_a_model_no_earlier_call_touched(ledger, evaluat
 
 def test_rounding_passes_the_probe_and_a_leak_is_sized(ledger, evaluation):
     full = np.array([1.0, -2.0, 4.0, np.nan])
-    runs._refuse_changed("x", "prediction", full, full[:3] + 1e-10, at=3)
-    runs._refuse_changed("x", "prediction", full, full, at=None)
+    guards.refuse_changed("x", "prediction", full, full[:3] + 1e-10, at=3)
+    guards.refuse_changed("x", "prediction", full, full, at=None)
     with pytest.raises(Refused, match="3 of 3 rows moved") as info:
-        runs._refuse_changed("x", "prediction", full, full[:3] + 1e-6, at=3, first=10)
+        guards.refuse_changed("x", "prediction", full, full[:3] + 1e-6, at=3, first=10)
     assert "at row 10" in str(info.value) and "read past row 3" in str(info.value)
     assert "2.5e-07 of the largest |prediction| 4" in str(info.value)
     with pytest.raises(Refused) as info:
-        runs._refuse_changed("x", "prediction", full, np.array([1.0, -2.0, 4.0, 0.0]))
+        guards.refuse_changed("x", "prediction", full, np.array([1.0, -2.0, 4.0, 0.0]))
     assert str(info.value) == (
         "x: the model reloaded from its saved bytes predicts prediction 0 at row 3 "
         "where the fitted one predicts nan, and 1 of 4 rows moved by up to 0, 0 of "
@@ -1575,7 +1586,7 @@ def test_a_predict_of_k_columns_is_stored_scored_and_blended_as_such(ledger, dat
     report = _run(ledger, evaluation, wide, blend)
     assert report.failed == {} and report.scores_recorded == 2
     first = ledger.sql("SELECT id, range_start, range_end FROM event_prediction")[0]
-    stored = _load_predictions(ledger, first["id"])
+    stored = load_predictions(ledger, first["id"])
     assert stored.shape == (first["range_end"] - first["range_start"], 2)
     sha = ledger.sql("SELECT blob FROM event_prediction WHERE id = ?", (first["id"],))
     frame = pl.read_parquet(io.BytesIO(ledger.get_blob(sha[0]["blob"])))
@@ -1602,7 +1613,7 @@ def test_an_output_that_is_not_one_row_per_range_row_is_refused(
     assert "one row per row of the range" in report.failed["shaped"]
     rows = ledger.sql("SELECT id, range_start, range_end FROM event_prediction")
     assert all(
-        len(_load_predictions(ledger, r["id"])) == r["range_end"] - r["range_start"]
+        len(load_predictions(ledger, r["id"])) == r["range_end"] - r["range_start"]
         for r in rows
     )
 
@@ -1783,8 +1794,8 @@ def test_a_postprocess_shares_the_fit_and_is_its_own_prediction(
     post = [e for e in ledger.events(Event.PREDICTIONS) if "raw" in e["payload"]]
     assert len(post) == len(folds)
     assert post[0]["payload"]["postprocess_config"] == 2.0
-    raw = _load_predictions(ledger, post[0]["payload"]["raw"])
-    assert np.allclose(_load_predictions(ledger, post[0]["id"]), 2 * raw)
+    raw = load_predictions(ledger, post[0]["payload"]["raw"])
+    assert np.allclose(load_predictions(ledger, post[0]["id"]), 2 * raw)
     again = _run(ledger, evaluation, plain, doubled)
     assert again.run == "" and again.predictions_reused == 2 * len(folds)
 
@@ -1807,8 +1818,8 @@ def test_a_postprocess_config_enters_the_prediction_id_and_shares_the_fit(
     post = [e for e in ledger.events(Event.PREDICTIONS) if "raw" in e["payload"]]
     by_config = {e["payload"]["postprocess_config"]: e for e in post}
     assert len(post) == 2 * report.predictions_computed and set(by_config) == {2, 3}
-    tripled_values = _load_predictions(ledger, by_config[3.0]["id"])
-    raw = _load_predictions(ledger, by_config[3.0]["payload"]["raw"])
+    tripled_values = load_predictions(ledger, by_config[3.0]["id"])
+    raw = load_predictions(ledger, by_config[3.0]["payload"]["raw"])
     assert np.allclose(tripled_values, 3 * raw)
     assert len({e["payload"]["raw"] for e in post}) == report.predictions_computed
 
@@ -1824,8 +1835,8 @@ def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evalua
     assert report.scores_recorded == 1
     blended = [e for e in ledger.events(Event.PREDICTIONS) if "members" in e["payload"]]
     first = blended[0]
-    parts = [_load_predictions(ledger, p) for p in first["payload"]["members"]]
-    assert np.allclose(_load_predictions(ledger, first["id"]), np.mean(parts, axis=0))
+    parts = [load_predictions(ledger, p) for p in first["payload"]["members"]]
+    assert np.allclose(load_predictions(ledger, first["id"]), np.mean(parts, axis=0))
     fit = ledger.latest(Event.FIT, first["payload"]["fit"])
     assert len(fit["payload"]["members"]) == 2
     stands_on = _count(
@@ -2315,7 +2326,7 @@ def test_a_fit_that_imports_a_distribution_lazily_is_refused():
     dists = identity.imported_dists(pipeline.functions, REPO)
     before_pytest = {name for name in sys.modules if not name.startswith("pytest")}
     with pytest.raises(Refused, match="distributions \\[.*'pytest'"):
-        runs._refuse_lazy_imports(pipeline, REPO, dists, before_pytest, "fit")
+        guards.refuse_lazy_imports(pipeline, REPO, dists, before_pytest, "fit")
 
 
 @pytest.mark.parametrize("stage", ["fit", "predict"])
@@ -2408,16 +2419,16 @@ def test_the_run_records_the_resolution_file_when_present(ledger, evaluation):
 def test_untracked_function_modules_are_in_the_run_diff(ledger, tmp_path):
     repo = _repo(tmp_path / "repo")
     (repo / "new_functions.py").write_text("y = 2\n")
-    git = runs._git(ledger, repo)
+    git = provenance.git_state(ledger, repo)
     diff = ledger.get_blob(git["diff"]["sha"]).decode()
     assert git["dirty"] and "new_functions.py" in diff and "+y = 2" in diff
 
 
 def test_a_large_untracked_file_is_named_in_the_run_diff_not_diffed(ledger, tmp_path):
     repo = _repo(tmp_path / "repo")
-    (repo / "big.csv").write_bytes(b"0" * (runs.UNTRACKED_DIFF_CAP + 1))
+    (repo / "big.csv").write_bytes(b"0" * (provenance.UNTRACKED_DIFF_CAP + 1))
     (repo / "b.py").write_text("y = 2\n")
-    diff = ledger.get_blob(runs._git(ledger, repo)["diff"]["sha"]).decode()
+    diff = ledger.get_blob(provenance.git_state(ledger, repo)["diff"]["sha"]).decode()
     assert "+y = 2" in diff and "not diffed: big.csv" in diff
     assert "+000" not in diff
     assert not (repo / ".git" / "index").read_bytes().count(b"b.py")
@@ -2426,7 +2437,7 @@ def test_a_large_untracked_file_is_named_in_the_run_diff_not_diffed(ledger, tmp_
 def test_git_keeps_the_raw_bytes_of_a_file_that_is_not_utf8(ledger, tmp_path):
     repo = _repo(tmp_path / "repo")
     (repo / "a.py").write_bytes(b"x = '\xe9t\xe9'\n")
-    git = runs._git(ledger, repo)
+    git = provenance.git_state(ledger, repo)
     assert git["dirty"] and b"+x = '\xe9t\xe9'" in ledger.get_blob(git["diff"]["sha"])
 
 
@@ -2434,12 +2445,12 @@ def test_git_survives_a_dangling_untracked_symlink(ledger, tmp_path):
     repo = _repo(tmp_path / "repo")
     (repo / "link.py").symlink_to(repo / "gone.py")
     (repo / "b.py").write_text("y = 2\n")
-    git = runs._git(ledger, repo)
+    git = provenance.git_state(ledger, repo)
     assert b"+y = 2" in ledger.get_blob(git["diff"]["sha"])
 
 
 def test_git_before_the_first_commit_records_the_untracked_code(ledger, tmp_path):
-    git = runs._git(ledger, _repo(tmp_path / "repo", commit=False))
+    git = provenance.git_state(ledger, _repo(tmp_path / "repo", commit=False))
     assert git["commit"] is None and git["dirty"] is True
     assert b"+x = 1" in ledger.get_blob(git["diff"]["sha"])
 
@@ -2450,7 +2461,7 @@ def test_a_failing_git_leaves_no_fit_under_an_unrecorded_run(
     def broken(ledger, root):
         raise RuntimeError("git broke")
 
-    monkeypatch.setattr(runs, "_git", broken)
+    monkeypatch.setattr(provenance, "git_state", broken)
     with pytest.raises(RuntimeError, match="git broke"):
         _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(3))
     assert _count(ledger, "event_run") == _count(ledger, "event_fit") == 0
@@ -3502,7 +3513,7 @@ def test_a_run_reuses_the_feature_set_its_dry_run_computed(ledger, dataset, eval
     assert synthetic.FEATURE_CALLS.count(n) == 1
     planned = ledger.root / "planned"
     assert sorted(p.suffix for p in planned.iterdir()) == [".json", ".parquet"]
-    runs._PLANNED_FEATURES.clear()
+    stages._PLANNED_FEATURES.clear()
     lines.clear()
     _run(ledger, evaluation, lag, dry=True, log=lines.append)
     assert synthetic.FEATURE_CALLS.count(n) == 1
@@ -3525,7 +3536,9 @@ def test_a_run_records_the_gpus_nvidia_smi_reports(ledger, evaluation, monkeypat
         None: "| NVIDIA-SMI 550.54.15  Driver Version: 550.54.15  CUDA Version: 12.4 |",
     }
     monkeypatch.setattr(
-        runs, "_command", lambda *args: answers[args[1] if len(args) > 1 else None]
+        provenance,
+        "_command",
+        lambda *args: answers[args[1] if len(args) > 1 else None],
     )
     _run(ledger, evaluation, synthetic.ridge(1))
     (row,) = ledger.sql("SELECT gpu, cuda FROM event_run")
@@ -3533,21 +3546,23 @@ def test_a_run_records_the_gpus_nvidia_smi_reports(ledger, evaluation, monkeypat
         {"name": "NVIDIA A100-SXM4-80GB", "driver": "550.54.15", "memory_mb": 81920}
     ]
     assert row["cuda"] == "12.4"
-    monkeypatch.setattr(runs, "_command", lambda *args: None)
-    assert "gpu" not in runs._host()
+    monkeypatch.setattr(provenance, "_command", lambda *args: None)
+    assert "gpu" not in provenance.host()
     answers["--query-gpu=name,driver_version,memory.total"] = (
         "NVIDIA A100, PCIe, 550.54.15, 81920\n"
         "NVIDIA A100 MIG 1g.10gb, 550.54.15, [N/A],\n\n"
     )
     monkeypatch.setattr(
-        runs, "_command", lambda *args: answers[args[1] if len(args) > 1 else None]
+        provenance,
+        "_command",
+        lambda *args: answers[args[1] if len(args) > 1 else None],
     )
-    assert runs._host()["gpu"] == [
+    assert provenance.host()["gpu"] == [
         {"name": "NVIDIA A100, PCIe", "driver": "550.54.15", "memory_mb": 81920},
         {"name": "NVIDIA A100 MIG 1g.10gb", "driver": "550.54.15", "memory_mb": None},
     ]
-    monkeypatch.setattr(runs, "_gpus", lambda: 1 / 0)
-    assert "gpu_error" in runs._host()
+    monkeypatch.setattr(provenance, "_gpus", lambda: 1 / 0)
+    assert "gpu_error" in provenance.host()
 
 
 def test_paired_sets_pairs_the_fold_means_of_two_sets(ledger, evaluation):
@@ -3727,7 +3742,7 @@ def test_a_predict_config_enters_the_prediction_id_and_shares_the_fit(
     assert len(rows) == 2 * folds
     configs = {json.loads(r["predict_config"]).get("sign", 1.0) for r in rows}
     assert configs == {1.0, -1.0}
-    up, down = (_load_predictions(ledger, r["id"]) for r in (rows[0], rows[folds]))
+    up, down = (load_predictions(ledger, r["id"]) for r in (rows[0], rows[folds]))
     assert rows[0]["fit"] == rows[folds]["fit"] and np.array_equal(up, -down)
     assert set(np.unique(up)) <= {-1.0, 0.0, 1.0}
 
@@ -3848,9 +3863,9 @@ def test_a_stateless_blend_records_no_fit_and_averages_its_members(
         r["fit"]: r["id"]
         for r in ledger.sql("SELECT id, fit FROM event_prediction WHERE fold = 0")
     }
-    first = [_load_predictions(ledger, p) for p in members.values()]
+    first = [load_predictions(ledger, p) for p in members.values()]
     assert len(first) == 3
-    averaged = _load_predictions(ledger, blend[0]["id"])
+    averaged = load_predictions(ledger, blend[0]["id"])
     others = [p for p in first if not np.array_equal(p, averaged)]
     assert np.allclose(np.mean(np.stack(others, axis=0), axis=0), averaged)
     costed = ledger.sql(
@@ -3890,7 +3905,11 @@ def test_a_stateless_blend_records_no_fit_and_averages_its_members(
     second = _run(ledger, evaluation, other)
     assert first.predictions_computed == folds and second.predictions_computed == folds
     assert second.predictions_reused == 2 * folds
-    assert runs._project_root([mean, one]) == runs._project_root([one]) == REPO
+    assert (
+        declarations.project_root([mean, one])
+        == declarations.project_root([one])
+        == REPO
+    )
 
 
 def test_a_note_records_text_about_ids_the_log_holds(
@@ -3950,7 +3969,7 @@ def test_a_prepare_step_is_built_once_per_train_range_and_shared(
     }
     assert len({fits[plain.id], fits[a.id], fits[b.id]}) == 3
     preds = {
-        r["pipeline"]: _load_predictions(ledger, r["id"])
+        r["pipeline"]: load_predictions(ledger, r["id"])
         for r in ledger.sql(
             "SELECT f.pipeline, p.id FROM event_prediction p JOIN event_fit f "
             "ON f.id = p.fit WHERE p.fold = 0"
@@ -3973,14 +3992,14 @@ def test_a_prepare_step_is_built_once_per_train_range_and_shared(
         name="dc",
     )
     assert "read-only" in _run(ledger, evaluation, dc).failed["dc"]
-    held = runs._frozen({"m": synthetic, "t": synthetic.Prepared, "a": np.ones(2)})
+    held = guards.frozen({"m": synthetic, "t": synthetic.Prepared, "a": np.ones(2)})
     assert synthetic.FEATURE_CALLS is not None and not held["a"].flags.writeable
     deep: list = []
     node = deep
     for _ in range(200):
         node.append([])
         node = node[0]
-    assert runs._frozen(deep) is deep
+    assert guards.frozen(deep) is deep
     with pytest.raises(Refused, match="timedelta64"):
         identity.content_hash({"lag": np.timedelta64(1, "D")})
     (row,) = ledger.sql(
@@ -3998,7 +4017,7 @@ def test_a_planned_feature_file_that_cannot_be_read_is_recomputed(
     planned = ledger.root / "planned"
     for stale in planned.iterdir():
         stale.write_bytes(b"not a file the run can read")
-    runs._PLANNED_FEATURES.clear()
+    stages._PLANNED_FEATURES.clear()
     synthetic.FEATURE_CALLS.clear()
     report = _run(ledger, evaluation, lag)
     assert not report.failed and report.features_computed == 1
