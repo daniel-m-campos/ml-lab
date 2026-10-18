@@ -21,6 +21,10 @@ packages = ["src/ml_lab"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "standard"
+
 [tool.ruff]
 line-length = 88
 target-version = "py312"
