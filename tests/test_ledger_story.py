@@ -10,6 +10,7 @@ import dataclasses
 import datetime
 import functools
 import importlib
+import importlib.util
 import io
 import itertools
 import json
@@ -26,13 +27,14 @@ import textwrap
 import threading
 import types
 from collections.abc import Iterator
+from typing import Any
 
 import numpy as np
 import polars as pl
 import pytest
 
 import ml_lab
-from ml_lab import cli, formats, identity, runs, splits
+from ml_lab import cli, dates, formats, identity, runs, splits
 from ml_lab.dataset import (
     Dataset,
     Range,
@@ -252,6 +254,12 @@ def _score(ledger: Ledger, score: str, pipeline: str, values: list[float]):
 # Dataset ==============================================================================
 
 
+def _loaded(pipeline: Pipeline, ledger: Ledger, sha: str) -> Any:
+    """A recorded model through the pipeline's load, which a fitting pipeline has."""
+    assert pipeline.load is not None
+    return pipeline.load(ledger.get_blob(sha))
+
+
 def test_ingesting_the_same_recipe_twice_appends_one_event(ledger):
     assert synthetic.dataset(ledger) == synthetic.dataset(ledger)
     assert _types(ledger) == {Event.DATASET: 1}
@@ -260,11 +268,14 @@ def test_ingesting_the_same_recipe_twice_appends_one_event(ledger):
 def test_the_dataset_id_is_the_data_not_the_recipe(ledger, dataset):
     same_rows = synthetic.dataset(ledger, seed=7)
     assert same_rows == dataset
-    kwargs = dict(targets=(synthetic.TARGET,))
     rows = synthetic.generate(
         start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
     )
-    assert record(ledger, rows, source="other", params={"v": 2}, **kwargs) == dataset
+    targets = (synthetic.TARGET,)
+    assert (
+        record(ledger, rows, source="other", params={"v": 2}, targets=targets)
+        == dataset
+    )
     assert synthetic.dataset(ledger, seed=8) != dataset
     assert _types(ledger) == {Event.DATASET: 2}
 
@@ -423,12 +434,20 @@ def test_an_integer_reveal_lag_counts_dates_with_rows(ledger):
     rows = synthetic.generate(
         start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
     )
-    kw = dict(source="synthetic", params={}, targets=(synthetic.TARGET,))
-    by_date = record(ledger, rows, reveal={synthetic.TARGET: 1}, **kw)
-    by_time = record(
-        ledger, rows, reveal={synthetic.TARGET: datetime.timedelta(1)}, **kw
-    )
-    assert by_date != by_time != record(ledger, rows, **kw)
+
+    def recorded(reveal=None):
+        return record(
+            ledger,
+            rows,
+            source="synthetic",
+            params={},
+            targets=(synthetic.TARGET,),
+            reveal=reveal,
+        )
+
+    by_date = recorded({synthetic.TARGET: 1})
+    by_time = recorded({synthetic.TARGET: datetime.timedelta(1)})
+    assert by_date != by_time != recorded()
     recipe = ledger.events(Event.DATASET, key=by_date)[0]["payload"]["recipe"]
     assert recipe["targets"][synthetic.TARGET] == {"dates": 1}
     evaluation = synthetic.evaluation(by_date)
@@ -525,7 +544,8 @@ def test_a_config_class_its_function_does_not_import_is_refused(ledger, evaluati
     with pytest.raises(Refused, match="define it beside the fit function"):
         _run(ledger, evaluation, synthetic.ridge(1), far)
     deep = dataclasses.replace(
-        synthetic.ridge(3), params=synthetic.RidgeConfig(3, 1.0, ({"far": Far()},))
+        synthetic.ridge(3),
+        params=synthetic.RidgeConfig(3, 1.0, ({"far": Far()},)),  # type: ignore[arg-type]
     )
     with pytest.raises(Refused, match="Far is defined in tests/test_ledger_story.py"):
         _run(ledger, evaluation, deep)
@@ -736,7 +756,7 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     folds = evaluation.split.folds(data)
     assert len(folds) >= evaluation.split.min_folds
     for fold in folds:
-        skipped = data.ts[fold.train[-1][1] : fold.test[0]]
+        skipped = synthetic.clock(data)[fold.train[-1][1] : fold.test[0]]
         assert len(np.unique(skipped)) == evaluation.split.embargo_timestamps
     _run(ledger, evaluation, synthetic.ridge(3))
     stored = ledger.latest(Event.EVALUATION, evaluation.id)["payload"]
@@ -765,6 +785,7 @@ def test_row_splits_make_disjoint_embargoed_folds(ledger, dataset):
     assert sum(hi - lo for lo, hi in (f.test for f in folds)) == n
     (hold,) = splits.Holdout(train_size=0.8, embargo_rows=5).folds(data)
     cut = data.boundary(round(0.8 * n))
+    assert cut is not None
     assert hold.train == ((0, cut),) and hold.test[0] == cut + 5
 
 
@@ -819,8 +840,10 @@ def test_a_clockless_dataset_fits_on_segments_and_refuses_walk_forward(ledger):
     assert bare.matrix(("f0",)).shape == (100, 1) and bare.column("f1").sum() == 100
     with pytest.raises(Refused, match="no timestamps; use a row-based split"):
         splits.CalendarWalkForward(first_cutoff="2025-01-01").folds(bare)
+    train = ((0, 50), (60, 100))
+    view = ml_lab.FitView(bare.train_view(train), train)
     assert synthetic.ridge_fit(
-        bare, ((0, 50), (60, 100)), synthetic.RidgeConfig(0, 1.0)
+        view, train, synthetic.RidgeConfig(0, 1.0)
     ).weights.shape == (3,)
 
 
@@ -881,9 +904,12 @@ def test_a_calendar_split_stops_at_end_and_embargoes_whole_timestamps():
         end="2021-12-06",
         min_folds=1,
     ).folds(dataset)
-    last = max(dataset.ts[f.test[1] - 1] for f in folds)
+    last = max(synthetic.clock(dataset)[f.test[1] - 1] for f in folds)
     assert last < np.datetime64("2021-12-06")
-    gaps = [len(np.unique(dataset.ts[f.train[0][1] : f.test[0]])) for f in folds]
+    gaps = [
+        len(np.unique(synthetic.clock(dataset)[f.train[0][1] : f.test[0]]))
+        for f in folds
+    ]
     assert gaps == [2] * len(folds) and len(folds) == 4
 
 
@@ -896,9 +922,9 @@ def test_a_calendar_split_rolls_a_train_window_of_whole_units():
     folds = rolling.folds(dataset)
     assert [f.test for f in folds] == [f.test for f in growing.folds(dataset)]
     for fold in folds:
-        cutoff = ml_lab.dates.as_date(fold.label)
+        cutoff = dates.as_date(fold.label)
         start, end = fold.train[0]
-        assert start == dataset.index_of(ml_lab.dates.add_months(cutoff, -3))
+        assert start == dataset.index_of(dates.add_months(cutoff, -3))
         assert end == dataset.index_of(cutoff)
     days = splits.CalendarWalkForward("2021-06-01", unit="day", train_units=5)
     for fold in days.folds(dataset)[:3]:
@@ -938,7 +964,7 @@ def test_the_clock_keeps_nanoseconds_and_the_dataset_id_sees_them():
     a = Dataset({"x": np.zeros(2)}, t0 + np.array([1, 2], "timedelta64[ns]"))
     b = Dataset({"x": np.zeros(2)}, t0 + np.array([1, 3], "timedelta64[ns]"))
     assert data_id(a) != data_id(b)
-    assert np.array_equal(rows_load(rows_save(a)).ts, a.ts)
+    assert np.array_equal(synthetic.clock(rows_load(rows_save(a))), synthetic.clock(a))
 
 
 # Identity =============================================================================
@@ -1039,6 +1065,7 @@ def test_a_module_named_like_the_standard_library_is_owned_by_its_file(
     spec = importlib.util.spec_from_file_location(
         "calendar", tmp_path / "lib" / "calendar.py"
     )
+    assert spec is not None and spec.loader is not None
     shadow = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(shadow)
     monkeypatch.setitem(sys.modules, "calendar", shadow)
@@ -1199,7 +1226,8 @@ def test_a_fit_view_blanks_every_column_outside_its_train_segments(tmp_path):
     view = full.train_view(((0, 2), (4, 6)))
     assert np.isnan(view.columns["x"][2:4]).all() and view.columns["x"][4] == 4.0
     assert view.columns["s"].tolist() == ["a", "b", None, None, "e", "f"]
-    assert np.isnat(view.columns["t"][2:4]).all() and view.ts[3] == clock[3]
+    assert np.isnat(view.columns["t"][2:4]).all()
+    assert synthetic.clock(view)[3] == clock[3]
     lag = view.matrix(("x", "lag"))[:, 1]
     assert np.isnan(lag[2:4]).all() and lag[5] == 5.0
     assert np.isnan(view.upto(3).column("lag", (2, 3))).all()
@@ -1264,7 +1292,8 @@ def test_functions_see_only_the_rows_before_their_cutoff(ledger, dataset, evalua
     assert synthetic.SEEN_ROWS == [fold.train[-1][1] for fold in folds]
     first = load(ledger, dataset).upto(10)
     assert first.rows == 10 and first.column("f0", (8, 10)).shape == (2,)
-    assert first.column("f0", (np.int64(8), np.int64(10))).shape == (2,)
+    numpy_range = (np.int64(8), np.int64(10))
+    assert first.column("f0", numpy_range).shape == (2,)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="before"):
         first.matrix(("f0",), (8, 12))
 
@@ -1320,7 +1349,7 @@ def test_a_fit_and_an_in_sample_member_see_no_column_outside_the_train_segments(
         "SELECT model FROM event_fit WHERE pipeline = ? AND label = 'block 1'",
         (memo.id,),
     )
-    f0 = memo.load(ledger.get_blob(fit["model"])).weights
+    f0 = _loaded(memo, ledger, fit["model"]).weights
     assert np.isnan(f0[lo:hi]).all() and not np.isnan(np.r_[f0[:lo], f0[hi:]]).any()
     (member,) = ledger.sql(
         "SELECT id FROM event_prediction WHERE fold = 1 AND range_start = ?", (hi,)
@@ -1389,7 +1418,7 @@ def opening_mean(dataset: Dataset, rows: Range) -> np.ndarray:
     """Each row's f0 mean over the first five rows of its date in ``rows``: those five
     read later rows of their date.
     """
-    day = dataset.ts[rows[0] : rows[1]].astype("datetime64[D]")
+    day = synthetic.clock(dataset)[rows[0] : rows[1]].astype("datetime64[D]")
     _, at = np.unique(day, return_inverse=True)
     opening = np.arange(len(at)) - np.searchsorted(at, at) < 5
     x = np.where(opening, dataset.column("f0", rows), 0.0)
@@ -1425,7 +1454,7 @@ def test_the_probes_cut_inside_a_date_however_the_calendar_falls(ledger):
 
 def next_date_predict(model, dataset: Dataset, rows: Range) -> np.ndarray:
     """Each row's ridge prediction plus the next date's mean f0 in ``rows``."""
-    _, at = np.unique(dataset.ts[rows[0] : rows[1]], return_inverse=True)
+    _, at = np.unique(synthetic.clock(dataset)[rows[0] : rows[1]], return_inverse=True)
     means = np.bincount(at, dataset.column("f0", rows)) / np.bincount(at)
     return synthetic.ridge_predict(model, dataset, rows) + np.r_[means[1:], 0.0][at]
 
@@ -1448,7 +1477,7 @@ def test_a_two_date_range_of_a_daily_cross_section_is_probed(ledger):
     assert "predict read past row 310" in report.failed["peek"]
 
 
-def memo_fit(dataset: Dataset, train: Segments, config) -> dict:
+def memo_fit(dataset: ml_lab.FitView, train: Segments, config) -> dict:
     return {"ridge": synthetic.ridge_fit(dataset, train, config), "seen": {}}
 
 
@@ -1638,7 +1667,7 @@ def test_a_features_tuple_is_one_event_per_function_shared_with_one_function_pip
     rows = ledger.sql("SELECT columns FROM event_feature ORDER BY seq")
     assert [json.loads(r["columns"]) for r in rows] == [["f0_lag"], ["f1_lag"]]
     weights = {
-        r["pipeline"]: both.load(ledger.get_blob(r["model"])).weights.shape
+        r["pipeline"]: _loaded(both, ledger, r["model"]).weights.shape
         for r in ledger.sql("SELECT pipeline, model FROM event_fit")
     }
     assert weights[both.id] == (5,)
@@ -1890,7 +1919,7 @@ def test_a_zip_model_is_portable_only_if_every_member_is(ledger, evaluation):
         (pickled.id, "zip", 0),
     }
     sha = next(r["model"] for r in rows if r["pipeline"] == zipped.id)
-    assert zipped.load(ledger.get_blob(sha)).weights.shape == (3,)
+    assert _loaded(zipped, ledger, sha).weights.shape == (3,)
     assert formats.zip_load(ledger.get_blob(sha))["note.txt"] == b"ridge"
 
 
@@ -1957,7 +1986,7 @@ def test_fit_and_predict_read_the_computed_columns_in_function_order(
     a = synthetic.featured(synthetic.ridge(3))
     _run(ledger, evaluation, a, synthetic.ridge(1))
     weights = {
-        r["pipeline"]: a.load(ledger.get_blob(r["model"])).weights.shape
+        r["pipeline"]: _loaded(a, ledger, r["model"]).weights.shape
         for r in ledger.sql("SELECT pipeline, model FROM event_fit")
     }
     assert weights[a.id] == (4,) and weights[synthetic.ridge(1).id] == (3,)
@@ -2194,7 +2223,7 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
     assert lock["ml-lab"].count("+") == 1
     run = ledger.latest(Event.RUN, payload["run"])
     assert "commit" in run["payload"]["git"]
-    model = pipeline.load(ledger.get_blob(payload["model"]["sha"]))
+    model = _loaded(pipeline, ledger, payload["model"]["sha"])
     assert model.weights.shape == (3,)
 
 
@@ -2769,9 +2798,8 @@ def test_paired_sums_the_row_differences_of_two_scores(ledger, dataset, evaluati
     assert result.n == len(d) and np.isclose(result.pooled_delta, row["pooled_delta"])
     assert np.isclose(result.se_iid, np.sqrt(len(d)) * d.std(ddof=1))
     assert result.se_block is None
-    assert np.isclose(
-        ml_lab.paired(ledger, a, b, "pnl", 1).se_block, result.se_iid, 0.1
-    )
+    blocked = ml_lab.paired(ledger, a, b, "pnl", 1).se_block
+    assert blocked is not None and np.isclose(blocked, result.se_iid, 0.1)
     blocked = ml_lab.paired(ledger, a, b, "pnl", 500)
     assert blocked.se_block == ml_lab.paired(ledger, a, b, "pnl", 500).se_block
     holdout = synthetic.evaluation(dataset, split=splits.Holdout(0.7))
@@ -3017,7 +3045,11 @@ def test_a_series_has_one_row_per_scoring_unit_and_a_scalar_is_refused(
     assert not _run(ledger, daily, synthetic.ridge(1)).failed
     folds = evaluation.split.folds(load(ledger, dataset))
     days = [
-        len(np.unique(load(ledger, dataset).ts[lo:hi].astype("datetime64[D]")))
+        len(
+            np.unique(
+                synthetic.clock(load(ledger, dataset))[lo:hi].astype("datetime64[D]")
+            )
+        )
         for lo, hi in (f.test for f in folds)
     ]
     (row,) = ledger.sql("SELECT fold_rows FROM score_aggregate")
@@ -3535,6 +3567,7 @@ def test_paired_sets_pairs_the_fold_means_of_two_sets(ledger, evaluation):
     d = (values[one.id] + values[three.id]) / 2 - values[six.id]
     assert result.n_folds == len(d) and np.allclose(result.fold_deltas, d)
     assert np.isclose(result.delta_mean, d.mean())
+    assert result.t is not None
     assert np.isclose(result.t, d.mean() * np.sqrt(len(d)) / d.std(ddof=1))
     assert result.wins == int((d > 0).sum())
     (row,) = ledger.sql(
@@ -3544,7 +3577,7 @@ def test_paired_sets_pairs_the_fold_means_of_two_sets(ledger, evaluation):
     )
     single = ml_lab.paired_sets(ledger, evaluation.id, "pnl", [one.id], [six.id])
     assert np.isclose(single.delta_mean, row["delta_mean"])
-    assert np.isclose(single.t, row["t"])
+    assert single.t is not None and np.isclose(single.t, row["t"])
     with pytest.raises(Refused, match="no latest score"):
         ml_lab.paired_sets(ledger, evaluation.id, "pnl", [one.id], ["nope"])
     with pytest.raises(Refused, match="at least one pipeline id in each set"):
@@ -3701,14 +3734,15 @@ def test_a_predict_config_enters_the_prediction_id_and_shares_the_fit(
 
 def test_a_train_view_copies_only_the_columns_a_fit_reads(monkeypatch):
     wide = _dataset(40, **{f"w{i}": np.arange(40, dtype=float) for i in range(50)})
-    copies: list[str] = []
-    real = ml_lab.dataset._blank
+    copies: list[int] = []
+    blanking = importlib.import_module("ml_lab.dataset")
+    real = blanking._blank
 
     def counted(values, keep):
         copies.append(len(values))
         return real(values, keep)
 
-    monkeypatch.setattr(ml_lab.dataset, "_blank", counted)
+    monkeypatch.setattr(blanking, "_blank", counted)
     view = wide.train_view(((0, 10), (20, 30)))
     assert view.rows == 40 and len(view.columns) == len(wide.columns)
     assert list(view.columns) == list(wide.columns) and "w7" in view.columns
@@ -3746,7 +3780,7 @@ def test_inner_split_cuts_a_validation_tail_purged_as_the_evaluation_would(
     assert view.rows == data.rows and view.column("f0", (0, 3)).shape == (3,)
     assert np.isnan(view.columns["f0"][2000:]).all() and view.reveal == {}
     with pytest.raises(Refused, match="pass fit's dataset argument"):
-        splits.inner_split(data, train, 0.1)
+        splits.inner_split(data, train, 0.1)  # type: ignore[arg-type]
     inner, valid = splits.inner_split(view, train, 0.1)
     assert valid == (1800, 2000) and inner == ((0, 1800),)
     assert splits.inner_split(view, train, 250)[1] == (1750, 2000)

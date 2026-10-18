@@ -94,7 +94,9 @@ def ridge_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeMo
     return RidgeModel(weights, float(y_mean - x_mean @ weights))
 
 
-def ridge_predict(model: RidgeModel, dataset: Dataset, rows: Range) -> np.ndarray:
+def ridge_predict(
+    model: RidgeModel, dataset: Dataset | FitView, rows: Range
+) -> np.ndarray:
     columns = FEATURES + dataset.computed_columns
     return dataset.matrix(columns, rows) @ model.weights + model.bias
 
@@ -225,7 +227,7 @@ def inner_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
         model = ridge_fit(dataset, inner, dataclasses.replace(config, alpha=alpha))
         pred = ridge_predict(model, dataset, valid)
         errors[alpha] = float(np.mean((pred - dataset.column(TARGET, valid)) ** 2))
-    best = min(errors, key=errors.get)
+    best = min(errors, key=lambda alpha: errors[alpha])
     model = ridge_fit(dataset, train, dataclasses.replace(config, alpha=best))
     return Fitted(model, {"alpha": best, "inner": inner, "validation": valid})
 
@@ -431,16 +433,22 @@ def biasless_save(model: RidgeModel) -> bytes:
     return formats.arrays_save({"weights": model.weights, "bias": np.zeros(1)})
 
 
+def clock(dataset: Dataset | FitView) -> np.ndarray:
+    """The dataset's timestamps, which these fixtures declare."""
+    assert dataset.ts is not None
+    return dataset.ts
+
+
 def demean_at_timestamp(model: Any, dataset: Dataset, rows: Range) -> np.ndarray:
     """Each row's f0 minus its timestamp's mean: a same-time cross-section."""
-    _, t = np.unique(dataset.ts[rows[0] : rows[1]], return_inverse=True)
+    _, t = np.unique(clock(dataset)[rows[0] : rows[1]], return_inverse=True)
     x = dataset.column("f0", rows)
     return x - (np.bincount(t, x) / np.bincount(t))[t]
 
 
 def day_mean(dataset: Dataset) -> dict[str, np.ndarray]:
     """Each row's f0 minus its day's mean: reads later rows of the same day."""
-    days, d = np.unique(dataset.ts.astype("datetime64[D]"), return_inverse=True)
+    days, d = np.unique(clock(dataset).astype("datetime64[D]"), return_inverse=True)
     x = dataset.columns["f0"]
     return {"f0_lag": x - (np.bincount(d, x) / np.bincount(d))[d]}
 
