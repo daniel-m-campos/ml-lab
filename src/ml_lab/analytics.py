@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 
@@ -255,20 +256,28 @@ def _fold_values(
     return values
 
 
+def _latest(ledger: Ledger, kind: str, key: str) -> dict[str, Any]:
+    """The newest event of a kind under a key, refused when there is none."""
+    event = ledger.latest(kind, key)
+    if event is None:
+        raise Refused(f"{kind} {key} is not in {ledger.root}")
+    return event
+
+
 def _evaluation(ledger: Ledger, score: str) -> str:
     """The evaluation id a score was recorded under."""
-    return ledger.latest(Event.SCORE, score)["stream"]
+    return _latest(ledger, Event.SCORE, score)["stream"]
 
 
 def _dataset(ledger: Ledger, score: str) -> str:
     """The dataset id of a score's evaluation."""
-    evaluation = ledger.latest(Event.EVALUATION, _evaluation(ledger, score))
+    evaluation = _latest(ledger, Event.EVALUATION, _evaluation(ledger, score))
     return evaluation["payload"]["dataset"]
 
 
 def _tests(ledger: Ledger, score: str) -> list[list[int]]:
     """The test ranges of a score's evaluation, in fold order."""
-    folds = ledger.latest(Event.EVALUATION, _evaluation(ledger, score))["payload"][
+    folds = _latest(ledger, Event.EVALUATION, _evaluation(ledger, score))["payload"][
         "folds"
     ]
     return [f["test"] for f in folds]
@@ -280,7 +289,7 @@ def _covered(ledger: Ledger, score: str) -> list[list[int]]:
     Refused when the folds are not in row order, since the series then does not
     read as one row sequence.
     """
-    folds = ledger.latest(Event.EVALUATION, _evaluation(ledger, score))["payload"][
+    folds = _latest(ledger, Event.EVALUATION, _evaluation(ledger, score))["payload"][
         "folds"
     ]
     merged: list[list[int]] = []

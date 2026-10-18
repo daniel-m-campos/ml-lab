@@ -149,7 +149,8 @@ class CalendarWalkForward:
                 dataset.index_of(at[c + reach - self.test_units]),
                 dataset.index_of(at[c + reach]),
             )
-            start = 0 if self.train_units is None else self._window(dataset, at[c])
+            units = self.train_units
+            start = 0 if units is None else self._window(dataset, at[c], units)
             out.append(Fold(str(at[c]), ((start, cut),), test))
         why = (
             f"{max(len(at) - 1, 0)} {self.unit}s from the first cutoff "
@@ -163,15 +164,15 @@ class CalendarWalkForward:
             )
         return _at_least(out, self.min_folds, why)
 
-    def _window(self, dataset: Dataset, cutoff: datetime.date) -> int:
-        """The first row of the rolling window: ``train_units`` units before the
-        cutoff, months by the calendar, days by the clock's days with rows.
+    def _window(self, dataset: Dataset, cutoff: datetime.date, units: int) -> int:
+        """The first row of the rolling window: ``units`` units before the cutoff,
+        months by the calendar, days by the clock's days with rows.
         """
         if self.unit == "month":
-            return dataset.index_of(dates.add_months(cutoff, -self.train_units))
-        days = np.unique(dataset._clock().astype("datetime64[D]")).astype(datetime.date)
-        at = int(np.searchsorted(days, cutoff))
-        return dataset.index_of(days[max(at - self.train_units, 0)])
+            return dataset.index_of(dates.add_months(cutoff, -units))
+        days = np.unique(dataset._clock().astype("datetime64[D]"))
+        at = int(np.searchsorted(days, np.datetime64(cutoff, "D")))
+        return dataset.index_of(str(days[max(at - units, 0)]))
 
     def _boundaries(self, dataset: Dataset, stop: datetime.date) -> list[datetime.date]:
         """Unit boundaries from the first cutoff to ``stop`` inclusive."""
