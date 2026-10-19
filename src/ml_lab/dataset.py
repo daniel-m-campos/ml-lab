@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import io
+import json
 import pathlib
 import sys
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
@@ -497,7 +498,9 @@ def record(
     Raises
     ------
     Refused
-        When ``targets`` is empty.
+        When ``targets`` is empty, or the rows are already recorded under another
+        source, params or steps: the id is the rows, the recipe is the one ingest
+        that wrote them.
     ValueError, KeyError, TypeError
         When the rows are empty, a lag has no clock or a bad kind, ``reveal`` names
         a non-target, a target is missing or not numeric, a column is not 1-D, or
@@ -539,19 +542,38 @@ def record(
         )
     sealed = _sealed(dataset, sealed_from)
     dataset_id = data_id(dataset, labels, sealed)
-    if ledger.latest(Event.DATASET, dataset_id) is not None:
+    canonical = identity.canonical(recipe)
+    before = ledger.latest(Event.DATASET, dataset_id)
+    if before is not None:
+        _refuse_other_recipe(before, dataset_id, canonical)
         return dataset_id
     sha = ledger.put_blob(rows_save(dataset))
     payload = {
         "source": source,
         "window": window,
-        "recipe": identity.canonical(recipe),
+        "recipe": canonical,
         "rows": dataset.rows,
         "sealed_from": sealed,
         "blob": {"sha": sha, "format": formats.Format.PARQUET},
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
     return dataset_id
+
+
+def _refuse_other_recipe(before: dict[str, Any], dataset_id: str, recipe: Any):
+    """Refuse recording rows the log holds under another source, params or steps.
+
+    The same recipe is the memo at work and returns the id; a different one would be
+    dropped on the floor, since one event holds the rows' recipe.
+    """
+    stored = before["payload"]["recipe"]
+    if stored == json.loads(json.dumps(recipe, default=identity.canonical)):
+        return
+    raise Refused(
+        f"these rows are dataset {dataset_id}, recorded from source "
+        f"{stored['source']!r} with another recipe; record them under that source "
+        "with its params and steps, or change the rows"
+    )
 
 
 def _step(step: Callable) -> dict[str, Any]:

@@ -284,10 +284,8 @@ def test_the_dataset_id_is_the_data_not_the_recipe(ledger, dataset):
         start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
     )
     targets = (synthetic.TARGET,)
-    assert (
+    with pytest.raises(Refused, match=f"these rows are dataset {dataset}, recorded"):
         record(ledger, rows, source="other", params={"v": 2}, targets=targets)
-        == dataset
-    )
     assert synthetic.dataset(ledger, seed=8) != dataset
     assert _types(ledger) == {Event.DATASET: 2}
 
@@ -354,7 +352,8 @@ def test_record_names_its_cleaning_steps_in_the_recipe(ledger):
     recipe = ledger.latest(Event.DATASET, recorded)["payload"]["recipe"]
     assert [s["function"] for s in recipe["steps"]] == ["numpy:sort", "builtins:len"]
     assert "numpy" in recipe["steps"][0]["distributions"]
-    assert dataset_id == record(ledger, rows, source="s", targets=["y"])
+    with pytest.raises(Refused, match="recorded from source 's' with another recipe"):
+        record(ledger, rows, source="s", targets=["y"])
     with pytest.raises(Refused, match="not a module-level function"):
         record(ledger, rows, source="t", targets=["y"], steps=(lambda f: f,))
 
@@ -363,6 +362,16 @@ def test_record_keeps_source_params_and_targets_as_the_recipe(ledger):
     dataset_id = record(ledger, _dataset(), source="s", targets=("y",))
     recipe = ledger.latest(Event.DATASET, dataset_id)["payload"]["recipe"]
     assert recipe == {"source": "s", "params": {}, "targets": {"y": None}}
+
+
+def test_record_refuses_the_same_rows_under_another_recipe(ledger):
+    dataset_id = record(ledger, _dataset(), source="s", targets=("y",))
+    assert record(ledger, _dataset(), source="s", targets=("y",)) == dataset_id
+    with pytest.raises(Refused, match="recorded from source 's' with another recipe"):
+        record(ledger, _dataset(), source="t", targets=("y",))
+    with pytest.raises(Refused, match="another recipe"):
+        record(ledger, _dataset(), source="s", targets=("y",), params={"k": 1})
+    assert _count(ledger, "event_dataset") == 1
 
 
 def test_a_stratified_order_puts_each_class_in_proportion_in_every_block():
