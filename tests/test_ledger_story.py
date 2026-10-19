@@ -503,6 +503,7 @@ def test_the_package_exports_what_a_project_imports():
         "note",
         "paired",
         "paired_sets",
+        "predictions",
         "record",
     ]
     assert ml_lab.record is record and ml_lab.Fold is splits.Fold
@@ -3717,6 +3718,31 @@ def test_current_drops_an_evaluation_re_declared_under_its_name(ledger, evaluati
     rows = ledger.sql(query, (one.id,))
     assert (evaluation.id, 1) in [(r["evaluation"], r["current"]) for r in rows]
     assert _count(ledger, "evaluation_current") == 1
+
+
+def test_predictions_reads_the_latest_scored_test_predictions_in_fold_order(
+    ledger, evaluation
+):
+    one = synthetic.ridge(1)
+    mean = ml_lab.mean_blend(one, synthetic.ridge(3), name="mean")
+    _run(ledger, evaluation, one, mean)
+    folds = evaluation.split.folds(load(ledger, evaluation.dataset_id))
+    for pipeline in (one, mean):
+        read = ml_lab.predictions(ledger, evaluation.id, pipeline.id)
+        assert read.ranges == tuple((lo, hi) for lo, hi in (f.test for f in folds))
+        assert len(read.values) == sum(hi - lo for lo, hi in read.ranges)
+        stored = [load_predictions(ledger, i) for i in read.ids]
+        assert np.array_equal(read.values, np.concatenate(stored))
+        assert [
+            ledger.event(Event.PREDICTIONS, i)["payload"]["fold"] for i in read.ids
+        ] == list(range(len(folds)))
+        (row,) = ledger.sql(
+            "SELECT score FROM score_latest WHERE evaluation = ? AND pipeline = ?",
+            (evaluation.id, pipeline.id),
+        )
+        assert read.score == row["score"]
+    with pytest.raises(Refused, match="no score of pipeline"):
+        ml_lab.predictions(ledger, evaluation.id, synthetic.ridge(12).id)
 
 
 def test_a_fit_records_its_facts_beside_the_model(ledger, evaluation):

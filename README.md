@@ -204,7 +204,7 @@ score = {r["name"]: r["score"] for r in ledger.sql("SELECT name, score FROM boar
 paired(ledger, score["ridge_shrunk"], score["ridge"], "0", block_rows=250)
 ```
 
-`ml_lab.note(ledger, text, about=[...], tag="decision")` writes what `lab note` writes, and `ml_lab.load(ledger, dataset_id)` reads a recorded dataset back. Predictions are Parquet files under `blobs/sha256/`, named by `event_prediction.blob`. The event tables, views, blob formats, declined designs and what is deferred: [docs/spec.md](docs/spec.md).
+`ml_lab.note(ledger, text, about=[...], tag="decision")` writes what `lab note` writes, and `ml_lab.load(ledger, dataset_id)` reads a recorded dataset back. `ml_lab.predictions(ledger, evaluation_id, pipeline_id)` reads a pipeline's latest scored test predictions back, stitched in fold order with each fold's test range. Predictions are Parquet files under `blobs/sha256/`, named by `event_prediction.blob`. The event tables, views, blob formats, declined designs and what is deferred: [docs/spec.md](docs/spec.md).
 
 ## Trust boundary
 

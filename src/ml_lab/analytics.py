@@ -1,10 +1,12 @@
-"""Uncertainty over the stored series: two scores paired row by row.
+"""Reading the stored series and predictions back: scores paired row by row, and a
+pipeline's test predictions stitched in fold order.
 
 The views pair scores fold by fold; at one fold, or to read the noise of a pooled
 metric, pair the series a score stores. A metric that adds over rows (a PnL, a summed
 loss) has the sum of row differences as its pooled difference. Two scores pair when
 their folds' test ranges cover the same rows in row order, so a refit-cadence twin of
 an evaluation, the same rows under finer folds, pairs against the house score.
+``predictions`` reads what a score scored, for a plot or an analysis outside a scorer.
 
 Examples
 --------
@@ -13,6 +15,8 @@ Examples
 2.1
 >>> paired_sets(ledger, evaluation, "sharpe", seeds_b, seeds_a).t  # doctest: +SKIP
 1.7
+>>> predictions(ledger, evaluation, pipeline).ranges  # doctest: +SKIP
+((800, 1000), (1000, 1200))
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from typing import Any
 import numpy as np
 
 from ml_lab import formats
+from ml_lab.dataset import Range
 from ml_lab.ledger import Event, Ledger, Refused
 
 RESAMPLES = 1000
@@ -207,6 +212,89 @@ def paired_sets(
     std = float(d.std(ddof=1)) if len(d) > 1 else None
     t = float(d.mean() * np.sqrt(len(d)) / std) if std else None
     return SetPaired(len(d), float(d.mean()), std, t, wins, tuple(map(float, d)))
+
+
+@dataclasses.dataclass(frozen=True)
+class Predictions:
+    """A pipeline's scored test predictions under an evaluation, in fold order.
+
+    Attributes
+    ----------
+    values : np.ndarray
+        The predictions over the folds' test rows, fold after fold: shape ``(rows,)``,
+        or ``(rows, k)`` for a pipeline that predicts ``k`` columns.
+    ranges : tuple[Range, ...]
+        The test row range of each fold, in fold order; ``values`` holds their rows in
+        that order, so ``values[:hi - lo]`` is the first fold's.
+    score : str
+        The score id they were read from: the latest under the evaluation.
+    ids : tuple[str, ...]
+        The prediction ids, one per fold.
+    """
+
+    values: np.ndarray
+    ranges: tuple[Range, ...]
+    score: str
+    ids: tuple[str, ...]
+
+
+def predictions(ledger: Ledger, evaluation: str, pipeline: str) -> Predictions:
+    """A pipeline's latest scored test predictions under an evaluation.
+
+    The latest score's prediction ids are the folds' test predictions and nothing
+    else, so a blend's in-sample ranges never enter. The counterpart of ``load`` for
+    datasets.
+
+    Parameters
+    ----------
+    ledger : Ledger
+        The ledger holding the score.
+    evaluation : str
+        The evaluation id.
+    pipeline : str
+        The pipeline id.
+
+    Returns
+    -------
+    Predictions
+        The values stitched in fold order with each fold's test range.
+
+    Raises
+    ------
+    Refused
+        When no score of the pipeline is recorded under the evaluation.
+
+    Examples
+    --------
+    >>> read = predictions(ledger, evaluation.id, pipeline.id)  # doctest: +SKIP
+    >>> read.values.shape, read.ranges  # doctest: +SKIP
+    ((400,), ((800, 1000), (1000, 1200)))
+    """
+    rows = ledger.sql(
+        "SELECT score FROM score_latest WHERE evaluation = ? AND pipeline = ?",
+        (evaluation, pipeline),
+    )
+    if not rows:
+        raise Refused(
+            f"no score of pipeline {pipeline} under evaluation {evaluation} in "
+            f"{ledger.root}; pass the ids board lists"
+        )
+    score = rows[0]["score"]
+    by_fold = _latest(ledger, Event.SCORE, score)["payload"]["predictions"]
+    events = [
+        ledger.event(Event.PREDICTIONS, by_fold[fold])
+        for fold in sorted(by_fold, key=int)
+    ]
+    values = [
+        formats.series_load(ledger.get_blob(event["payload"]["blob"]["sha"]))
+        for event in events
+    ]
+    return Predictions(
+        np.concatenate(values),
+        tuple((int(lo), int(hi)) for lo, hi in (e["payload"]["range"] for e in events)),
+        score,
+        tuple(e["id"] for e in events),
+    )
 
 
 # Private Functions ====================================================================
