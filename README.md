@@ -16,7 +16,7 @@ uv pip install -e ml-lab                 # Python 3.12, numpy, polars
 
 Development: `uv pip install -e ".[dev]"` and `pytest`.
 
-A study's code is hashed from the git repository `lab` runs in; a module reached from outside it must belong to an installed distribution, or the run is refused as code the memo cannot see. A study on `PYTHONPATH` alone is refused: install it editable (`uv pip install -e <study>`) or keep it in the repository. Prefer a path-based editable install, which static analysis resolves: hatchling and most build backends write one by default, and setuptools does with `--config-settings editable_mode=compat`; its default import-hook mode hides the package from pyright, which then needs the source directory in `extraPaths`.
+A study's code is hashed from the git repository `lab` runs in; a module reached from outside it must belong to an installed distribution, or the run is refused as code the memo cannot see. A study on `PYTHONPATH` alone is refused: install it editable (`uv pip install -e <study>`) or keep it in the repository. Prefer a path-based editable install, which static analysis resolves: hatchling and most build backends write one by default, and setuptools does with `--config-settings editable_mode=compat`; its default import-hook mode hides the package from pyright, which then needs the source directory in `extraPaths`. An editable install's lock entry hashes the modules a fit reaches, so an edit to it refits; ml-lab itself is the exception, in the lock by version alone however it is installed, with its commit under `run_started.editable`, so a pull of the tool refits nothing.
 
 ## The smallest project
 
