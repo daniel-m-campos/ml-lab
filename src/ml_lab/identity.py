@@ -45,6 +45,10 @@ class Refused(Exception):
 
 HASH_LEN = 16
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+TOOL = "ml-lab"
+"""The tool's own distribution. It enters a lock by version, as a release of any
+distribution does, never by a hash of its files, so an editable install's edits to
+the tool change no id; ``run_started.editable`` records its commit and diff."""
 
 
 # Declarations =========================================================================
@@ -188,6 +192,8 @@ def imports(
     Modules outside ``code_root`` are reached but not expanded, so a third-party package
     appears once and its internals are never walked, except an editable install's
     modules, which are expanded as the repo's are, their sources read once per process.
+    The tool's own install, ``TOOL``, is a third-party package here however it is
+    installed.
     """
     root = code_root.resolve()
     queue = [sys.modules[f.__module__] for f in funcs if f.__module__ in sys.modules]
@@ -201,7 +207,7 @@ def imports(
         editable = None if path else _editable(module)
         if path:
             source = path.read_bytes()
-        elif editable:
+        elif editable and editable[0] != TOOL:
             source = _editable_source(editable[1])
         elif not _namespace_under(module, root):
             continue
@@ -330,7 +336,7 @@ def imported_dists(
 
     An editable install's version carries a hash of the code keys of its modules the
     closure reaches, since the version does not move when the files do; see
-    ``_editable_suffix``.
+    ``_editable_suffix``. The tool's own install, ``TOOL``, is its version alone.
     """
     owners = distribution_owners()
     modules = imports(funcs, code_root)
@@ -345,7 +351,7 @@ def imported_dists(
         if name in found:
             continue
         found[name] = version + (
-            _editable_suffix(dist, name, modules) if editable else ""
+            _editable_suffix(dist, name, modules) if editable and name != TOOL else ""
         )
         todo.update(requires)
     return dict(sorted(found.items()))
