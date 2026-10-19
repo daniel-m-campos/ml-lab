@@ -3687,6 +3687,38 @@ def test_current_marks_the_id_the_newest_run_declared_under_a_name(ledger, evalu
     assert pair["n_folds"] == folds
 
 
+def test_current_drops_an_evaluation_re_declared_under_its_name(ledger, evaluation):
+    house = dataclasses.replace(evaluation, name="house")
+    one = synthetic.ridge(1)
+    _run(ledger, house, one)
+    cheaper = dataclasses.replace(house, scorer_params=synthetic.SimConfig(0.01))
+    assert cheaper.name == house.name and cheaper.id != house.id
+    _run(ledger, cheaper, one)
+    query = (
+        "SELECT evaluation, current FROM board WHERE pipeline = ? AND metric = 'pnl' "
+        "ORDER BY seq"
+    )
+    rows = ledger.sql(query, (one.id,))
+    assert [(r["evaluation"], r["current"]) for r in rows] == [
+        (house.id, 0),
+        (cheaper.id, 1),
+    ]
+    (row,) = ledger.sql(
+        "SELECT evaluation FROM evaluation_current WHERE name = 'house'"
+    )
+    assert row["evaluation"] == cheaper.id
+    _run(ledger, house, one, synthetic.ridge(3))
+    rows = ledger.sql(query, (one.id,))
+    assert [(r["evaluation"], r["current"]) for r in rows] == [
+        (house.id, 1),
+        (cheaper.id, 0),
+    ]
+    _run(ledger, evaluation, one)
+    rows = ledger.sql(query, (one.id,))
+    assert (evaluation.id, 1) in [(r["evaluation"], r["current"]) for r in rows]
+    assert _count(ledger, "evaluation_current") == 1
+
+
 def test_a_fit_records_its_facts_beside_the_model(ledger, evaluation):
     plain = synthetic.ridge(1)
     facts = dataclasses.replace(plain, fit=synthetic.facts_fit, name="facts")

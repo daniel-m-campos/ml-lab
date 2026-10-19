@@ -110,6 +110,17 @@ CREATE VIEW pipeline_current AS WITH newest AS MATERIALIZED (
 SELECT r.evaluation, r.name, r.pipeline, r.run, r.seq FROM run_pipeline r
 JOIN newest n ON n.evaluation = r.evaluation AND n.name = r.name AND n.seq = r.seq;
 
+CREATE VIEW evaluation_current AS WITH named AS (
+  SELECT json_extract(payload,'$.name') AS name, key AS evaluation, seq FROM event
+  WHERE type='evaluation_declared'
+  UNION ALL
+  SELECT json_extract(d.payload,'$.name'), r.stream, r.seq FROM event r
+  JOIN event d ON d.type='evaluation_declared' AND d.key = r.stream
+  WHERE r.type='run_started')
+SELECT name, evaluation, seq FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY seq DESC) AS rn FROM named)
+WHERE rn = 1 AND name <> '';
+
 CREATE VIEW event_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
   json_extract(payload,'$.pipeline') AS pipeline, json_extract(payload,'$.run') AS run,
   json_extract(payload,'$.columns') AS columns,
@@ -179,10 +190,12 @@ JOIN (SELECT score, metric, COUNT(value) AS n_folds, AVG(value) AS fold_mean,
 WHERE e.type='score_recorded';
 
 CREATE VIEW score_latest AS WITH c AS MATERIALIZED (
-  SELECT DISTINCT evaluation, pipeline FROM pipeline_current)
+  SELECT DISTINCT evaluation, pipeline FROM pipeline_current),
+v AS MATERIALIZED (SELECT evaluation FROM evaluation_current)
 SELECT l.evaluation, e.name AS evaluation_name,
   l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq,
-  CASE WHEN c.pipeline IS NOT NULL THEN 1 ELSE 0 END AS current
+  CASE WHEN c.pipeline IS NOT NULL AND (e.name = '' OR v.evaluation IS NOT NULL)
+    THEN 1 ELSE 0 END AS current
 FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq,
         ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM event_score) l
@@ -190,6 +203,7 @@ JOIN event_pipeline p ON p.id = l.pipeline
 JOIN event_evaluation e ON e.id = l.evaluation
 JOIN event_dataset d ON d.id = e.dataset
 LEFT JOIN c ON c.evaluation = l.evaluation AND c.pipeline = l.pipeline
+LEFT JOIN v ON v.evaluation = l.evaluation
 WHERE l.rn = 1;
 
 CREATE VIEW score_fit AS WITH RECURSIVE
