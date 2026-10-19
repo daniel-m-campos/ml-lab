@@ -10,6 +10,7 @@ import dataclasses
 import datetime
 import functools
 import importlib
+import importlib.metadata
 import importlib.util
 import io
 import itertools
@@ -1151,6 +1152,15 @@ def test_a_namespace_package_submodule_is_in_the_closure(tmp_path, monkeypatch):
     assert "ns_pkg/helpers.py" in identity.import_shas((model.fit,), tmp_path)
 
 
+def test_the_tools_own_editable_install_is_a_version_in_the_lock():
+    functions = synthetic.ridge(1).functions
+    dists = identity.imported_dists(functions, REPO)
+    assert dists[identity.TOOL] == importlib.metadata.version(identity.TOOL)
+    reached = {m.__name__ for m in identity.imports(functions, REPO)}
+    assert "ml_lab.dataset" in reached and "ml_lab.analytics" not in reached
+    assert identity.TOOL in identity.editable_roots(functions, REPO)
+
+
 def test_an_editable_single_module_install_hashes_its_source(tmp_path, monkeypatch):
     source = _editable(tmp_path, monkeypatch, "single_tool", single=True)
     fit = importlib.import_module("single_tool_functions").fit
@@ -2232,7 +2242,7 @@ def test_a_fit_carries_code_identity_and_its_model_reloads_without_pickle(
         for line in ledger.get_blob(payload["env_lock"]["sha"]).decode().split()
     )
     assert {"python", "numpy", "polars"} <= set(lock) and "pytest" not in lock
-    assert lock["ml-lab"].count("+") == 1
+    assert lock[identity.TOOL] == importlib.metadata.version(identity.TOOL)
     run = ledger.latest(Event.RUN, payload["run"])
     assert "commit" in run["payload"]["git"]
     model = _loaded(pipeline, ledger, payload["model"]["sha"])
