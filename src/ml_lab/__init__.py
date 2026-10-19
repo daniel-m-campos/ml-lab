@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ml_lab.analytics import paired, paired_sets
+from ml_lab.analytics import paired, paired_sets, predictions
 from ml_lab.dataset import Dataset, FitView, Range, Segments, load, record
 from ml_lab.experiment import Evaluation, Fitted, Pipeline, Scorer, mean_blend
 from ml_lab.ledger import Ledger, note
@@ -26,5 +26,6 @@ __all__ = [
     "note",
     "paired",
     "paired_sets",
+    "predictions",
     "record",
 ]
