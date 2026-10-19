@@ -38,13 +38,13 @@ from ml_lab import (
     cli,
     dates,
     declarations,
+    features,
     formats,
     guards,
     identity,
     provenance,
     runs,
     splits,
-    stages,
 )
 from ml_lab.dataset import (
     Dataset,
@@ -3513,7 +3513,7 @@ def test_a_run_reuses_the_feature_set_its_dry_run_computed(ledger, dataset, eval
     assert synthetic.FEATURE_CALLS.count(n) == 1
     planned = ledger.root / "planned"
     assert sorted(p.suffix for p in planned.iterdir()) == [".json", ".parquet"]
-    stages._PLANNED_FEATURES.clear()
+    features._PLANNED_FEATURES.clear()
     lines.clear()
     _run(ledger, evaluation, lag, dry=True, log=lines.append)
     assert synthetic.FEATURE_CALLS.count(n) == 1
@@ -4017,7 +4017,7 @@ def test_a_planned_feature_file_that_cannot_be_read_is_recomputed(
     planned = ledger.root / "planned"
     for stale in planned.iterdir():
         stale.write_bytes(b"not a file the run can read")
-    stages._PLANNED_FEATURES.clear()
+    features._PLANNED_FEATURES.clear()
     synthetic.FEATURE_CALLS.clear()
     report = _run(ledger, evaluation, lag)
     assert not report.failed and report.features_computed == 1

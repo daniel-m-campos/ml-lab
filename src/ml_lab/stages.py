@@ -2,7 +2,8 @@
 
 ``RunContext`` is what every stage of one run shares; ``Stage`` computes one
 pipeline's ids, looks each up, and computes and records what the log lacks, behind
-the probes in ``ml_lab.guards``. A blend holds one stage per member.
+the probes in ``ml_lab.guards``. Its feature sets are a ``ml_lab.features.Features``.
+A blend holds one stage per member.
 
 Examples
 --------
@@ -20,7 +21,6 @@ import json
 import pathlib
 import sys
 import time
-from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
@@ -33,11 +33,10 @@ from ml_lab.dataset import (
     Lag,
     Range,
     Segments,
-    rows_load,
-    rows_save,
 )
 from ml_lab.declarations import stage_functions
 from ml_lab.experiment import Evaluation, Fitted, Pipeline
+from ml_lab.features import Features, FeatureSet
 from ml_lab.guards import (
     cuts,
     frozen,
@@ -111,29 +110,6 @@ class RunContext:
         return self.stages[pipeline.id]
 
 
-@dataclasses.dataclass(frozen=True)
-class FeatureSet:
-    """One computed feature set.
-
-    Attributes
-    ----------
-    columns : tuple[str, ...]
-        The column names, in order.
-    path : pathlib.Path | None
-        The Parquet file they are read from; None in a dry run, which stores nothing.
-    columns_id : str
-        The id of the ordered columns' bytes.
-    """
-
-    columns: tuple[str, ...]
-    path: pathlib.Path | None
-    columns_id: str
-
-
-PLANNED_DAYS = 7
-"""How long a dry run's feature set waits under ``planned`` for a run to use it."""
-
-
 class Stage:
     """One pipeline's memoized features, fits and predictions; a blend holds one per
     member. ``run`` is what every stage of the run shares.
@@ -144,15 +120,13 @@ class Stage:
         self.pipeline = pipeline
         self.name = pipeline.name or pipeline.id
         self.members = [run.stage(m) for m in pipeline.members]
-        self.feature_functions = pipeline.feature_functions
-        shared = {m.feature_functions for m in self.members}
-        if not self.feature_functions and len(shared) == 1:
-            self.feature_functions = shared.pop()
+        functions = pipeline.feature_functions
+        shared = {m.features.functions for m in self.members}
+        if not functions and len(shared) == 1:
+            functions = shared.pop()
+        self.features = Features(run, self.name, pipeline, functions)
         self.shas = identity.import_shas(pipeline.functions, self.run.root)
-        self.functions = {
-            **stage_functions(pipeline),
-            "features": self.feature_functions,
-        }
+        self.functions = stage_functions(pipeline)
         self.stage_shas = {
             stage: identity.import_shas(functions, self.run.root)
             for stage, functions in self.functions.items()
@@ -170,22 +144,6 @@ class Stage:
             "sha": identity.bytes_hash(self.locks["fit"].encode()),
             "format": formats.Format.TEXT,
         }
-        self.feature_ids = [
-            identity.content_hash(
-                {
-                    "dataset": self.run.evaluation.dataset_id,
-                    "features": function,
-                    "code_keys": identity.code_keys((function,), self.run.root),
-                    "env_lock": identity.bytes_hash(
-                        lock_text(
-                            identity.imported_dists((function,), self.run.root)
-                        ).encode()
-                    ),
-                }
-            )
-            for function in self.feature_functions
-        ]
-        self.featured: Dataset | None = None
         self.models: dict[str, Any] = {}
         self.pending: dict[str, _Pending] = {}
         self.fits: dict[tuple[tuple[int, int], ...], str] = {}
@@ -201,7 +159,7 @@ class Stage:
     def _fit(self, fold: Fold, index: int) -> str:
         train = [list(seg) for seg in fold.train]
         member_fits = [m.fit(fold, index) for m in self.members]
-        columns_id = self._feature_columns_id()
+        columns_id = self.features.columns_id()
         if self.pipeline.stateless:
             return identity.content_hash(
                 {
@@ -243,7 +201,9 @@ class Stage:
             return fit_id
         split = self.run.evaluation.split
         visible = FitView(
-            self._visible(max(hi for _, hi in fold.train)).train_view(fold.train),
+            self.features.visible(max(hi for _, hi in fold.train)).train_view(
+                fold.train
+            ),
             fold.train,
             embargo_rows=getattr(split, "embargo_rows", 0),
             embargo_timestamps=getattr(split, "embargo_timestamps", 0),
@@ -370,7 +330,7 @@ class Stage:
                 else {}
             ),
         }
-        visible = self._visible(rows[1])
+        visible = self.features.visible(rows[1])
         if train:
             visible = visible.train_view(fold.train)
         visible = visible.masked(self.run.targets, rows[0])
@@ -522,46 +482,6 @@ class Stage:
         if moved:
             raise Refused(f"{self.name}: source changed during the run: {moved}; rerun")
 
-    def _visible(self, cut: int) -> Dataset:
-        """The dataset's first ``cut`` rows, with the pipeline's feature columns read
-        on demand from their stored files.
-        """
-        if not self.feature_functions:
-            return self.run.dataset.upto(cut)
-        if self.featured is None:
-            sets = [
-                self._features(f, i)
-                for f, i in zip(self.feature_functions, self.feature_ids, strict=True)
-            ]
-            names = tuple(n for fs in sets for n in fs.columns)
-            stores = {
-                n: fs.path for fs in sets for n in fs.columns if fs.path is not None
-            }
-            self.featured = Dataset(
-                self.run.dataset.columns,
-                self.run.dataset.ts,
-                names,
-                stores,
-                reveal=self.run.dataset.reveal,
-            )
-        return self.featured.upto(cut)
-
-    def _feature_columns_id(self) -> str | None:
-        """The fit's feature input: the id of the ordered columns' bytes, computing the
-        features first when no run has, so a dry run's ids are the real ones.
-        """
-        sets = [
-            self._features(f, i)
-            for f, i in zip(self.feature_functions, self.feature_ids, strict=True)
-        ]
-        names = Counter(n for fs in sets for n in fs.columns)
-        twice = sorted(n for n, k in names.items() if k > 1)
-        if twice:
-            raise Refused(
-                f"{self.name}: features functions name the same columns {twice}"
-            )
-        return identity.content_hash([fs.columns_id for fs in sets]) if sets else None
-
     def _model_blob(self, model: Any) -> dict[str, Any]:
         """The saved model; a zip is portable iff every member's format is."""
         payload = _declared(self.pipeline.save, self.name, "save")(model)
@@ -581,267 +501,6 @@ class Stage:
             "format": self.pipeline.format,
             "portable": all(formats.KNOWN[f] for f in used.values()),
         }
-
-    def _features(self, function: Callable, feature_id: str) -> FeatureSet:
-        """One features function's columns, computed once per feature id over the
-        dataset without its targets, probed and stored. A dry run computes and probes
-        them too, so the names and id are known and a leak is refused before any fit,
-        but stores nothing; what it computed is kept for the process, so a dry run of
-        the same features under another evaluation reuses it. The probe cuts each of
-        the five spans between the sixths of the rows and the end by ``cuts``.
-        """
-        if feature_id in self.run.features:
-            return self.run.features[feature_id]
-        event = self.run.ledger.latest(Event.FEATURES, feature_id)
-        if event is not None:
-            payload = event["payload"]
-            path = self.run.ledger.blobs / payload["blob"]["sha"]
-            found = FeatureSet(tuple(payload["columns"]), path, payload["columns_id"])
-            self.run.report.features_reused += 1
-            return self.run.features.setdefault(feature_id, found)
-        if (
-            self.run.dry
-            and feature_id in self.run.planned
-            and feature_id in _PLANNED_FEATURES
-        ):
-            return self.run.features.setdefault(
-                feature_id, _PLANNED_FEATURES[feature_id]
-            )
-        revealed: dict[str, Lag] = {
-            k: v for k, v in self.run.targets.items() if v is not None
-        }
-        bare = Dataset(
-            {
-                k: v
-                for k, v in self.run.dataset.columns.items()
-                if k in revealed or k not in self.run.targets
-            },
-            self.run.dataset.ts,
-        )
-        ref = identity.function_ref(function)
-        planned = self._planned_features(feature_id)
-        if planned is not None and self.run.dry:
-            columns_id, columns, duration = planned
-            self.run.log(
-                f"would compute features {self.name} {ref} {len(columns)} columns: "
-                f"computed and probed by an earlier dry run"
-            )
-            self.run.report.features_computed += 1
-            self.run.planned.add(feature_id)
-            found = FeatureSet(tuple(columns), None, columns_id)
-            _PLANNED_FEATURES[feature_id] = found
-            return self.run.features.setdefault(feature_id, found)
-        loaded = set(sys.modules)
-        if planned is None:
-            self.run.log(f"computing features {self.name} {ref}")
-            started = time.perf_counter()
-            columns = self._feature_columns(function, bare)
-            duration = time.perf_counter() - started
-        else:
-            self.run.log(f"features {self.name} {ref}: from the dry run, probing")
-            columns_id, columns, duration = planned
-        columns_id = columns_hash(columns)
-        probe_rows = self._probe_features(
-            function, bare, revealed, columns, spans=1 if self.run.dry else 5
-        )
-        self._check_imports("features", loaded)
-        self._unchanged("features")
-        if self.run.dry:
-            self.run.log(
-                f"would compute features {self.name} {ref} {len(columns)} columns "
-                f"{duration:.1f}s: {self._features_why(function)}; probed at rows "
-                f"{probe_rows} only"
-            )
-            self._plan_features(feature_id, columns, columns_id, duration)
-            self.run.report.features_computed += 1
-            self.run.planned.add(feature_id)
-            found = FeatureSet(tuple(columns), None, columns_id)
-            _PLANNED_FEATURES[feature_id] = found
-            return self.run.features.setdefault(feature_id, found)
-        run_id = self.run.start()
-        sha = self.run.ledger.put_blob(rows_save(Dataset(columns, None)))
-        self.run.ledger.append(
-            Event.FEATURES,
-            self.run.evaluation.dataset_id,
-            feature_id,
-            {
-                "pipeline": self.pipeline.id,
-                "run": run_id,
-                "features": identity.canonical(function),
-                "import_shas": identity.import_shas((function,), self.run.root),
-                "code_keys": identity.code_keys((function,), self.run.root),
-                "columns": list(columns),
-                "columns_id": columns_id,
-                "probe_rows": probe_rows,
-                "duration_s": duration,
-                "blob": {"sha": sha, "format": PARQUET},
-            },
-            id=feature_id,
-        )
-        self.run.report.features_computed += 1
-        self.run.log(f"features {self.name} {len(columns)} columns {duration:.1f}s")
-        for leftover in self._planned_dir().glob(f"{feature_id}.*"):
-            leftover.unlink(missing_ok=True)
-        return self.run.features.setdefault(
-            feature_id,
-            FeatureSet(tuple(columns), self.run.ledger.blobs / sha, columns_id),
-        )
-
-    def _planned_dir(self) -> pathlib.Path:
-        return self.run.ledger.root / "planned"
-
-    def _plan_features(
-        self,
-        feature_id: str,
-        columns: dict[str, np.ndarray],
-        columns_id: str,
-        duration: float,
-    ):
-        """Keep a dry run's feature set under ``planned``, outside the events and the
-        blob store, so the run that follows reads it instead of computing it again;
-        sets older than ``PLANNED_DAYS`` are dropped, since no run came for them.
-        """
-        planned = self._planned_dir()
-        planned.mkdir(exist_ok=True)
-        stale = time.time() - PLANNED_DAYS * 86400
-        for old in planned.iterdir():
-            try:
-                if old.stat().st_mtime < stale:
-                    old.unlink(missing_ok=True)
-            except OSError:
-                continue
-        (planned / f"{feature_id}.parquet").write_bytes(
-            rows_save(Dataset(columns, None))
-        )
-        (planned / f"{feature_id}.json").write_text(
-            json.dumps(
-                {
-                    "columns": list(columns),
-                    "columns_id": columns_id,
-                    "duration_s": duration,
-                }
-            )
-        )
-
-    def _planned_features(
-        self, feature_id: str
-    ) -> tuple[str, dict[str, np.ndarray], float] | None:
-        """A feature set an earlier dry run left under ``planned``, when its columns
-        still hash to the id it was saved with; None otherwise.
-        """
-        meta = self._planned_dir() / f"{feature_id}.json"
-        data = self._planned_dir() / f"{feature_id}.parquet"
-        try:
-            saved = json.loads(meta.read_text())
-            columns = rows_load(data).columns
-        except (OSError, ValueError):
-            return None
-        if (
-            list(columns) != saved["columns"]
-            or columns_hash(columns) != saved["columns_id"]
-        ):
-            return None
-        return saved["columns_id"], columns, float(saved["duration_s"])
-
-    def _probe_features(
-        self,
-        function: Callable,
-        bare: Dataset,
-        revealed: dict[str, Lag],
-        columns: dict[str, np.ndarray],
-        spans: int = 5,
-    ) -> list[int]:
-        """Recompute the columns on the rows before each probe cut of the first
-        ``spans`` of the five spans between the sixths of the rows and the end, with
-        the labels not yet known at the cut hidden, and refuse a column that moves; the
-        cuts. A dry run probes the first span only, the cheapest, which still catches
-        a column that reads past its row or its date's later rows.
-        """
-        n = bare.rows
-        sixths = [j * n // 6 for j in range(1, 7)]
-        probe_rows = [
-            at
-            for span in list(zip(sixths, sixths[1:], strict=False))[:spans]
-            for at in cuts(bare, *span)
-        ]
-        for row in probe_rows:
-            head = self._feature_columns(
-                function, bare.upto(row).masked(revealed, row - 1)
-            )
-            if set(head) != set(columns):
-                raise Refused(
-                    f"{self.name}: features name columns {sorted(columns)} on the "
-                    f"whole dataset and {sorted(head)} on the rows before {row}"
-                )
-            for name, values in columns.items():
-                try:
-                    refuse_changed(
-                        f"{self.name}: features", name, values, head[name], at=row
-                    )
-                except Refused as error:
-                    plain = self._feature_columns(function, bare.upto(row))[name]
-                    if np.array_equal(plain, values[:row], equal_nan=True):
-                        raise Refused(
-                            f"{self.name}: features read a revealed target before its "
-                            f"reveal lag: column {name} changes before row {row} when "
-                            f"labels not yet known at row {row - 1} are hidden"
-                        ) from error
-                    raise
-            del head
-        return probe_rows
-
-    def _features_why(self, function: Callable) -> str:
-        """Why a feature set is computed: the inputs that moved against the nearest
-        earlier computation of the same function, the one with the fewest moved.
-        """
-        rows = self.run.ledger.sql(
-            "SELECT stream AS dataset, json_extract(payload, '$.code_keys') AS "
-            "code_keys FROM event WHERE type = ? AND "
-            "json_extract(payload, '$.features.__function__') = ? "
-            "ORDER BY seq DESC LIMIT 64",
-            (Event.FEATURES, identity.function_ref(function)),
-        )
-        if not rows:
-            return "no earlier features of this function"
-        now = identity.code_keys((function,), self.run.root)
-
-        def moved(row: dict[str, Any]) -> list[str]:
-            before = json.loads(row["code_keys"])
-            files = sorted(
-                k for k in set(before) | set(now) if before.get(k) != now.get(k)
-            )
-            return [
-                reason
-                for reason, differs in (
-                    (
-                        "dataset changed",
-                        row["dataset"] != self.run.evaluation.dataset_id,
-                    ),
-                    (f"code changed: {', '.join(files)}", bool(files)),
-                )
-                if differs
-            ]
-
-        nearest = min((moved(r) for r in rows), key=len)
-        return "; ".join(nearest) or "environment lock changed"
-
-    def _feature_columns(
-        self, function: Callable, bare: Dataset
-    ) -> dict[str, np.ndarray]:
-        out = function(bare)
-        clash = sorted(set(out) & set(self.run.dataset.columns))
-        if clash:
-            raise Refused(f"{self.name}: features redefine dataset columns {clash}")
-        columns = {}
-        for name, values in out.items():
-            values = np.asarray(values)
-            if values.shape != (bare.rows,):
-                raise Refused(
-                    f"{self.name}: feature {name} has shape {values.shape}, not "
-                    f"({bare.rows},)"
-                )
-            columns[name] = values
-        return columns
 
     def _why(self, label: str, train: list[list[int]]) -> str:
         """Why a fit is computed: the inputs that moved against the nearest earlier fit
@@ -970,13 +629,6 @@ class Stage:
         return values
 
 
-def columns_hash(columns: dict[str, np.ndarray]) -> str:
-    """The ordered columns' names, dtypes and bytes: what a fit consumes."""
-    return identity.content_hash(
-        [[n, str(v.dtype), identity.array_hash(v)] for n, v in columns.items()]
-    )
-
-
 def load_predictions(ledger: Ledger, pred_id: str) -> np.ndarray:
     event = ledger.event(Event.PREDICTIONS, pred_id)
     return formats.series_load(ledger.get_blob(event["payload"]["blob"]["sha"]))
@@ -994,15 +646,6 @@ class _Pending:
     model: Any
     why: str
     payload: dict[str, Any]
-
-
-_PLANNED_FEATURES: dict[str, FeatureSet] = {}
-"""Feature sets a dry run computed in this process, by feature id, so a later dry run
-of the same features under another evaluation reuses the names and id instead of
-computing them again. The id covers the dataset, the function, its code and its
-environment, so an entry is right for as long as the process runs. On disk the same
-sets live under the ledger's ``planned`` directory (``_planned_dir``), where a later
-process, dry or real, picks them up."""
 
 
 def _facts(name: str, facts: Any) -> dict[str, Any]:
