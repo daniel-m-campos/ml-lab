@@ -462,7 +462,7 @@ def note(
     if unknown:
         raise Refused(
             f"ids {unknown} are not in {ledger.root.resolve()}; a note is about "
-            "dataset, pipeline, evaluation, run or score ids, as lab prints them"
+            "ids the log holds, as lab prints them"
         )
     return ledger.append(
         Event.NOTE, "", tag, {"text": text, "about": list(about), "tag": tag}
@@ -470,10 +470,11 @@ def note(
 
 
 _ABOUT = (
-    "SELECT 1 FROM event WHERE (type IN ('dataset_recorded', 'run_started', "
-    "'score_recorded') AND id = ?) OR (type IN ('pipeline_declared', "
+    "SELECT 1 FROM event WHERE id = ? OR (type IN ('pipeline_declared', "
     "'evaluation_declared') AND key = ?) LIMIT 1"
 )
+"""An id the log holds: any event's id, or a pipeline or evaluation id, whose
+events are keyed by it."""
 
 
 def actor() -> str:

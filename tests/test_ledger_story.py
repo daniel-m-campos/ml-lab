@@ -3790,6 +3790,13 @@ def test_the_read_contract_names_its_versions_and_carries_the_concept_columns(
     rows = ledger.sql("SELECT note, tag, text, about FROM note_about ORDER BY about")
     assert {r["about"] for r in rows} == {one.id, latest["score"]}
     assert {(r["tag"], r["text"]) for r in rows} == {("tag", "baseline")}
+    (fit,) = ledger.sql(
+        "SELECT fit FROM score_fit WHERE score = ? LIMIT 1", (latest["score"],)
+    )
+    (feature,) = ledger.sql("SELECT id FROM event_prediction LIMIT 1")
+    ml_lab.note(ledger, "a fit and a prediction", about=[fit["fit"], feature["id"]])
+    with pytest.raises(Refused, match="ids the log holds"):
+        ml_lab.note(ledger, "nothing", about=["zzz"])
 
 
 def test_a_fit_records_its_facts_beside_the_model(ledger, evaluation):
@@ -4036,8 +4043,8 @@ def test_a_note_records_text_about_ids_the_log_holds(
     assert cli.main([*root, *args, "nope"]) == 1
     assert "ids ['nope'] are not in" in capsys.readouterr().err
     fit = ledger.sql("SELECT id FROM event_fit LIMIT 1")[0]["id"]
-    for bad in (fit, "decision", note_id):
-        assert cli.main([*root, *args, bad]) == 1
+    assert cli.main([*root, *args, "decision"]) == 1
+    assert cli.main([*root, *args, fit, note_id]) == 0
     assert cli.main([*root, *args, evaluation.id]) == 0
     with pytest.raises(Refused, match="needs text"):
         ml_lab.note(ledger, "  ")
