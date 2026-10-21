@@ -324,11 +324,3 @@ class Evaluation:
     @property
     def id(self) -> str:
         return identity.content_hash(self)
-
-    @property
-    def directions(self) -> dict[str, str]:
-        return self.scorer.directions
-
-    @property
-    def metrics(self) -> Callable:
-        return self.scorer.metrics
