@@ -292,7 +292,7 @@ def _score(
             "predictions": sorted(predictions.values()),
             "scorer_keys": identity.code_keys(scoring, context.root),
             "env_lock": identity.bytes_hash(lock.encode()),
-            "directions": evaluation.directions,
+            "directions": evaluation.scorer.directions,
         }
     )
     if ledger.latest(Event.SCORE, score_id) is not None:
@@ -315,12 +315,12 @@ def _score(
         )
         parts.append(series)
         metrics = finite_metrics(
-            name, evaluation.metrics(series.copy()), f"fold {fold.label}"
+            name, evaluation.scorer.metrics(series.copy()), f"fold {fold.label}"
         )
         per_fold.append({"fold": index, "label": fold.label, "metrics": metrics})
     whole = np.concatenate(parts)
     aggregate = finite_metrics(
-        name, evaluation.metrics(whole.copy()), "the pooled folds"
+        name, evaluation.scorer.metrics(whole.copy()), "the pooled folds"
     )
     refuse_lazy_imports(pipeline, context.root, dists, loaded, "scorer")
     columns = np.asarray(whole, np.float64).reshape(len(whole), -1)
@@ -347,7 +347,7 @@ def _score(
                 "predictions": predictions,
                 "folds": per_fold,
                 "aggregate": aggregate,
-                "directions": evaluation.directions,
+                "directions": evaluation.scorer.directions,
                 "series": stored,
                 "scorer_shas": scorer_shas,
                 "sealed": evaluation.sealed,

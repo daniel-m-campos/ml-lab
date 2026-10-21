@@ -77,7 +77,7 @@ def declare_evaluation(
             "name": evaluation.name,
             "dataset": evaluation.dataset_id,
             "declaration": identity.canonical(evaluation),
-            "metrics": evaluation.directions,
+            "metrics": evaluation.scorer.directions,
             "folds": live,
         },
         id=identity.content_hash({"id": evaluation.id, "name": evaluation.name}),

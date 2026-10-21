@@ -784,7 +784,7 @@ def test_the_schedule_is_embargoed_and_stored_once_in_the_evaluation_event(
     stored = ledger.latest(Event.EVALUATION, evaluation.id)["payload"]
     assert (
         len(stored["folds"]) == len(folds)
-        and stored["metrics"] == evaluation.directions
+        and stored["metrics"] == evaluation.scorer.directions
     )
     config = ledger.sql("SELECT scorer_params FROM event_evaluation")[0][
         "scorer_params"
@@ -2704,7 +2704,7 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     folds = evaluation.split.folds(load(ledger, dataset))
     _run(ledger, evaluation, synthetic.ridge(1), synthetic.ridge(6))
     db = sqlite3.connect(tmp_path / "ml-lab" / "ml_lab.sqlite")
-    metrics = len(evaluation.directions)
+    metrics = len(evaluation.scorer.directions)
     assert db.execute("SELECT COUNT(*) FROM score_fold").fetchone()[0] == (
         2 * len(folds) * metrics
     )
@@ -2738,7 +2738,7 @@ def test_the_views_read_with_sqlite_alone(ledger, dataset, evaluation, tmp_path)
     ]
     assert json.loads(
         db.execute("SELECT directions FROM event_evaluation").fetchone()[0]
-    ) == dict(evaluation.directions)
+    ) == dict(evaluation.scorer.directions)
     runs_ = {r for (r,) in db.execute("SELECT id FROM event_run")}
     assert {r for (r,) in db.execute("SELECT DISTINCT run FROM score_fit")} == runs_
 
@@ -2787,7 +2787,8 @@ def test_an_agent_ranks_and_pairs_against_the_house_score_it_reuses(
         ("agent", "ridge_6m"),
     }
     flipped = {
-        m: "min" if d == "max" else "max" for m, d in evaluation.directions.items()
+        m: "min" if d == "max" else "max"
+        for m, d in evaluation.scorer.directions.items()
     }
     scorer = dataclasses.replace(evaluation.scorer, directions=flipped)
     _run(ledger, dataclasses.replace(evaluation, scorer=scorer), synthetic.ridge(6))
