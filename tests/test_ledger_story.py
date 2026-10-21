@@ -54,6 +54,7 @@ from ml_lab.dataset import (
     data_id,
     load,
     record,
+    resolve,
     rows_load,
     rows_save,
     stratified_order,
@@ -2604,17 +2605,17 @@ def test_a_source_written_by_two_actors_resolves_to_the_actors_own(
     monkeypatch.setenv("ML_LAB_ACTOR", "other-agent")
     second = synthetic.dataset(ledger, seed=8)
     assert second != dataset
-    assert cli._dataset(ledger, "synthetic") == second
-    assert cli._dataset(ledger, None) == second
+    assert resolve(ledger, "synthetic") == second
+    assert resolve(ledger, None) == second
     monkeypatch.setenv("ML_LAB_ACTOR", "tester")
-    assert cli._dataset(ledger, "synthetic") == dataset
+    assert resolve(ledger, "synthetic") == dataset
     monkeypatch.setenv("ML_LAB_ACTOR", "stranger")
     with pytest.raises(Refused, match="several actors, none by stranger") as info:
-        cli._dataset(ledger, "synthetic")
+        resolve(ledger, "synthetic")
     assert dataset[:8] in str(info.value) and "other-agent" in str(info.value)
     with pytest.raises(Refused, match="several actors"):
-        cli._dataset(ledger, None)
-    assert cli._dataset(ledger, dataset[:8]) == dataset
+        resolve(ledger, None)
+    assert resolve(ledger, dataset[:8]) == dataset
     assert cli.main(["--root", str(ledger.root), "run", "tests.synthetic"]) == 1
     assert "several actors" in capsys.readouterr().err
 

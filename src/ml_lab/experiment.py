@@ -305,11 +305,12 @@ class Fitted:
 @dataclasses.dataclass(frozen=True)
 class Evaluation:
     """How every pipeline on a dataset is scored: a split into folds, a scorer and its
-    params. ``dataset_id`` may be a prefix of the id, resolved at run as ``lab run
-    --dataset`` resolves one. Splits live in ``ml_lab.splits``; any frozen dataclass
-    with ``folds(dataset) -> list[Fold]`` works. ``name`` is a label. A sweep is a list
-    of ``dataclasses.replace(base, scorer_params=SimParams(t), name=f"cost{t}")``; the
-    scorer's params class must live in a module the scorer imports. Only a ``sealed``
+    params. ``dataset_id`` is a selector, resolved at run as ``lab run --dataset``
+    resolves one: a source, an id or an id prefix. Splits live in ``ml_lab.splits``;
+    any frozen dataclass with ``folds(dataset) -> list[Fold]`` works. ``name`` is a
+    label. A sweep is a list of ``dataclasses.replace(base,
+    scorer_params=SimParams(t), name=f"cost{t}")``; the scorer's params class must
+    live in a module the scorer imports. Only a ``sealed``
     evaluation validates on the dataset's sealed tail (``record(sealed_from=...)``),
     it validates nothing before the tail, and it scores each pipeline once.
     """

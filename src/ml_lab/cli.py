@@ -246,14 +246,16 @@ def _experiments(
     declared = found[0]
     evaluations = cast(
         "Iterable[Evaluation]",
-        declared(_dataset(ledger, args.dataset)) if callable(declared) else declared,
+        declared(dataset.resolve(ledger, args.dataset))
+        if callable(declared)
+        else declared,
     )
     evaluations = [
         dataclasses.replace(e, dataset_id=dataset.resolve(ledger, e.dataset_id))
         for e in evaluations
     ]
     if args.dataset and not callable(found[0]):
-        chosen = _dataset(ledger, args.dataset)
+        chosen = dataset.resolve(ledger, args.dataset)
         off = [e.name or e.id for e in evaluations if e.dataset_id != chosen]
         if off:
             raise Refused(
@@ -280,43 +282,6 @@ def _code_root(module: Any) -> pathlib.Path:
             "since provenance names a commit"
         )
     return root
-
-
-def _dataset(ledger: Ledger, selector: str | None) -> str:
-    """Resolve ``--dataset`` to one dataset id.
-
-    The selector is an id prefix or a source; with none, the newest dataset,
-    provided every dataset in the ledger shares one source. A source written by
-    several actors resolves to the newest dataset the running actor recorded under
-    it, and is refused with every actor's id when the running actor recorded none,
-    since the newest would silently be someone else's.
-    """
-    rows = ledger.sql("SELECT id, source, actor FROM event_dataset ORDER BY seq")
-    by_source: dict[str, str] = {r["source"]: r["id"] for r in rows}
-    if selector is None and len(by_source) == 1:
-        selector = rows[-1]["source"]
-    named = [r for r in rows if r["source"] == selector]
-    if len({r["actor"] for r in named}) > 1:
-        own = [r for r in named if r["actor"] == actor()]
-        if not own:
-            raise Refused(
-                f"source {selector} names datasets by several actors, none by "
-                f"{actor()}; pass an id: "
-                + ", ".join(f"{r['id'][:8]} ({r['actor']})" for r in named)
-            )
-        return own[-1]["id"]
-    if selector in by_source:
-        return by_source[selector]
-    if selector:
-        return dataset.resolve(ledger, selector)
-    if len(by_source) > 1:
-        choices = ", ".join(f"{s} ({i[:8]})" for s, i in by_source.items())
-        raise Refused(f"ledger holds several sources, pass --dataset: {choices}")
-    if not rows:
-        raise Refused(
-            f"dataset (newest): 0 matches in {ledger.root.resolve()}; lab ingest first"
-        )
-    return rows[-1]["id"]
 
 
 def _load(spec: str) -> Any:

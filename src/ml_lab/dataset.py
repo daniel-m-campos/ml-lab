@@ -35,7 +35,7 @@ import polars as pl
 from ml_lab import dates, formats, identity
 from ml_lab.formats import TS
 from ml_lab.identity import Refused
-from ml_lab.ledger import Event, Ledger
+from ml_lab.ledger import Event, Ledger, actor
 
 Range = tuple[int, int]
 Rows = Range | tuple[Range, ...]
@@ -669,16 +669,62 @@ def data_id(
     )
 
 
-def resolve(ledger: Ledger, prefix: str) -> str:
-    """The one recorded dataset id starting with ``prefix``; none or several are
-    refused, naming the matches.
+def resolve(ledger: Ledger, selector: str | None = None) -> str:
+    """One recorded dataset id from a selector, the rule behind ``lab run --dataset``
+    and ``Evaluation.dataset_id``.
+
+    Parameters
+    ----------
+    ledger : Ledger
+        The ledger holding the datasets.
+    selector : str, optional
+        A source, an id, or an id prefix; None for the newest dataset, allowed when
+        the ledger holds one source.
+
+    Returns
+    -------
+    str
+        The dataset id. A source resolves to the newest dataset under it; one that
+        several actors wrote under resolves to the newest the running actor recorded.
+
+    Raises
+    ------
+    Refused
+        When the ledger holds no dataset or several sources and no selector was
+        given, when a prefix matches none or several ids, naming them, or when a
+        source names datasets by several actors and none by the running actor,
+        naming every actor's id, since the newest would silently be someone else's.
     """
-    rows = ledger.sql("SELECT id FROM event_dataset ORDER BY seq")
-    matches = [r["id"] for r in rows if r["id"].startswith(prefix)]
+    rows = ledger.sql("SELECT id, source, actor FROM event_dataset ORDER BY seq")
+    sources = {r["source"] for r in rows}
+    if selector is None:
+        if len(sources) > 1:
+            newest = {r["source"]: r["id"] for r in rows}
+            choices = ", ".join(f"{s} ({i[:8]})" for s, i in newest.items())
+            raise Refused(f"ledger holds several sources, pass --dataset: {choices}")
+        if not rows:
+            raise Refused(
+                f"dataset (newest): 0 matches in {ledger.root.resolve()}; "
+                "lab ingest first"
+            )
+        selector = rows[-1]["source"]
+    named = [r for r in rows if r["source"] == selector]
+    if len({r["actor"] for r in named}) > 1:
+        own = [r for r in named if r["actor"] == actor()]
+        if not own:
+            raise Refused(
+                f"source {selector} names datasets by several actors, none by "
+                f"{actor()}; pass an id: "
+                + ", ".join(f"{r['id'][:8]} ({r['actor']})" for r in named)
+            )
+        return own[-1]["id"]
+    if named:
+        return named[-1]["id"]
+    matches = [r["id"] for r in rows if r["id"].startswith(selector)]
     if len(matches) != 1:
         hint = "pass a longer prefix: " + ", ".join(matches)
         raise Refused(
-            f"dataset {prefix}: {len(matches)} matches in {ledger.root.resolve()}; "
+            f"dataset {selector}: {len(matches)} matches in {ledger.root.resolve()}; "
             f"{hint if matches else 'lab ingest first'}"
         )
     return matches[0]
