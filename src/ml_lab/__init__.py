@@ -12,22 +12,25 @@ from ml_lab.splits import Fold, inner_split
 
 __version__ = importlib.metadata.version("ml-lab")
 __all__ = [
+    # declaring a study: the ledger, its datasets, pipelines and evaluations
+    "Ledger",
     "Dataset",
+    "record",
+    "Pipeline",
+    "Scorer",
     "Evaluation",
+    # writing a pipeline's functions
     "FitView",
     "Fitted",
     "Fold",
-    "Ledger",
-    "Pipeline",
     "Range",
-    "Scorer",
     "Segments",
     "inner_split",
-    "load",
     "mean_blend",
-    "note",
+    # reading the log back
+    "load",
+    "predictions",
     "paired",
     "paired_sets",
-    "predictions",
-    "record",
+    "note",
 ]

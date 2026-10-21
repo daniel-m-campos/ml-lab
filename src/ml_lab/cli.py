@@ -1,4 +1,4 @@
-"""``lab``: the command line over the log, two verbs; reading is SQL over the views.
+"""``lab``: the command line over the log, three verbs; reading is SQL over the views.
 
 Declarations are plain module attributes, so a project may organize them freely: one
 script, or ``dataset.py`` + ``functions.py`` + ``experiment.py``, or a file per idea.
@@ -16,7 +16,7 @@ directory or a ``.py`` path, imported without writing bytecode. The dataset defa
 to the newest one recorded when the ledger holds one source. The ledger root comes
 from ``--root``, before or after the verb, or ``ML_LAB_ROOT`` (default ``.ml-lab``);
 only ``lab ingest`` creates one, and ``lab run`` refuses a root without a ledger. The
-actor comes from ``ML_LAB_ACTOR``; both verbs refuse it unset.
+actor comes from ``ML_LAB_ACTOR``; every verb refuses it unset.
 
 Examples
 --------
