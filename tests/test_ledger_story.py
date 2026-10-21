@@ -60,7 +60,7 @@ from ml_lab.dataset import (
     stratified_order,
 )
 from ml_lab.experiment import Evaluation, Pipeline, Scorer
-from ml_lab.ledger import Event, Ledger, Refused
+from ml_lab.ledger import SCHEMA_VERSION, VIEWS_VERSION, Event, Ledger, Refused
 from ml_lab.panel import Panel
 from ml_lab.stages import load_predictions
 from tests import synthetic
@@ -3764,6 +3764,32 @@ def test_predictions_reads_the_latest_scored_test_predictions_in_fold_order(
         assert read.score == row["score"]
     with pytest.raises(Refused, match="no score of pipeline"):
         ml_lab.predictions(ledger, evaluation.id, synthetic.ridge(12).id)
+
+
+def test_the_read_contract_names_its_versions_and_carries_the_concept_columns(
+    ledger, dataset, evaluation
+):
+    (meta,) = ledger.sql("SELECT * FROM ml_lab")
+    assert meta == {
+        "schema": SCHEMA_VERSION,
+        "views": VIEWS_VERSION,
+        "version": ml_lab.__version__,
+    }
+    one = synthetic.ridge(1)
+    _run(ledger, evaluation, one)
+    (recorded,) = ledger.sql("SELECT targets, params, sealed_from FROM event_dataset")
+    assert synthetic.TARGET in json.loads(recorded["targets"])
+    assert json.loads(recorded["params"]) == {"seed": 7} or recorded["params"]
+    assert recorded["sealed_from"] is None
+    (declared,) = ledger.sql("SELECT split, sealed FROM event_evaluation")
+    assert json.loads(declared["split"])["__type__"].endswith("CalendarWalkForward")
+    assert declared["sealed"] == 0
+    (latest,) = ledger.sql("SELECT at, score FROM score_latest")
+    assert latest["at"] > 0
+    ml_lab.note(ledger, "baseline", about=[one.id, latest["score"]], tag="tag")
+    rows = ledger.sql("SELECT note, tag, text, about FROM note_about ORDER BY about")
+    assert {r["about"] for r in rows} == {one.id, latest["score"]}
+    assert {(r["tag"], r["text"]) for r in rows} == {("tag", "baseline")}
 
 
 def test_a_fit_records_its_facts_beside_the_model(ledger, evaluation):

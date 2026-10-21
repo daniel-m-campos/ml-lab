@@ -17,6 +17,7 @@ Examples
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import pathlib
@@ -31,6 +32,9 @@ from ml_lab import identity
 from ml_lab.identity import Refused
 
 SCHEMA_VERSION = 17
+VIEWS_VERSION = 1
+"""The read contract's version: moves when a documented view column is renamed or
+removed, never when one is added; ``SELECT * FROM ml_lab`` reports both."""
 ACTOR_ENV = "ML_LAB_ACTOR"
 BUSY_TIMEOUT_S = 5.0
 
@@ -69,6 +73,9 @@ CREATE VIEW event_dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.window[0]') AS span_start,
   json_extract(payload,'$.window[1]') AS span_end,
   json_extract(payload,'$.recipe') AS recipe,
+  json_extract(payload,'$.recipe.targets') AS targets,
+  json_extract(payload,'$.recipe.params') AS params,
+  json_extract(payload,'$.sealed_from') AS sealed_from,
   json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
   json_extract(payload,'$.blob.format') AS format
 FROM event WHERE type='dataset_recorded';
@@ -84,6 +91,8 @@ CREATE VIEW event_evaluation AS SELECT seq, key AS id, at, actor,
   json_extract(payload,'$.dataset') AS dataset,
   json_extract(payload,'$.metrics') AS directions,
   json_extract(payload,'$.declaration.scorer_params') AS scorer_params,
+  json_extract(payload,'$.declaration.split') AS split,
+  COALESCE(json_extract(payload,'$.declaration.sealed'), 0) AS sealed,
   json_extract(payload,'$.declaration') AS declaration,
   json_extract(payload,'$.folds') AS folds
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY key ORDER BY seq DESC) AS rn
@@ -193,10 +202,10 @@ CREATE VIEW score_latest AS WITH c AS MATERIALIZED (
   SELECT DISTINCT evaluation, pipeline FROM pipeline_current),
 v AS MATERIALIZED (SELECT evaluation FROM evaluation_current)
 SELECT l.evaluation, e.name AS evaluation_name,
-  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq,
+  l.pipeline, p.name, e.dataset, d.source, l.actor, l.score, l.run, l.seq, l.at,
   CASE WHEN c.pipeline IS NOT NULL AND (e.name = '' OR v.evaluation IS NOT NULL)
     THEN 1 ELSE 0 END AS current
-FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq,
+FROM (SELECT evaluation, pipeline, actor, id AS score, run, seq, at,
         ROW_NUMBER() OVER (PARTITION BY evaluation, pipeline ORDER BY seq DESC) AS rn
       FROM event_score) l
 JOIN event_pipeline p ON p.id = l.pipeline
@@ -282,6 +291,10 @@ CREATE VIEW event_note AS SELECT seq, id, at, actor, key AS tag,
   json_extract(payload,'$.text') AS text, json_extract(payload,'$.about') AS about
 FROM event WHERE type='note_recorded';
 
+CREATE VIEW note_about AS SELECT n.seq, n.id AS note, n.at, n.actor, n.tag, n.text,
+  a.value AS about
+FROM event_note n, json_each(n.about) a;
+
 CREATE VIEW event_failure AS SELECT seq, id, at, actor, host,
   stream AS evaluation,
   key AS pipeline, json_extract(payload,'$.run') AS run,
@@ -311,10 +324,13 @@ class Ledger:
                 "a cache of code plus data, delete the root and rerun"
             )
         views = self._db.execute("SELECT name FROM sqlite_master WHERE type='view'")
-        names = {n for (n,) in views.fetchall()} | set(re.findall(r"VIEW (\w+)", VIEWS))
+        shipped = VIEWS + _meta_view()
+        names = {n for (n,) in views.fetchall()} | set(
+            re.findall(r"VIEW (\w+)", shipped)
+        )
         drops = "".join(f"DROP VIEW IF EXISTS {n};" for n in sorted(names))
         self._db.executescript(
-            f"BEGIN IMMEDIATE; {DDL} {drops} {VIEWS} "
+            f"BEGIN IMMEDIATE; {DDL} {drops} {shipped} "
             f"PRAGMA user_version={SCHEMA_VERSION}; COMMIT;"
         )
 
@@ -468,6 +484,17 @@ def actor() -> str:
             "log for many writers"
         )
     return os.environ[ACTOR_ENV]
+
+
+def _meta_view() -> str:
+    """The one-row ``ml_lab`` view a reader asserts on: the schema and view versions
+    and the tool's version.
+    """
+    version = importlib.metadata.version("ml-lab")
+    return (
+        f"CREATE VIEW ml_lab AS SELECT {SCHEMA_VERSION} AS schema, "
+        f"{VIEWS_VERSION} AS views, '{version}' AS version;"
+    )
 
 
 def _wal(db: sqlite3.Connection):
