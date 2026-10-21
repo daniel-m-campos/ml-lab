@@ -280,7 +280,7 @@ def predictions(ledger: Ledger, evaluation: str, pipeline: str) -> Predictions:
             f"{ledger.root}; pass the ids board lists"
         )
     score = rows[0]["score"]
-    by_fold = _latest(ledger, Event.SCORE, score)["payload"]["predictions"]
+    by_fold = ledger.event(Event.SCORE, score)["payload"]["predictions"]
     events = [
         ledger.event(Event.PREDICTIONS, by_fold[fold])
         for fold in sorted(by_fold, key=int)
@@ -344,31 +344,20 @@ def _fold_values(
     return values
 
 
-def _latest(ledger: Ledger, kind: str, key: str) -> dict[str, Any]:
-    """The newest event of a kind under a key, refused when there is none."""
-    event = ledger.latest(kind, key)
-    if event is None:
-        raise Refused(f"{kind} {key} is not in {ledger.root}")
-    return event
-
-
-def _evaluation(ledger: Ledger, score: str) -> str:
-    """The evaluation id a score was recorded under."""
-    return _latest(ledger, Event.SCORE, score)["stream"]
+def _evaluation(ledger: Ledger, score: str) -> dict[str, Any]:
+    """The payload of the evaluation a score was recorded under."""
+    recorded = ledger.event(Event.SCORE, score)
+    return ledger.event(Event.EVALUATION, recorded["stream"])["payload"]
 
 
 def _dataset(ledger: Ledger, score: str) -> str:
     """The dataset id of a score's evaluation."""
-    evaluation = _latest(ledger, Event.EVALUATION, _evaluation(ledger, score))
-    return evaluation["payload"]["dataset"]
+    return _evaluation(ledger, score)["dataset"]
 
 
 def _tests(ledger: Ledger, score: str) -> list[list[int]]:
     """The test ranges of a score's evaluation, in fold order."""
-    folds = _latest(ledger, Event.EVALUATION, _evaluation(ledger, score))["payload"][
-        "folds"
-    ]
-    return [f["test"] for f in folds]
+    return [f["test"] for f in _evaluation(ledger, score)["folds"]]
 
 
 def _covered(ledger: Ledger, score: str) -> list[list[int]]:
@@ -377,11 +366,8 @@ def _covered(ledger: Ledger, score: str) -> list[list[int]]:
     Refused when the folds are not in row order, since the series then does not
     read as one row sequence.
     """
-    folds = _latest(ledger, Event.EVALUATION, _evaluation(ledger, score))["payload"][
-        "folds"
-    ]
     merged: list[list[int]] = []
-    for lo, hi in (f["test"] for f in folds):
+    for lo, hi in _tests(ledger, score):
         if merged and lo < merged[-1][1]:
             raise Refused(
                 f"score {score}: its evaluation's folds are not in row order; pair "

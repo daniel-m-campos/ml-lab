@@ -382,7 +382,7 @@ class Ledger:
         """The newest event of a type under a key, which the log must hold."""
         found = self.latest(type, key)
         if found is None:
-            raise KeyError(f"no {type} event under {key} in {self.root}")
+            raise Refused(f"no {type} event under {key} in {self.root.resolve()}")
         return found
 
     def sql(self, query: str, params: tuple | list = ()) -> list[dict[str, Any]]:
