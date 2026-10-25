@@ -695,7 +695,57 @@ def test_a_blend_fit_of_three_parameters_predicts_no_train_range_and_four_do(
     assert "equal" in _latest(ledger, evaluation)
     learned = dataclasses.replace(fixed, fit=synthetic.blend_fit, name="learned")
     assert not _run(ledger, evaluation, learned).failed
-    assert _count(ledger, "event_prediction") > _count(ledger, "event_fit")
+    members = (
+        "SELECT json_extract(payload, '$.member_predictions') AS members FROM event "
+        "WHERE type = 'fit_computed' AND json_extract(payload, '$.pipeline') = ?"
+    )
+    assert all(r["members"] is None for r in ledger.sql(members, (fixed.id,)))
+    assert all(r["members"] is not None for r in ledger.sql(members, (learned.id,)))
+
+
+def test_a_learned_blend_fits_on_its_members_out_of_fold_predictions(
+    ledger, evaluation
+):
+    one, three = synthetic.ridge(1), synthetic.ridge(3)
+    learned = synthetic.blend(one, three)
+    assert not _run(ledger, evaluation, learned).failed
+    folds = json.loads(
+        ledger.sql("SELECT folds FROM event_evaluation WHERE id = ?", (evaluation.id,))[
+            0
+        ]["folds"]
+    )
+    for fold in folds:
+        inner = ledger.sql(
+            "SELECT train FROM event_fit WHERE pipeline = ? AND label LIKE ?",
+            (one.id, f"{fold['label']} oof %"),
+        )
+        assert len(inner) == splits.OOF_SPLITS
+        recorded = ledger.sql(
+            "SELECT json_extract(payload, '$.member_predictions') AS members "
+            "FROM event WHERE type = 'fit_computed' "
+            "AND json_extract(payload, '$.pipeline') = ? "
+            "AND json_extract(payload, '$.label') = ?",
+            (learned.id, fold["label"]),
+        )
+        members = json.loads(recorded[0]["members"])
+        assert len(members) == 2
+        blocks = []
+        for pred_id in members[0]:
+            row = ledger.sql(
+                "SELECT fit, range_start, range_end FROM event_prediction WHERE id = ?",
+                (pred_id,),
+            )[0]
+            train = json.loads(
+                ledger.sql("SELECT train FROM event_fit WHERE id = ?", (row["fit"],))[
+                    0
+                ]["train"]
+            )
+            block = (row["range_start"], row["range_end"])
+            assert all(hi <= block[0] or lo >= block[1] for lo, hi in train)
+            blocks.append(block)
+        covered = sum(hi - lo for lo, hi in blocks)
+        assert covered == sum(hi - lo for lo, hi in fold["train"])
+        assert blocks == sorted(blocks)
 
 
 def test_a_dry_run_counts_shared_work_once_as_the_run_does(
@@ -1856,9 +1906,11 @@ def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evalua
     one, three = synthetic.ridge(1), synthetic.ridge(3)
     _run(ledger, evaluation, one, three)
     report = _run(ledger, evaluation, synthetic.blend(one, three))
-    assert report.fits_reused == 2 * len(folds) and report.fits_computed == len(folds)
+    inner = 2 * splits.OOF_SPLITS
+    assert report.fits_reused == 2 * len(folds)
+    assert report.fits_computed == (1 + inner) * len(folds)
     assert report.predictions_reused == 2 * len(folds)
-    assert report.predictions_computed == 3 * len(folds)
+    assert report.predictions_computed == (1 + inner) * len(folds)
     assert report.scores_recorded == 1
     blended = [e for e in ledger.events(Event.PREDICTIONS) if "members" in e["payload"]]
     first = blended[0]
@@ -1876,7 +1928,7 @@ def test_a_blend_reuses_its_members_fits_and_predictions(ledger, dataset, evalua
     ).fits_computed == len(folds)
 
 
-def test_a_member_postprocess_change_refits_an_in_sample_blend(ledger, evaluation):
+def test_a_member_postprocess_change_refits_a_learned_blend(ledger, evaluation):
     member = synthetic.ridge(1)
     first = _run(ledger, evaluation, synthetic.blend(member))
     shifted = dataclasses.replace(
@@ -1884,7 +1936,7 @@ def test_a_member_postprocess_change_refits_an_in_sample_blend(ledger, evaluatio
     )
     second = _run(ledger, evaluation, synthetic.blend(shifted))
     assert not first.failed and not second.failed
-    assert second.fits_computed == first.fits_computed // 2 > 0
+    assert first.fits_computed == (2 + splits.OOF_SPLITS) * second.fits_computed > 0
 
 
 def test_every_fit_of_a_nested_blend_names_a_declared_pipeline(ledger, evaluation):

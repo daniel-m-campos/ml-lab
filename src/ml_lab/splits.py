@@ -17,6 +17,8 @@ Examples
 >>> BlockedKFold(n_splits=5, embargo_rows=600).folds(dataset)[2].label  # doctest: +SKIP
 'block 2'
 >>> inner, valid = inner_split(dataset, train, 0.1)  # inside fit  # doctest: +SKIP
+>>> oof_folds(dataset, train, "block 2")[0].label  # doctest: +SKIP
+'block 2 oof 0'
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ import numpy as np
 from ml_lab import dates
 from ml_lab.dataset import Dataset, FitView, Range, Segments, known_before
 from ml_lab.identity import Refused
+
+OOF_SPLITS = 5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -326,6 +330,80 @@ def inner_split(
     return inner, (at, end)
 
 
+def oof_folds(dataset: FitView, train: Segments, label: str = "") -> list[Fold]:
+    """Cut a fold's train segments into ``OOF_SPLITS`` contiguous blocks, each a fold
+    that trains on the other train rows and predicts the block: the out-of-fold
+    predictions a learned blend receives.
+
+    The blocks tile the train rows in order, cut over the segments as one row range,
+    every inner bound snapped to the first row of its timestamp. A block's train is
+    purged on both sides as the evaluation purges: the view's embargo before and after
+    the block, and before it every row whose label the view's reveal lags say is not
+    known when the block starts. A block the segments split in two yields a fold per
+    part, sharing the train. A ``group`` column is not honoured.
+
+    Parameters
+    ----------
+    dataset : FitView
+        The view the blend's fit receives; its clock, embargo and reveal lags drive the
+        cut and the purge.
+    train : Segments
+        The fold's train segments.
+    label : str
+        The fold's label; each block's fold is labelled ``"<label> oof <k>"``.
+
+    Returns
+    -------
+    list[Fold]
+        One fold per block part, in row order.
+
+    Raises
+    ------
+    Refused
+        When ``train`` holds fewer rows than blocks, a block comes out empty, or the
+        purge leaves a block no train row.
+    """
+    rows = sum(hi - lo for lo, hi in train)
+    if not train or rows < OOF_SPLITS:
+        raise Refused(
+            f"out-of-fold predictions cut the train rows into {OOF_SPLITS} blocks, "
+            f"{rows} rows given"
+        )
+    bounds = [train[0][0]]
+    bounds += [
+        _snap(dataset, _absolute(train, round(i * rows / OOF_SPLITS)))
+        for i in range(1, OOF_SPLITS)
+    ]
+    bounds.append(train[-1][1])
+    out = []
+    for k in range(OOF_SPLITS):
+        lo, hi = bounds[k], bounds[k + 1]
+        blocks = [(max(lo, a), min(hi, b)) for a, b in train if max(lo, a) < min(hi, b)]
+        if not blocks:
+            raise Refused(
+                f"block {k} of the out-of-fold cut is empty: the timestamps snap its "
+                f"bounds {lo}:{hi} together"
+            )
+        before = purge(dataset, lo, dataset.embargo_rows, dataset.embargo_timestamps)
+        for lag in dataset.reveal.values():
+            before = min(before, known_before(dataset, lo, lag))
+        after = _advance(dataset, hi + dataset.embargo_rows, dataset.embargo_timestamps)
+        inner = tuple(
+            seg
+            for a, b in train
+            for seg in ((a, min(b, before)), (max(a, after), b))
+            if seg[0] < seg[1]
+        )
+        if not inner:
+            raise Refused(
+                f"the embargo and reveal lags purge every train row around block {k} "
+                f"of the out-of-fold cut, rows {lo}:{hi}"
+            )
+        name = f"{label} oof {k}".strip()
+        out.extend(Fold(name, inner, block) for block in blocks)
+    return out
+
+
 def purge(
     dataset: Dataset | FitView,
     cut: int,
@@ -372,6 +450,26 @@ def _train_rows(dataset: Dataset, train_size: int | float) -> int:
     if isinstance(train_size, int):
         return train_size
     return round(dataset.rows * train_size)
+
+
+def _absolute(train: Segments, offset: int) -> int:
+    """The row ``offset`` rows into the train segments read as one range."""
+    for lo, hi in train:
+        if offset <= hi - lo:
+            return lo + offset
+        offset -= hi - lo
+    return train[-1][1]
+
+
+def _advance(dataset: Dataset | FitView, row: int, timestamps: int) -> int:
+    """The first row ``timestamps`` distinct timestamps after ``row``'s; ``row`` itself
+    without a clock.
+    """
+    for _ in range(timestamps):
+        if dataset.ts is None or not 0 <= row < dataset.rows:
+            break
+        row = int(np.searchsorted(dataset.ts, dataset.ts[row], "right"))
+    return row
 
 
 def _snap(

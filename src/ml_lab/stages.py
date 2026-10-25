@@ -47,7 +47,7 @@ from ml_lab.guards import (
 )
 from ml_lab.ledger import Event, Ledger, Refused
 from ml_lab.provenance import lock_text
-from ml_lab.splits import Fold
+from ml_lab.splits import Fold, oof_folds
 
 # Public Functions ===================================================================
 
@@ -170,7 +170,7 @@ class Stage:
             )
         fit = _declared(self.pipeline.fit, self.name, "fit")
         train_preds = (
-            self._train_predictions(member_fits, fold, index)
+            self._train_predictions(fold, index)
             if self.pipeline.learns_from_members
             else []
         )
@@ -199,14 +199,11 @@ class Stage:
                 f"would fit {self.name} {fold.label}: {self._why(fold.label, train)}"
             )
             return fit_id
-        split = self.run.evaluation.split
-        visible = FitView(
+        visible = self._fit_view(
             self.features.visible(max(hi for _, hi in fold.train)).train_view(
                 fold.train
             ),
-            fold.train,
-            embargo_rows=getattr(split, "embargo_rows", 0),
-            embargo_timestamps=getattr(split, "embargo_timestamps", 0),
+            fold,
         )
         if self.pipeline.prepare is not None:
             prepared = self._prepare(self.pipeline.prepare, visible, fold, columns_id)
@@ -259,6 +256,7 @@ class Stage:
                 "duration_s": duration,
                 "model": blob,
                 **({"members": member_fits} if self.members else {}),
+                **({"member_predictions": train_preds} if train_preds else {}),
                 **({"features": columns_id} if columns_id else {}),
                 **({"facts": facts} if facts is not None else {}),
             },
@@ -267,10 +265,16 @@ class Stage:
         return fit_id
 
     def predictions(
-        self, fit_id: str, fold: Fold, index: int, rows: Range, train: bool = False
+        self,
+        fit_id: str,
+        fold: Fold,
+        index: int,
+        rows: Range,
+        train: Segments | None = None,
     ) -> str:
-        """The prediction id over ``rows``: the fold's test range, or with ``train`` one
-        of its train segments, seen through the fit's view, for an in-sample blend.
+        """The prediction id over ``rows``: the fold's test range, or with ``train`` a
+        block of an out-of-fold cut, seen with every column blank outside ``train``
+        as a learned blend's fit sees it.
         """
         member_fits = [m.fit(fold, index) for m in self.members]
         member_preds = [
@@ -331,8 +335,8 @@ class Stage:
             ),
         }
         visible = self.features.visible(rows[1])
-        if train:
-            visible = visible.train_view(fold.train)
+        if train is not None:
+            visible = visible.train_view(train)
         visible = visible.masked(self.run.targets, rows[0])
         self.run.start()
         if self.run.ledger.latest(Event.PREDICTIONS, raw_id) is not None:
@@ -370,7 +374,7 @@ class Stage:
                 rows,
             )
             self._check_imports("predict", loaded)
-            if self.pipeline.postprocess is None and not train:
+            if self.pipeline.postprocess is None and train is None:
                 self._refuse_non_finite("predict", raw, fold, rows)
             raw = self._write(raw_id, raw, where)
             self.run.log(f"predictions {self.name} rows {rows[0]}:{rows[1]}")
@@ -394,7 +398,7 @@ class Stage:
                 rows,
             )
             self._check_imports("postprocess", loaded)
-            if not train:
+            if train is None:
                 self._refuse_non_finite("postprocess", post, fold, rows)
             self._write(
                 pred_id,
@@ -463,12 +467,30 @@ class Stage:
         seconds = pending.payload["duration_s"]
         self.run.log(f"fit {self.name} {fold.label} {seconds:.1f}s: {pending.why}")
 
-    def _train_predictions(
-        self, member_fits: list[str], fold: Fold, index: int
-    ) -> list[list[str]]:
+    def _fit_view(self, data: Dataset, fold: Fold) -> FitView:
+        """``data`` as the fit of ``fold`` sees it, with the evaluation's embargo."""
+        split = self.run.evaluation.split
+        return FitView(
+            data,
+            fold.train,
+            embargo_rows=getattr(split, "embargo_rows", 0),
+            embargo_timestamps=getattr(split, "embargo_timestamps", 0),
+        )
+
+    def _train_predictions(self, fold: Fold, index: int) -> list[list[str]]:
+        """The members' out-of-fold prediction ids over the fold's train segments, in
+        row order: each member fit on the train rows outside a block of the cut and
+        predicting the block through the fold's train view.
+        """
+        inner = oof_folds(
+            self._fit_view(self.run.dataset, fold), fold.train, fold.label
+        )
         return [
-            [member.predictions(fit_id, fold, index, seg, True) for seg in fold.train]
-            for member, fit_id in zip(self.members, member_fits, strict=True)
+            [
+                m.predictions(m.fit(f, index), f, index, f.test, fold.train)
+                for f in inner
+            ]
+            for m in self.members
         ]
 
     def _unchanged(self, stage: str):

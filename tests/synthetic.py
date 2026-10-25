@@ -79,11 +79,11 @@ class RidgeModel:
 def ridge_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> RidgeModel:
     rows = train
     if dataset.ts is not None and config.train_window_months:
-        start, end = train[0][0], train[-1][1]
+        end = train[-1][1]
         since = dataset.index_of(
             add_months(dataset.date_at(end - 1), -config.train_window_months)
         )
-        rows = ((max(start, since), end),)
+        rows = tuple((max(lo, since), hi) for lo, hi in train if hi > since)
     X = dataset.matrix(config.columns, rows)
     y = dataset.column(TARGET, rows)
     x_mean, y_mean = X.mean(axis=0), y.mean()
@@ -277,7 +277,7 @@ class BlendModel:
 def blend_fit(
     dataset: FitView, train: Segments, config: BlendConfig, members: list[np.ndarray]
 ) -> BlendModel:
-    """Least squares on the members' in-sample predictions, shrunk toward equal."""
+    """Least squares on the members' out-of-fold predictions, shrunk toward equal."""
     x = np.column_stack(members)
     y = dataset.column(TARGET, train)
     fitted = np.linalg.lstsq(x, y, rcond=None)[0]
@@ -300,7 +300,7 @@ def blend_load(payload: bytes) -> BlendModel:
 
 
 def equal_fit(dataset: FitView, train: Segments, config: BlendConfig) -> BlendModel:
-    """Fixed equal weights: three parameters, so no in-sample member predictions."""
+    """Fixed equal weights: three parameters, so no member predictions."""
     return BlendModel(np.full(2, 0.5))
 
 
