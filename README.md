@@ -183,6 +183,7 @@ lab ingest project/dataset.py 20                     # calls dataset(ledger, "20
 lab run project/experiment.py                        # the newest dataset when the ledger holds one source; otherwise --dataset <source or id prefix>
 lab run project/experiment.py ideas/agent7.py        # pipelines from both files, the evaluations from one
 lab run project/experiment.py --dry-run              # every id computed, nothing written: what would fit and why; a new feature set is computed and probed, and kept for the run that follows
+lab run project/experiment.py --reference ridge_1m   # after each evaluation, one line per pipeline and metric: fold mean and spread, paired t and wins against the reference
 lab note "ridge_shrunk replaces ridge" --tag decision --about <pipeline id> <score id>   # a record about ids the log holds, read from event_note
 ```
 

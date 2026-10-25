@@ -78,6 +78,11 @@ def main(argv: list[str] | None = None) -> int:
         help="write nothing; say what a run would compute and why, computing and "
         "probing a new feature set on its first span so its ids are real",
     )
+    p.add_argument(
+        "--reference",
+        help="a pipeline name or id prefix among those run; each evaluation's "
+        "summary then adds the paired t and wins against it",
+    )
     p.set_defaults(handler=_run)
 
     p = sub.add_parser(
@@ -137,6 +142,7 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
     not memoized and a rerun retries it.
     """
     pipelines, evaluations, modules = _experiments(args, ledger)
+    reference = _reference(pipelines, args.reference)
     home = next(m for m in modules if hasattr(m, "evaluations"))
     root = _code_root(home)
     failed: dict[str, str] = {}
@@ -178,6 +184,10 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
             )
         else:
             print(f"run {report.run}: {_counts(report)}")
+        if not args.dry_run:
+            scored = [p for p in live if p.id not in report.failed_ids]
+            for line in _summary(ledger, evaluation, scored, reference):
+                print(line)
     if len(evaluations) > 1:
         verb = "would compute" if args.dry_run else "computed"
         print(
@@ -196,6 +206,73 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 # Private Functions ====================================================================
+
+
+def _reference(pipelines: list[Pipeline], selector: str | None) -> Pipeline | None:
+    """The pipeline ``--reference`` names, by name or id prefix, or None without one."""
+    if selector is None:
+        return None
+    found = [p for p in pipelines if selector in (p.name, p.id[: len(selector)])]
+    if len(found) != 1:
+        names = ", ".join(f"{p.id} {p.name}".rstrip() for p in pipelines)
+        raise Refused(
+            f"--reference {selector!r} matches {len(found)} of the pipelines run: "
+            f"{names}"
+        )
+    return found[0]
+
+
+def _summary(
+    ledger: Ledger,
+    evaluation: Evaluation,
+    pipelines: list[Pipeline],
+    reference: Pipeline | None,
+) -> list[str]:
+    """One line per scored pipeline and metric: the fold mean and spread from
+    ``board``, and against ``reference`` the paired t and wins from ``head_to_head``.
+    """
+    if not pipelines:
+        return []
+    ids = [p.id for p in pipelines]
+    marks = ", ".join("?" * len(ids))
+    rows = ledger.sql(
+        "SELECT metric, name, pipeline, fold_mean, fold_std, n_folds FROM board "
+        f"WHERE evaluation = ? AND pipeline IN ({marks}) ORDER BY metric, rank, name",
+        (evaluation.id, *ids),
+    )
+    paired: dict[tuple[str, str], dict[str, Any]] = {}
+    if reference is not None:
+        paired = {
+            (r["metric"], r["pipeline"]): r
+            for r in ledger.sql(
+                "SELECT metric, pipeline, t, wins, n_folds FROM head_to_head "
+                f"WHERE evaluation = ? AND reference = ? AND pipeline IN ({marks})",
+                (evaluation.id, reference.id, *ids),
+            )
+        }
+    lines = []
+    for r in rows:
+        label = r["name"] or r["pipeline"]
+        line = (
+            f"  {r['metric']} {label}: {_number(r['fold_mean'])} "
+            f"±{_number(r['fold_std'])} over {r['n_folds']} folds"
+        )
+        pair = paired.get((r["metric"], r["pipeline"]))
+        if pair is not None and reference is not None:
+            against = reference.name or reference.id
+            line += (
+                f"; t {_number(pair['t'], '+')}, wins {pair['wins']}/{pair['n_folds']} "
+                f"vs {against}"
+            )
+        lines.append(line)
+    return lines
+
+
+def _number(value: Any, sign: str = "") -> str:
+    """A metric as five significant digits, or ``-`` when there is none."""
+    if value is None:
+        return "-"
+    return f"{value:{sign}.5g}"
 
 
 def _counts(report: runs.RunReport) -> str:
