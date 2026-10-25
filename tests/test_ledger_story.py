@@ -758,6 +758,30 @@ def test_a_rank_blend_ranks_against_its_members_train_predictions(ledger, evalua
     assert values.min() > 0 and values.max() <= 1
     with pytest.raises(Refused, match="at least two members"):
         ml_lab.rank_blend(one)
+
+
+def test_lab_run_summarises_each_evaluation_against_a_reference(
+    ledger, dataset, scratch, capsys
+):
+    shared = scratch / "ref.py"
+    shared.write_text(
+        "from tests import synthetic\n"
+        "pipelines = [synthetic.ridge(1), synthetic.ridge(3)]\n"
+        "def evaluations(d):\n    return [synthetic.evaluation(d)]\n"
+    )
+    args = ["--root", str(ledger.root), "run", str(shared)]
+    assert cli.main([*args, "--reference", "ridge_1m"]) == 0
+    out = capsys.readouterr().out
+    line = r"^  pnl ridge_3m: \S+ ±\S+ over \d+ folds; t [+-]\S+, wins \d+/\d+ vs "
+    assert re.search(line + "ridge_1m$", out, re.M), out
+    assert cli.main(args) == 0
+    assert re.search(
+        r"^  pnl ridge_3m: \S+ ±\S+ over \d+ folds$", capsys.readouterr().out, re.M
+    )
+    assert cli.main([*args, "--reference", "nope"]) == 1
+    assert "matches 0 of the pipelines run" in capsys.readouterr().err
+
+
 def test_a_dry_run_counts_shared_work_once_as_the_run_does(
     ledger, dataset, scratch, capsys
 ):
