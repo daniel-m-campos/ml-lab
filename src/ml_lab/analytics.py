@@ -242,7 +242,7 @@ def predictions(ledger: Ledger, evaluation: str, pipeline: str) -> Predictions:
     """A pipeline's latest scored test predictions under an evaluation.
 
     The latest score's prediction ids are the folds' test predictions and nothing
-    else, so a blend's in-sample ranges never enter. The counterpart of ``load`` for
+    else, so a blend's out-of-fold ranges never enter. The counterpart of ``load`` for
     datasets.
 
     Parameters

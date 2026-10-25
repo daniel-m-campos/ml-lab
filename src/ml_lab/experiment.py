@@ -93,9 +93,12 @@ class Pipeline:
     ----------
     fit : Callable | None
         ``fit(dataset, train, params) -> model``, with ``dataset`` a ``FitView``. A
-        blend's ``fit`` may take a fourth positional parameter and then receives the
-        members' predictions over the train segments; those are in-sample, so a
-        weight learned on them overfits. ``fit=None`` declares a stateless blend: no
+        blend's ``fit`` may take a fourth positional parameter and then learns from
+        its members: it receives their out-of-fold predictions over the train
+        segments, ``splits.oof_folds`` cutting the train rows into contiguous blocks,
+        each member fit on the rows outside a block, purged as the evaluation
+        purges, and predicting it; every inner fit and prediction is memoized like
+        the fold's own. ``fit=None`` declares a stateless blend: no
         model, no fit recorded, ``predict`` receives None as the model, and the
         predictions hash the members' fit ids; ``mean_blend`` declares one.
     predict : Callable
@@ -173,7 +176,7 @@ class Pipeline:
 
     @property
     def learns_from_members(self) -> bool:
-        """Whether ``fit`` receives the members' in-sample predictions: a blend whose
+        """Whether ``fit`` receives the members' out-of-fold predictions: a blend whose
         ``fit`` takes a fourth positional parameter.
         """
         if self.fit is None or not self.members:
