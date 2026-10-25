@@ -120,14 +120,17 @@ SELECT r.evaluation, r.name, r.pipeline, r.run, r.seq FROM run_pipeline r
 JOIN newest n ON n.evaluation = r.evaluation AND n.name = r.name AND n.seq = r.seq;
 
 CREATE VIEW evaluation_current AS WITH named AS (
-  SELECT json_extract(payload,'$.name') AS name, key AS evaluation, seq FROM event
+  SELECT json_extract(payload,'$.dataset') AS dataset,
+    json_extract(payload,'$.name') AS name, key AS evaluation, seq FROM event
   WHERE type='evaluation_declared'
   UNION ALL
-  SELECT json_extract(d.payload,'$.name'), r.stream, r.seq FROM event r
+  SELECT json_extract(d.payload,'$.dataset'), json_extract(d.payload,'$.name'),
+    r.stream, r.seq FROM event r
   JOIN event d ON d.type='evaluation_declared' AND d.key = r.stream
   WHERE r.type='run_started')
-SELECT name, evaluation, seq FROM (
-  SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY seq DESC) AS rn FROM named)
+SELECT dataset, name, evaluation, seq FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY dataset, name ORDER BY seq DESC) AS rn
+  FROM named)
 WHERE rn = 1 AND name <> '';
 
 CREATE VIEW event_feature AS SELECT seq, id, at, actor, host, stream AS dataset,
