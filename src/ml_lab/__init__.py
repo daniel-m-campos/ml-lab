@@ -6,7 +6,14 @@ import importlib.metadata
 
 from ml_lab.analytics import paired, paired_sets, predictions
 from ml_lab.dataset import Dataset, FitView, Range, Segments, load, record
-from ml_lab.experiment import Evaluation, Fitted, Pipeline, Scorer, mean_blend
+from ml_lab.experiment import (
+    Evaluation,
+    Fitted,
+    Pipeline,
+    Scorer,
+    mean_blend,
+    rank_blend,
+)
 from ml_lab.ledger import Ledger, note
 from ml_lab.splits import Fold, inner_split
 
@@ -27,6 +34,7 @@ __all__ = [
     "Segments",
     "inner_split",
     "mean_blend",
+    "rank_blend",
     # reading the log back
     "load",
     "predictions",

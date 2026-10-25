@@ -515,6 +515,7 @@ def test_the_package_exports_what_a_project_imports():
         "paired",
         "paired_sets",
         "predictions",
+        "rank_blend",
         "record",
     ]
     assert ml_lab.record is record and ml_lab.Fold is splits.Fold
@@ -748,6 +749,15 @@ def test_a_learned_blend_fits_on_its_members_out_of_fold_predictions(
         assert blocks == sorted(blocks)
 
 
+def test_a_rank_blend_ranks_against_its_members_train_predictions(ledger, evaluation):
+    one, three = synthetic.ridge(1), synthetic.ridge(3)
+    ranked = ml_lab.rank_blend(one, three, name="ranked")
+    report = _run(ledger, evaluation, ranked)
+    assert not report.failed, report.failed
+    values = ml_lab.predictions(ledger, evaluation.id, ranked.id).values
+    assert values.min() > 0 and values.max() <= 1
+    with pytest.raises(Refused, match="at least two members"):
+        ml_lab.rank_blend(one)
 def test_a_dry_run_counts_shared_work_once_as_the_run_does(
     ledger, dataset, scratch, capsys
 ):

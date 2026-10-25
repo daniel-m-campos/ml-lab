@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from ml_lab import identity
+from ml_lab import formats, identity
 from ml_lab.identity import Refused
 
 
@@ -259,6 +259,108 @@ def mean_blend(*members: Pipeline, name: str = "") -> Pipeline:
     return Pipeline(fit=None, predict=mean_predict, members=members, name=name)
 
 
+def rank_blend(*members: Pipeline, name: str = "") -> Pipeline:
+    """A learned blend: the mean of its members' ranks, each member's prediction
+    ranked against that member's out-of-fold predictions over the train segments.
+
+    A rank over the predicted range reads later rows, so the tool's prefix probe
+    refuses it; ranking against the fit's own distribution is row-causal and gives
+    the same order over a range the members' calibrations differ on. The fit is
+    ``rank_fit`` and the model the members' sorted out-of-fold predictions, so a
+    rank blend costs each member the inner fits a learned blend costs.
+
+    Parameters
+    ----------
+    *members : Pipeline
+        At least two pipelines whose one-column predictions are ranked.
+    name : str, optional
+        The blend's label.
+
+    Returns
+    -------
+    Pipeline
+        The blend, with ``rank_fit`` and ``rank_predict``.
+
+    Raises
+    ------
+    Refused
+        With fewer than two members.
+    """
+    if len(members) < 2:
+        raise Refused("rank_blend takes at least two members")
+    return Pipeline(
+        fit=rank_fit,
+        predict=rank_predict,
+        save=formats.arrays_save,
+        load=formats.arrays_load,
+        format=formats.Format.ARROW_ARRAYS,
+        members=members,
+        name=name,
+    )
+
+
+def rank_fit(
+    dataset: Any, train: Any, params: None, members: list[Any]
+) -> dict[str, np.ndarray]:
+    """Each member's out-of-fold predictions over the train segments, sorted: the
+    distribution ``rank_predict`` ranks against.
+
+    Parameters
+    ----------
+    dataset : FitView
+        Unused; the view ``fit`` receives.
+    train : Segments
+        Unused; the train segments.
+    params : None
+        A rank blend has no params.
+    members : list
+        The members' out-of-fold predictions over the train segments.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        The sorted predictions by member position.
+
+    Raises
+    ------
+    Refused
+        When a member predicts more than one column.
+    """
+    return {str(i): np.sort(_one_column(m, i)) for i, m in enumerate(members)}
+
+
+def rank_predict(
+    model: dict[str, np.ndarray],
+    dataset: Any,
+    rows: tuple[int, int],
+    members: list[Any],
+) -> np.ndarray:
+    """The mean over members of each prediction's quantile in that member's sorted
+    out-of-fold predictions, in (0, 1].
+
+    Parameters
+    ----------
+    model : dict[str, np.ndarray]
+        What ``rank_fit`` returned.
+    dataset : Any
+        Unused; the view ``predict`` receives.
+    rows : tuple[int, int]
+        The range predicted.
+    members : list
+        The members' predictions over the range.
+
+    Returns
+    -------
+    np.ndarray
+        One quantile mean per row.
+    """
+    quantiles = [
+        np.searchsorted(model[str(i)], _one_column(m, i), "right") / len(model[str(i)])
+        for i, m in enumerate(members)
+    ]
+    return np.mean(quantiles, axis=0)
+
+
 def mean_predict(
     model: None, dataset: Any, rows: tuple[int, int], members: list[Any]
 ) -> Any:
@@ -328,3 +430,16 @@ class Evaluation:
     @property
     def id(self) -> str:
         return identity.content_hash(self)
+
+
+def _one_column(values: Any, member: int) -> np.ndarray:
+    """A member's predictions as one float column."""
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim == 2 and array.shape[1] == 1:
+        array = array[:, 0]
+    if array.ndim != 1:
+        raise Refused(
+            f"rank_blend ranks one column per member; member {member} predicts "
+            f"{array.shape[1:]} columns"
+        )
+    return array
