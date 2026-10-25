@@ -772,11 +772,13 @@ def test_lab_run_summarises_each_evaluation_against_a_reference(
     args = ["--root", str(ledger.root), "run", str(shared)]
     assert cli.main([*args, "--reference", "ridge_1m"]) == 0
     out = capsys.readouterr().out
-    line = r"^  pnl ridge_3m: \S+ ±\S+ over \d+ folds; t [+-]\S+, wins \d+/\d+ vs "
-    assert re.search(line + "ridge_1m$", out, re.M), out
+    line = r"^  pnl ridge_3m: \S+ ±\S+ over \d+ folds, fit \S+ s; t [+-]\S+, wins "
+    assert re.search(line + r"\d+/\d+ vs ridge_1m$", out, re.M), out
     assert cli.main(args) == 0
     assert re.search(
-        r"^  pnl ridge_3m: \S+ ±\S+ over \d+ folds$", capsys.readouterr().out, re.M
+        r"^  pnl ridge_3m: \S+ ±\S+ over \d+ folds, fit \S+ s$",
+        capsys.readouterr().out,
+        re.M,
     )
     assert cli.main([*args, "--reference", "nope"]) == 1
     assert "matches 0 of the pipelines run" in capsys.readouterr().err
