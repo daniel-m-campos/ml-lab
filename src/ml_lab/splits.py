@@ -192,20 +192,22 @@ class CalendarWalkForward:
 class BlockedKFold:
     """``n_splits`` contiguous blocks over the first ``train_size`` of rows, the rows
     ``Holdout(train_size)`` trains on; each is scored once with the rest as train.
-    ``embargo_rows`` cuts the train side: it drops that many train rows on either side
-    of the scored block. With ``group``, a column whose groups are contiguous, every
-    cut moves to the first row of its group, so no group is split.
+    ``train_size`` is a fraction of the rows, or an int, that many rows, so a sealed
+    tail is named by its first row and the cut cannot round past it. ``embargo_rows``
+    cuts the train side: it drops that many train rows on either side of the scored
+    block. With ``group``, a column whose groups are contiguous, every cut moves to
+    the first row of its group, so no group is split.
     """
 
     n_splits: int
     embargo_rows: int = 0
-    train_size: float = 1.0
+    train_size: int | float = 1.0
     group: str | None = None
 
     def folds(self, dataset: Dataset) -> list[Fold]:
         _require(n_splits=(self.n_splits, 2), embargo_rows=(self.embargo_rows, 0))
         starts = _group_starts(dataset, self.group)
-        n = _snap(dataset, round(dataset.rows * self.train_size), starts)
+        n = _snap(dataset, _train_rows(dataset, self.train_size), starts)
         bounds = [
             _snap(dataset, round(i * n / self.n_splits), starts)
             for i in range(self.n_splits + 1)
@@ -225,12 +227,13 @@ class BlockedKFold:
 @dataclasses.dataclass(frozen=True)
 class Holdout:
     """One fold: the first ``train_size`` of rows train and the rest is scored.
-    ``embargo_rows`` cuts the test side: it drops that many rows after the cut from
-    the scored range. With ``group``, a column whose groups are contiguous, the cut
-    moves to the first row of its group.
+    ``train_size`` is a fraction of the rows, or an int, that many rows, so a sealed
+    tail is named by its first row. ``embargo_rows`` cuts the test side: it drops
+    that many rows after the cut from the scored range. With ``group``, a column
+    whose groups are contiguous, the cut moves to the first row of its group.
     """
 
-    train_size: float = 0.7
+    train_size: int | float = 0.7
     embargo_rows: int = 0
     group: str | None = None
 
@@ -238,7 +241,9 @@ class Holdout:
         _require(embargo_rows=(self.embargo_rows, 0))
         n = dataset.rows
         cut = _snap(
-            dataset, round(n * self.train_size), _group_starts(dataset, self.group)
+            dataset,
+            _train_rows(dataset, self.train_size),
+            _group_starts(dataset, self.group),
         )
         test = (min(cut + self.embargo_rows, n), n)
         return _at_least([Fold("holdout", ((0, cut),), test)], 1)
@@ -356,6 +361,17 @@ def purge(
         elif cut:
             cut -= 1
     return cut
+
+
+def _train_rows(dataset: Dataset, train_size: int | float) -> int:
+    """The rows ``train_size`` names: a fraction of the dataset's rounded to a row,
+    or an int as it is.
+    """
+    if isinstance(train_size, bool) or not isinstance(train_size, (int, float)):
+        raise Refused(f"train_size={train_size!r}: a fraction, or an int count of rows")
+    if isinstance(train_size, int):
+        return train_size
+    return round(dataset.rows * train_size)
 
 
 def _snap(

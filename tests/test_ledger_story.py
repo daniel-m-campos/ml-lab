@@ -825,6 +825,12 @@ def test_row_splits_cut_on_timestamp_boundaries():
     assert walk.train == ((0, 42),) and walk.test == (42, 63)
     bare = Dataset({"x": np.zeros(70)})
     assert splits.Holdout(0.75).folds(bare)[0].train == ((0, 52),)
+    assert splits.Holdout(52).folds(bare) == splits.Holdout(0.75).folds(bare)
+    assert splits.Holdout(49).folds(dataset) == splits.Holdout(0.75).folds(dataset)
+    blocks = splits.BlockedKFold(n_splits=3, train_size=49).folds(dataset)
+    assert [f.test for f in blocks] == [(0, 14), (14, 28), (28, 49)]
+    with pytest.raises(Refused, match="a fraction, or an int count of rows"):
+        splits.Holdout(True).folds(bare)
 
 
 def test_a_grouped_split_cuts_on_group_starts_and_refuses_a_recurring_group():

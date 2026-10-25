@@ -145,7 +145,7 @@ An evaluation is a split and a scorer over one dataset. The split turns the data
 | row 3000 | rows 0 to 3000 | rows 3000 to 4000 |
 | row 4000 | rows 0 to 4000 | rows 4000 to 5000 |
 
-`BlockedKFold(n_splits=5)` validates each of five blocks with the other four as train, `Holdout(train_size=0.8)` is one fold, `WalkForward(max_train_rows=1000)` trains on a rolling window, and `embargo_rows` drops rows between the two ranges. `group="g"` on `BlockedKFold` or `Holdout` moves each cut to the first row of its group, so no group is split; a group that recurs after another is refused. Decay is another evaluation: `WalkForward(horizon=3)` scores the third block after each cutoff and shares every fit with `horizon=1` through the memo, so it costs predictions only.
+`BlockedKFold(n_splits=5)` validates each of five blocks with the other four as train, `Holdout(train_size=0.8)` is one fold (`train_size` is a fraction, or an int count of rows, so a sealed tail is named by its first row), `WalkForward(max_train_rows=1000)` trains on a rolling window, and `embargo_rows` drops rows between the two ranges. `group="g"` on `BlockedKFold` or `Holdout` moves each cut to the first row of its group, so no group is split; a group that recurs after another is refused. Decay is another evaluation: `WalkForward(horizon=3)` scores the third block after each cutoff and shares every fit with `horizon=1` through the memo, so it costs predictions only.
 
 Growing it:
 
