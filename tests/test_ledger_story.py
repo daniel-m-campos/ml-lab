@@ -906,6 +906,22 @@ def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
     ) == identity.content_hash(splits.BlockedKFold(n_splits=5, train_size=1.0))
 
 
+def test_a_kfold_with_train_only_rows_never_scores_them_and_keeps_its_id():
+    dataset = Dataset({"x": np.zeros(70)})
+    folds = splits.BlockedKFold(n_splits=3, train_only_rows=10).folds(dataset)
+    assert [f.test for f in folds] == [(10, 30), (30, 50), (50, 70)]
+    assert all(f.train[0][0] == 0 and f.train[0][1] >= 10 for f in folds)
+    plain = splits.BlockedKFold(n_splits=3).folds(Dataset({"x": np.zeros(60)}))
+    assert [(lo - 10, hi - 10) for f in folds for lo, hi in [f.test]] == [
+        f.test for f in plain
+    ]
+    assert identity.content_hash(
+        splits.BlockedKFold(n_splits=3)
+    ) == identity.content_hash(splits.BlockedKFold(n_splits=3, train_only_rows=0))
+    with pytest.raises(Refused, match="leaves no row to score"):
+        splits.BlockedKFold(n_splits=3, train_only_rows=70).folds(dataset)
+
+
 def test_a_clockless_dataset_fits_on_segments_and_refuses_walk_forward(ledger):
     bare = Dataset(
         {

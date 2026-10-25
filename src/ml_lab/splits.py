@@ -200,20 +200,34 @@ class BlockedKFold:
     tail is named by its first row and the cut cannot round past it. ``embargo_rows``
     cuts the train side: it drops that many train rows on either side of the scored
     block. With ``group``, a column whose groups are contiguous, every cut moves to
-    the first row of its group, so no group is split.
+    the first row of its group, so no group is split. The first ``train_only_rows``
+    rows are train in every fold and never scored: auxiliary rows, another table of
+    the same columns ingested ahead of the rows a model is judged on, so the blocks
+    tile the rows after them and match a split without them row for row.
     """
 
     n_splits: int
     embargo_rows: int = 0
     train_size: int | float = 1.0
     group: str | None = None
+    train_only_rows: int = 0
 
     def folds(self, dataset: Dataset) -> list[Fold]:
-        _require(n_splits=(self.n_splits, 2), embargo_rows=(self.embargo_rows, 0))
+        _require(
+            n_splits=(self.n_splits, 2),
+            embargo_rows=(self.embargo_rows, 0),
+            train_only_rows=(self.train_only_rows, 0),
+        )
         starts = _group_starts(dataset, self.group)
         n = _snap(dataset, _train_rows(dataset, self.train_size), starts)
+        head = self.train_only_rows
+        if head >= n:
+            raise Refused(
+                f"train_only_rows={head} leaves no row to score before row {n}, "
+                "where the split ends"
+            )
         bounds = [
-            _snap(dataset, round(i * n / self.n_splits), starts)
+            _snap(dataset, head + round(i * (n - head) / self.n_splits), starts)
             for i in range(self.n_splits + 1)
         ]
         out = []
