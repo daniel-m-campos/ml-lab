@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import importlib
+import json
 import os
 import pathlib
 import sys
@@ -229,17 +230,28 @@ def _summary(
     reference: Pipeline | None,
 ) -> list[str]:
     """One line per scored pipeline and metric: the fold mean and spread from
-    ``board``, and against ``reference`` the paired t and wins from ``head_to_head``.
+    ``board``, the fit seconds the score stands on, against ``reference`` the paired
+    t and wins from ``head_to_head``, and the fits' numeric facts as ranges.
     """
     if not pipelines:
         return []
     ids = [p.id for p in pipelines]
     marks = ", ".join("?" * len(ids))
     rows = ledger.sql(
-        "SELECT metric, name, pipeline, fold_mean, fold_std, n_folds FROM board "
+        "SELECT metric, name, pipeline, score, fold_mean, fold_std, n_folds FROM board "
         f"WHERE evaluation = ? AND pipeline IN ({marks}) ORDER BY metric, rank, name",
         (evaluation.id, *ids),
     )
+    scores = sorted({r["score"] for r in rows})
+    score_marks = ", ".join("?" * len(scores))
+    fits = ledger.sql(
+        "SELECT sf.score, SUM(sf.duration_s) AS seconds, "
+        "json_group_array(f.facts) AS facts FROM score_fit sf "
+        f"JOIN event_fit f ON f.id = sf.fit WHERE sf.score IN ({score_marks}) "
+        "GROUP BY sf.score",
+        tuple(scores),
+    )
+    costs = {r["score"]: r for r in fits}
     paired: dict[tuple[str, str], dict[str, Any]] = {}
     if reference is not None:
         paired = {
@@ -257,6 +269,9 @@ def _summary(
             f"  {r['metric']} {label}: {_number(r['fold_mean'])} "
             f"±{_number(r['fold_std'])} over {r['n_folds']} folds"
         )
+        cost = costs.get(r["score"])
+        if cost is not None:
+            line += f", fit {_number(cost['seconds'])} s"
         pair = paired.get((r["metric"], r["pipeline"]))
         if pair is not None and reference is not None:
             against = reference.name or reference.id
@@ -264,8 +279,23 @@ def _summary(
                 f"; t {_number(pair['t'], '+')}, wins {pair['wins']}/{pair['n_folds']} "
                 f"vs {against}"
             )
+        if cost is not None:
+            facts = _fact_ranges(json.loads(cost["facts"]))
+            line += f"; {facts}" if facts else ""
         lines.append(line)
     return lines
+
+
+def _fact_ranges(facts: list[str | None]) -> str:
+    """The numeric keys of the fits' facts as ``key lo..hi`` over the fits."""
+    spans: dict[str, list[float]] = {}
+    for text in facts:
+        for key, value in (json.loads(text) if text else {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                spans.setdefault(key, []).append(value)
+    return ", ".join(
+        f"{key} {_number(min(v))}..{_number(max(v))}" for key, v in spans.items()
+    )
 
 
 def _number(value: Any, sign: str = "") -> str:
