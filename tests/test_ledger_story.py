@@ -3739,6 +3739,12 @@ def test_current_drops_an_evaluation_re_declared_under_its_name(ledger, evaluati
     rows = ledger.sql(query, (one.id,))
     assert (evaluation.id, 1) in [(r["evaluation"], r["current"]) for r in rows]
     assert _count(ledger, "evaluation_current") == 1
+    elsewhere = dataclasses.replace(house, dataset_id=synthetic.dataset(ledger, seed=8))
+    _run(ledger, elsewhere, one)
+    rows = ledger.sql(query, (one.id,))
+    current = {r["evaluation"] for r in rows if r["current"]}
+    assert {house.id, elsewhere.id} <= current and cheaper.id not in current
+    assert _count(ledger, "evaluation_current") == 2
 
 
 def test_predictions_reads_the_latest_scored_test_predictions_in_fold_order(
