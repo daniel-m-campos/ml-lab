@@ -278,7 +278,9 @@ def inner_split(
 
     For early stopping or any choice made on held-out rows. The validation range is
     the tail of the last train segment, its start snapped to the first row of its
-    timestamp. The inner train is the train segments before it, purged as the
+    timestamp, or that whole segment when it holds no more rows than asked and
+    earlier segments remain to train on, as the inner train of an out-of-fold block
+    can. The inner train is the train segments before it, purged as the
     evaluation purges: the view's embargo, then every row whose label the view's
     reveal lags say is not known when the validation starts, so a round count chosen
     here reads no label the fold's own test would hide. A ``group`` column is not
@@ -325,7 +327,7 @@ def inner_split(
         )
     start, end = train[-1]
     at = _snap(dataset, max(end - held, start))
-    if at <= start or at >= end:
+    if at >= end or (at <= start and len(train) == 1):
         raise Refused(
             f"validation of {held} rows leaves no inner train or no validation in the "
             f"last train segment {train[-1]}; ask for fewer rows or a smaller fraction"
