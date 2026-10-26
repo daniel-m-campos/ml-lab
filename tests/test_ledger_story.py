@@ -4056,8 +4056,7 @@ def test_inner_split_cuts_a_validation_tail_purged_as_the_evaluation_would(
         ((0, 500), (1000, 1250)),
         (1250, 2000),
     )
-    with pytest.raises(Refused, match="no inner train or no validation"):
-        splits.inner_split(view, two, 1000)
+    assert splits.inner_split(view, two, 1000) == (((0, 500),), (1000, 2000))
     with pytest.raises(Refused, match="a count of rows, or a fraction"):
         splits.inner_split(view, train, 1.5)
     chooser = dataclasses.replace(
