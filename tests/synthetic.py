@@ -232,6 +232,13 @@ def inner_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     return Fitted(model, {"alpha": best, "inner": inner, "validation": valid})
 
 
+def boundary_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
+    """Records the split's train-only boundary the view carries."""
+    return Fitted(
+        ridge_fit(dataset, train, config), {"train_only_rows": dataset.train_only_rows}
+    )
+
+
 def bad_facts_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     return Fitted(ridge_fit(dataset, train, config), {"when": object()})
 

@@ -271,6 +271,10 @@ class FitView:
     embargo_timestamps : int
         The evaluation split's timestamp embargo, 0 when it has none; with
         ``embargo_rows`` what ``splits.inner_split`` purges by.
+    train_only_rows : int
+        The split's ``train_only_rows``, 0 when it has none: the first rows are
+        auxiliary, train in every fold and never scored, so a fit can read them
+        apart from the rows it is judged on.
     prepared : Any
         What the pipeline's ``prepare`` built for this train range; None without one.
     """
@@ -279,6 +283,7 @@ class FitView:
     train: Segments
     embargo_rows: int = 0
     embargo_timestamps: int = 0
+    train_only_rows: int = 0
     prepared: Any = None
 
     def __repr__(self) -> str:

@@ -468,13 +468,16 @@ class Stage:
         self.run.log(f"fit {self.name} {fold.label} {seconds:.1f}s: {pending.why}")
 
     def _fit_view(self, data: Dataset, fold: Fold) -> FitView:
-        """``data`` as the fit of ``fold`` sees it, with the evaluation's embargo."""
+        """``data`` as the fit of ``fold`` sees it, with the evaluation's embargo and
+        train-only rows.
+        """
         split = self.run.evaluation.split
         return FitView(
             data,
             fold.train,
             embargo_rows=getattr(split, "embargo_rows", 0),
             embargo_timestamps=getattr(split, "embargo_timestamps", 0),
+            train_only_rows=getattr(split, "train_only_rows", 0),
         )
 
     def _train_predictions(self, fold: Fold, index: int) -> list[list[str]]:

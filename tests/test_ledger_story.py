@@ -942,6 +942,21 @@ def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
     ) == identity.content_hash(splits.BlockedKFold(n_splits=5, train_size=1.0))
 
 
+def test_a_fit_reads_the_split_train_only_rows_on_its_view(ledger, dataset):
+    split = splits.BlockedKFold(n_splits=3, train_only_rows=500)
+    evaluation = synthetic.evaluation(dataset, split=split)
+    bounded = dataclasses.replace(
+        synthetic.ridge(0), fit=synthetic.boundary_fit, name="bounded"
+    )
+    assert not _run(ledger, evaluation, bounded).failed
+    facts = ledger.sql(
+        "SELECT json_extract(facts, '$.train_only_rows') AS rows FROM event_fit "
+        "WHERE pipeline = ?",
+        (bounded.id,),
+    )
+    assert facts and all(r["rows"] == 500 for r in facts)
+
+
 def test_a_kfold_with_train_only_rows_never_scores_them_and_keeps_its_id():
     dataset = Dataset({"x": np.zeros(70)})
     folds = splits.BlockedKFold(n_splits=3, train_only_rows=10).folds(dataset)
