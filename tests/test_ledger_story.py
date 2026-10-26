@@ -4040,7 +4040,7 @@ def test_inner_split_cuts_a_validation_tail_purged_as_the_evaluation_would(
     short = ((0, 1500), (1700, 1800))
     assert splits.inner_split(view, short, 0.1) == (((0, 1500),), (1700, 1800))
     with pytest.raises(Refused, match="leaves no inner train or no validation"):
-        splits.inner_split(view, ((1700, 1800),), 0.9)
+        splits.inner_split(view, ((1700, 1800),), 100)
     stamped = dataclasses.replace(view, embargo_timestamps=2)
     assert splits.inner_split(stamped, train, 0.1)[0] == ((0, 1798),)
     assert splits.inner_split(stamped, train, 0.1, embargo_timestamps=0)[0] == (
