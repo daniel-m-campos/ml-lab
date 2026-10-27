@@ -76,6 +76,7 @@ CREATE VIEW event_dataset AS SELECT seq, id, at, actor,
   json_extract(payload,'$.recipe.targets') AS targets,
   json_extract(payload,'$.recipe.params') AS params,
   json_extract(payload,'$.sealed_from') AS sealed_from,
+  COALESCE(json_extract(payload,'$.auxiliary_rows'), 0) AS auxiliary_rows,
   json_extract(payload,'$.rows') AS rows, json_extract(payload,'$.blob.sha') AS blob,
   json_extract(payload,'$.blob.format') AS format
 FROM event WHERE type='dataset_recorded';

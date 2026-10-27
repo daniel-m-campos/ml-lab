@@ -49,6 +49,7 @@ from ml_lab import (
 )
 from ml_lab.dataset import (
     Dataset,
+    FitView,
     Range,
     Segments,
     data_id,
@@ -946,20 +947,97 @@ def test_a_kfold_stops_where_holdout_cuts_and_keeps_its_id(ledger, dataset):
     ) == identity.content_hash(splits.BlockedKFold(n_splits=5, train_size=1.0))
 
 
-def test_a_kfold_with_train_only_rows_never_scores_them_and_keeps_its_id():
-    dataset = Dataset({"x": np.zeros(70)})
-    folds = splits.BlockedKFold(n_splits=3, train_only_rows=10).folds(dataset)
+def test_a_kfold_tiles_the_rows_after_the_auxiliary_head_and_never_scores_it():
+    dataset = Dataset({"x": np.zeros(70)}, auxiliary_rows=10)
+    folds = splits.BlockedKFold(n_splits=3).folds(dataset)
     assert [f.test for f in folds] == [(10, 30), (30, 50), (50, 70)]
     assert all(f.train[0][0] == 0 and f.train[0][1] >= 10 for f in folds)
     plain = splits.BlockedKFold(n_splits=3).folds(Dataset({"x": np.zeros(60)}))
     assert [(lo - 10, hi - 10) for f in folds for lo, hi in [f.test]] == [
         f.test for f in plain
     ]
-    assert identity.content_hash(
-        splits.BlockedKFold(n_splits=3)
-    ) == identity.content_hash(splits.BlockedKFold(n_splits=3, train_only_rows=0))
-    with pytest.raises(Refused, match="leaves no row to score"):
-        splits.BlockedKFold(n_splits=3, train_only_rows=70).folds(dataset)
+    with pytest.raises(Refused, match="inside the dataset's 10 auxiliary rows"):
+        splits.BlockedKFold(n_splits=3, train_size=10).folds(dataset)
+
+
+def test_the_out_of_fold_cut_skips_the_auxiliary_head_and_trains_on_it():
+    view = FitView(Dataset({"x": np.zeros(70)}, auxiliary_rows=10), ((0, 70),))
+    folds = splits.oof_folds(view, ((0, 70),), "block 0")
+    assert [f.test for f in folds] == [(10, 22), (22, 34), (34, 46), (46, 58), (58, 70)]
+    assert folds[0].train == ((0, 10), (22, 70))
+    assert folds[-1].train == ((0, 58),)
+    assert splits.inner_split(view, ((0, 70),), 30) == (((0, 40),), (40, 70))
+    with pytest.raises(Refused, match="after the dataset's 10 auxiliary rows"):
+        splits.inner_split(view, ((0, 70),), 65)
+
+
+def test_an_auxiliary_head_is_recorded_snapped_and_enters_the_id(ledger):
+    open_id = _record(ledger, _dataset())
+    kwargs: dict[str, Any] = {"source": "s", "params": {}, "targets": ("y",)}
+    headed = record(ledger, _dataset(), auxiliary_rows=4, **kwargs)
+    assert headed != open_id
+    assert ledger.latest(Event.DATASET, headed)["payload"]["auxiliary_rows"] == 4
+    assert load(ledger, headed).auxiliary_rows == 4
+    assert load(ledger, open_id).auxiliary_rows == 0
+    heads = ledger.sql("SELECT id, auxiliary_rows FROM event_dataset")
+    assert {r["id"]: r["auxiliary_rows"] for r in heads} == {open_id: 0, headed: 4}
+    clock = np.datetime64("2025-01-01", "ns") + np.repeat(np.arange(12), 4).astype(
+        "timedelta64[h]"
+    )
+    snapped = record(
+        ledger, Dataset(_dataset().columns, clock), auxiliary_rows=22, **kwargs
+    )
+    assert ledger.latest(Event.DATASET, snapped)["payload"]["auxiliary_rows"] == 20
+    with pytest.raises(
+        Refused, match="no row to judge before the sealed tail at row 40"
+    ):
+        record(ledger, _dataset(), auxiliary_rows=40, sealed_from=40, **kwargs)
+    with pytest.raises(Refused, match="no row to judge before the end at row 48"):
+        record(ledger, _dataset(), auxiliary_rows=48, **kwargs)
+    with pytest.raises(TypeError, match="a count of leading rows"):
+        record(ledger, _dataset(), auxiliary_rows=kwargs.get("none", 4.0), **kwargs)
+
+
+def _headed(ledger: Ledger, head: int = 200) -> tuple[str, int]:
+    rows = synthetic.generate(
+        start="2025-01-01", months=12, rows_per_day=20, seed=7, drift_at="2025-07-01"
+    )
+    dataset = record(
+        ledger,
+        rows,
+        source="synthetic",
+        params={"head": head},
+        targets=(synthetic.TARGET,),
+        auxiliary_rows=head,
+    )
+    return dataset, rows.rows
+
+
+def test_an_evaluation_that_scores_an_auxiliary_row_is_refused(ledger):
+    dataset, n = _headed(ledger)
+    split = splits.Holdout(train_size=100)
+    with pytest.raises(
+        Refused,
+        match=rf"fold holdout validates rows 100 to {n}, inside the dataset's 200 ",
+    ):
+        _run(ledger, synthetic.evaluation(dataset, split=split), synthetic.ridge(1))
+
+
+def test_a_fit_reads_the_auxiliary_head_on_its_view(ledger):
+    dataset, n = _headed(ledger)
+    split = splits.BlockedKFold(n_splits=3)
+    folds = split.folds(load(ledger, dataset))
+    assert folds[0].test[0] == 200 and folds[-1].test[1] == n
+    headed = dataclasses.replace(
+        synthetic.ridge(0), fit=synthetic.headed_fit, name="headed"
+    )
+    assert not _run(ledger, synthetic.evaluation(dataset, split=split), headed).failed
+    facts = ledger.sql(
+        "SELECT json_extract(facts, '$.auxiliary_rows') AS head FROM event_fit "
+        "WHERE pipeline = ?",
+        (headed.id,),
+    )
+    assert len(facts) == 3 and all(r["head"] == 200 for r in facts)
 
 
 def test_a_clockless_dataset_fits_on_segments_and_refuses_walk_forward(ledger):

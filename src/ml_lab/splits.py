@@ -200,31 +200,26 @@ class BlockedKFold:
     tail is named by its first row and the cut cannot round past it. ``embargo_rows``
     cuts the train side: it drops that many train rows on either side of the scored
     block. With ``group``, a column whose groups are contiguous, every cut moves to
-    the first row of its group, so no group is split. The first ``train_only_rows``
-    rows are train in every fold and never scored: auxiliary rows, another table of
-    the same columns ingested ahead of the rows a model is judged on, so the blocks
-    tile the rows after them and match a split without them row for row.
+    the first row of its group, so no group is split. The dataset's auxiliary rows
+    are train in every fold and never scored: the blocks tile the rows after them,
+    so they match a split of the judged rows alone row for row.
     """
 
     n_splits: int
     embargo_rows: int = 0
     train_size: int | float = 1.0
     group: str | None = None
-    train_only_rows: int = 0
 
     def folds(self, dataset: Dataset) -> list[Fold]:
-        _require(
-            n_splits=(self.n_splits, 2),
-            embargo_rows=(self.embargo_rows, 0),
-            train_only_rows=(self.train_only_rows, 0),
-        )
+        _require(n_splits=(self.n_splits, 2), embargo_rows=(self.embargo_rows, 0))
         starts = _group_starts(dataset, self.group)
         n = _snap(dataset, _train_rows(dataset, self.train_size), starts)
-        head = self.train_only_rows
+        head = dataset.auxiliary_rows
         if head >= n:
             raise Refused(
-                f"train_only_rows={head} leaves no row to score before row {n}, "
-                "where the split ends"
+                f"train_size={self.train_size!r} ends the split at row {n}, inside the "
+                f"dataset's {head} auxiliary rows, which are never scored; make it "
+                f"larger than {head}"
             )
         bounds = [
             _snap(dataset, head + round(i * (n - head) / self.n_splits), starts)
@@ -280,7 +275,8 @@ def inner_split(
     the tail of the last train segment, its start snapped to the first row of its
     timestamp, or that whole segment when it holds no more rows than asked and
     earlier segments remain to train on, as the inner train of an out-of-fold block
-    can. The inner train is the train segments before it, purged as the
+    can; it never reaches into the dataset's auxiliary rows, which are judged by no
+    evaluation. The inner train is the train segments before it, purged as the
     evaluation purges: the view's embargo, then every row whose label the view's
     reveal lags say is not known when the validation starts, so a round count chosen
     here reads no label the fold's own test would hide. A ``group`` column is not
@@ -326,11 +322,15 @@ def inner_split(
             f"validation {validation!r}: a count of rows, or a fraction in (0, 1)"
         )
     start, end = train[-1]
+    head = dataset.auxiliary_rows
+    start = max(start, head)
     at = _snap(dataset, max(end - held, start))
     if at >= end or (at <= start and len(train) == 1):
+        where = f" after the dataset's {head} auxiliary rows" if head else ""
         raise Refused(
             f"validation of {held} rows leaves no inner train or no validation in the "
-            f"last train segment {train[-1]}; ask for fewer rows or a smaller fraction"
+            f"last train segment {train[-1]}{where}; ask for fewer rows or a smaller "
+            "fraction"
         )
     if embargo_timestamps is None:
         embargo_timestamps = dataset.embargo_timestamps
@@ -351,12 +351,14 @@ def oof_folds(dataset: FitView, train: Segments, label: str = "") -> list[Fold]:
     that trains on the other train rows and predicts the block: the out-of-fold
     predictions a learned blend receives.
 
-    The blocks tile the train rows in order, cut over the segments as one row range,
-    every inner bound snapped to the first row of its timestamp. A block's train is
-    purged on both sides as the evaluation purges: the view's embargo before and after
-    the block, and before it every row whose label the view's reveal lags say is not
-    known when the block starts. A block the segments split in two yields a fold per
-    part, sharing the train. A ``group`` column is not honoured.
+    The blocks tile the train rows after the dataset's auxiliary rows in order, cut
+    over the segments as one row range, every inner bound snapped to the first row of
+    its timestamp; the auxiliary rows stay in every block's train, as they do in
+    every fold's. A block's train is purged on both sides as the evaluation purges:
+    the view's embargo before and after the block, and before it every row whose
+    label the view's reveal lags say is not known when the block starts. A block the
+    segments split in two yields a fold per part, sharing the train. A ``group``
+    column is not honoured.
 
     Parameters
     ----------
@@ -376,25 +378,29 @@ def oof_folds(dataset: FitView, train: Segments, label: str = "") -> list[Fold]:
     Raises
     ------
     Refused
-        When ``train`` holds fewer rows than blocks, a block comes out empty, or the
-        purge leaves a block no train row.
+        When ``train`` holds fewer rows after the auxiliary rows than blocks, a block
+        comes out empty, or the purge leaves a block no train row.
     """
-    rows = sum(hi - lo for lo, hi in train)
-    if not train or rows < OOF_SPLITS:
+    head = dataset.auxiliary_rows
+    judged = tuple((max(lo, head), hi) for lo, hi in train if hi > head)
+    rows = sum(hi - lo for lo, hi in judged)
+    if not judged or rows < OOF_SPLITS:
         raise Refused(
-            f"out-of-fold predictions cut the train rows into {OOF_SPLITS} blocks, "
-            f"{rows} rows given"
+            f"out-of-fold predictions cut the train rows after the dataset's {head} "
+            f"auxiliary rows into {OOF_SPLITS} blocks, {rows} rows given"
         )
-    bounds = [train[0][0]]
+    bounds = [judged[0][0]]
     bounds += [
-        _snap(dataset, _absolute(train, round(i * rows / OOF_SPLITS)))
+        _snap(dataset, _absolute(judged, round(i * rows / OOF_SPLITS)))
         for i in range(1, OOF_SPLITS)
     ]
-    bounds.append(train[-1][1])
+    bounds.append(judged[-1][1])
     out = []
     for k in range(OOF_SPLITS):
         lo, hi = bounds[k], bounds[k + 1]
-        blocks = [(max(lo, a), min(hi, b)) for a, b in train if max(lo, a) < min(hi, b)]
+        blocks = [
+            (max(lo, a), min(hi, b)) for a, b in judged if max(lo, a) < min(hi, b)
+        ]
         if not blocks:
             raise Refused(
                 f"block {k} of the out-of-fold cut is empty: the timestamps snap its "

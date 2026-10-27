@@ -43,6 +43,7 @@ from ml_lab.declarations import (
 from ml_lab.experiment import Evaluation, Pipeline
 from ml_lab.guards import (
     finite_metrics,
+    refuse_auxiliary,
     refuse_lazy_imports,
     refuse_overlap,
     refuse_sealed,
@@ -101,10 +102,10 @@ def run(
     its train segments,
     whose folds train on labels not revealed when their test range starts (the message
     names the purge that clears them); a split whose folds moved under an unchanged
-    declaration; a sealed evaluation on a dataset without a sealed tail, an
-    evaluation that is not sealed validating on one, a sealed evaluation validating
-    before it, and a fold training on a tail row no earlier fold of a sealed
-    evaluation tested.
+    declaration; a fold validating inside the dataset's auxiliary rows; a sealed
+    evaluation on a dataset without a sealed tail, an evaluation that is not sealed
+    validating on one, a sealed evaluation validating before it, and a fold training
+    on a tail row no earlier fold of a sealed evaluation tested.
 
     Recorded as ``pipeline_failed``, after which the others continue and a rerun resumes
     from what was written: an error a function raises, noted with the fold's label; an
@@ -175,6 +176,7 @@ def run(
     schedule = evaluation.split.folds(dataset)
     refuse_overlap(schedule)
     refuse_unrevealed(dataset, targets, schedule)
+    refuse_auxiliary(evaluation, schedule, dataset.auxiliary_rows)
     refuse_sealed(evaluation, schedule, recorded["sealed_from"])
     declare_evaluation(ledger, evaluation, schedule, dry)
     report = RunReport()
