@@ -210,10 +210,16 @@ def _run(args: argparse.Namespace, ledger: Ledger) -> int:
 
 
 def _reference(pipelines: list[Pipeline], selector: str | None) -> Pipeline | None:
-    """The pipeline ``--reference`` names, by name or id prefix, or None without one."""
+    """The pipeline ``--reference`` names, by name or id prefix, or None without one;
+    one pipeline listed by several modules counts once.
+    """
     if selector is None:
         return None
-    found = [p for p in pipelines if selector in (p.name, p.id[: len(selector)])]
+    found = list(
+        {
+            p.id: p for p in pipelines if selector in (p.name, p.id[: len(selector)])
+        }.values()
+    )
     if len(found) != 1:
         names = ", ".join(f"{p.id} {p.name}".rstrip() for p in pipelines)
         raise Refused(

@@ -780,6 +780,10 @@ def test_lab_run_summarises_each_evaluation_against_a_reference(
         capsys.readouterr().out,
         re.M,
     )
+    twice = scratch / "twice.py"
+    twice.write_text("from tests import synthetic\npipelines = [synthetic.ridge(1)]\n")
+    assert cli.main([*args, str(twice), "--reference", "ridge_1m"]) == 0
+    assert "vs ridge_1m" in capsys.readouterr().out
     assert cli.main([*args, "--reference", "nope"]) == 1
     assert "matches 0 of the pipelines run" in capsys.readouterr().err
 
