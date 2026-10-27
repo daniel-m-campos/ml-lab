@@ -8,6 +8,12 @@ Its id is the data: the ``ts`` bytes, column names, dtypes and values, so a load
 that changes rows is a new dataset and an edit that changes nothing is not. The recipe
 rides on the event as provenance; the bytes are Parquet.
 
+The rows may have two boundaries, both recorded with them and in the id: an
+auxiliary head, ``record(auxiliary_rows=n)``, the first rows, which a fit may learn
+from and no evaluation scores, and a sealed tail, ``record(sealed_from=row)``, which
+only a sealed evaluation scores. A fit reads the head as ``dataset.auxiliary_rows``
+on its view.
+
 Examples
 --------
 >>> import numpy as np
@@ -62,6 +68,9 @@ class Dataset:
         The Parquet file each computed column is read from.
     reveal : Mapping[str, Lag], optional
         The targets' reveal lags, recorded with the data and set by ``load``.
+    auxiliary_rows : int, optional
+        The auxiliary head: that many leading rows a fit may learn from and no
+        evaluation scores, recorded with the data and set by ``load``.
 
     Raises
     ------
@@ -80,6 +89,7 @@ class Dataset:
         computed_columns: tuple[str, ...] = (),
         stores: dict[str, pathlib.Path] | None = None,
         reveal: Mapping[str, Lag] | None = None,
+        auxiliary_rows: int = 0,
     ):
         self.columns = {
             n: a.astype("datetime64[ns]", copy=False) if a.dtype.kind == "M" else a
@@ -90,6 +100,7 @@ class Dataset:
         self.cut: int | None = None
         self.keep: np.ndarray | None = None
         self.reveal: dict[str, Lag] = dict(reveal or {})
+        self.auxiliary_rows = auxiliary_rows
         self.ts = None if ts is None else ts.astype("datetime64[ns]")
         if self.ts is not None and np.isnat(self.ts).any():
             raise ValueError("timestamps must not contain NaT")
@@ -127,6 +138,7 @@ class Dataset:
         view.cut = min(row, self.rows)
         view.keep = None if self.keep is None else self.keep[:row]
         view.reveal = self.reveal
+        view.auxiliary_rows = self.auxiliary_rows
         return view
 
     def masked(self, reveal: dict[str, Lag], at: int) -> Dataset:
@@ -258,7 +270,8 @@ class FitView:
     segments, with the fold's context beside it.
 
     It reads as a ``Dataset`` through ``column``, ``matrix``, ``columns``, ``ts``,
-    ``rows``, ``index_of``, ``date_at``, ``computed_columns`` and ``reveal``.
+    ``rows``, ``index_of``, ``date_at``, ``computed_columns``, ``reveal`` and
+    ``auxiliary_rows``.
 
     Attributes
     ----------
@@ -288,6 +301,14 @@ class FitView:
     def columns(self) -> Mapping[str, np.ndarray]:
         """The columns, blank outside ``train``."""
         return self.data.columns
+
+    @property
+    def auxiliary_rows(self) -> int:
+        """The dataset's auxiliary head: that many leading rows, in every fold's
+        train and scored by no evaluation, so a fit can learn from them apart from
+        the rows it is judged on.
+        """
+        return self.data.auxiliary_rows
 
     @property
     def ts(self) -> np.ndarray | None:
@@ -456,6 +477,7 @@ def record(
     params: Mapping[str, Any] | None = None,
     reveal: Mapping[str, datetime.timedelta | np.timedelta64 | int] | None = None,
     sealed_from: int | str | None = None,
+    auxiliary_rows: int = 0,
     steps: Sequence[Callable] = (),
 ) -> str:
     """Check the targets and store the rows.
@@ -482,6 +504,13 @@ def record(
         or a date (its first row at or after it). Only an ``Evaluation(sealed=True)``
         validates on the tail, each pipeline once, and no fold trains on it before
         such an evaluation tests it.
+    auxiliary_rows : int, optional
+        The auxiliary head: that many leading rows a fit may learn from and no
+        evaluation scores, such as another table of the same columns ingested ahead
+        of the rows a model is judged on. With a clock the head ends on the first row
+        of the timestamp its count falls in, so no timestamp is split. The blocked
+        splits tile the rows after it, a fold whose test range reaches into it is
+        refused, and a fit reads the count as ``dataset.auxiliary_rows``.
     steps : Sequence[Callable], optional
         The module-level functions that made the rows, the cleaning included. Each
         is recorded in the recipe by its dotted path with the code keys of its module
@@ -492,8 +521,8 @@ def record(
     -------
     str
         The dataset id: a hash of the ``ts`` bytes, the columns, the targets, their
-        lags and the sealed tail's first row, so an edit that leaves the rows as
-        they were records nothing new.
+        lags, the sealed tail's first row and the auxiliary head's length, so an
+        edit that leaves the rows as they were records nothing new.
 
     Raises
     ------
@@ -503,8 +532,9 @@ def record(
         that wrote them.
     ValueError, KeyError, TypeError
         When the rows are empty, a lag has no clock or a bad kind, ``reveal`` names
-        a non-target, a target is missing or not numeric, a column is not 1-D, or
-        ``sealed_from`` leaves either side empty.
+        a non-target, a target is missing or not numeric, a column is not 1-D,
+        ``sealed_from`` leaves either side empty, or ``auxiliary_rows`` is not a
+        count or leaves no row to judge before the end or the sealed tail.
     """
     if not targets:
         raise Refused(
@@ -541,7 +571,8 @@ def record(
             "2-D array into named columns"
         )
     sealed = _sealed(dataset, sealed_from)
-    dataset_id = data_id(dataset, labels, sealed)
+    head = _auxiliary(dataset, auxiliary_rows, sealed)
+    dataset_id = data_id(dataset, labels, sealed, head)
     canonical = identity.canonical(recipe)
     before = ledger.latest(Event.DATASET, dataset_id)
     if before is not None:
@@ -554,6 +585,7 @@ def record(
         "recipe": canonical,
         "rows": dataset.rows,
         "sealed_from": sealed,
+        "auxiliary_rows": head,
         "blob": {"sha": sha, "format": formats.Format.PARQUET},
     }
     ledger.append(Event.DATASET, dataset_id, dataset_id, payload, id=dataset_id)
@@ -608,15 +640,45 @@ def _sealed(dataset: Dataset, sealed_from: int | str | None) -> int | None:
     if isinstance(sealed_from, str):
         row = dataset.index_of(sealed_from)
     else:
-        row = int(sealed_from)
-        if dataset.ts is not None and 0 < row < dataset.rows:
-            row = dataset.index_of(dataset.ts[row])
+        row = _first_of_timestamp(dataset, int(sealed_from))
     if not 0 < row < dataset.rows:
         raise Refused(
             f"sealed_from {sealed_from!r} is row {row} of {dataset.rows}; a sealed "
             "tail starts after the first row and before the last"
         )
     return int(row)
+
+
+def _auxiliary(dataset: Dataset, auxiliary_rows: int, sealed: int | None) -> int:
+    """The auxiliary head's length, cut back to the first row of the timestamp its
+    count falls in, with at least one row left to judge before the sealed tail or
+    the end.
+    """
+    if isinstance(auxiliary_rows, bool) or not isinstance(
+        auxiliary_rows, (int, np.integer)
+    ):
+        raise TypeError(
+            f"auxiliary_rows is a count of leading rows, not {auxiliary_rows!r}"
+        )
+    head = _first_of_timestamp(dataset, int(auxiliary_rows))
+    end = dataset.rows if sealed is None else sealed
+    where = "the end" if sealed is None else "the sealed tail"
+    if not 0 <= head < end:
+        raise Refused(
+            f"auxiliary_rows={auxiliary_rows} leaves no row to judge before {where} at "
+            f"row {end}; the auxiliary head is followed by the rows a model is judged "
+            "on"
+        )
+    return head
+
+
+def _first_of_timestamp(dataset: Dataset, row: int) -> int:
+    """``row`` moved back to the first row of its timestamp, when the dataset has a
+    clock and the row is inside it.
+    """
+    if dataset.ts is not None and 0 < row < dataset.rows:
+        return dataset.index_of(dataset.ts[row])
+    return row
 
 
 def _stored_lag(stored: Any) -> Lag:
@@ -653,10 +715,12 @@ def data_id(
     dataset: Dataset,
     targets: Mapping[str, Any] | None = None,
     sealed_from: int | None = None,
+    auxiliary_rows: int = 0,
 ) -> str:
     """The content id of a dataset: its ``ts`` bytes, column names, dtypes and values
     (a string column by its strings), which columns are targets with their reveal lags
-    in seconds or a count of dates, and the sealed tail's first row when it has one.
+    in seconds or a count of dates, the sealed tail's first row when it has one and
+    the auxiliary head's length when it has one.
     """
     ts = None if dataset.ts is None else identity.bytes_hash(dataset.ts.tobytes())
     columns = {
@@ -664,8 +728,9 @@ def data_id(
         for name, a in dataset.columns.items()
     }
     sealed = {} if sealed_from is None else {"sealed_from": sealed_from}
+    head = {} if not auxiliary_rows else {"auxiliary_rows": auxiliary_rows}
     return identity.content_hash(
-        {"ts": ts, "columns": columns, "targets": targets, **sealed}
+        {"ts": ts, "columns": columns, "targets": targets, **sealed, **head}
     )
 
 
@@ -743,7 +808,8 @@ def load(ledger: Ledger, dataset_id: str) -> Dataset:
     Returns
     -------
     Dataset
-        The rows, with ``reveal`` set from the recipe.
+        The rows, with ``reveal`` set from the recipe and ``auxiliary_rows`` from
+        the record.
 
     Raises
     ------
@@ -756,6 +822,7 @@ def load(ledger: Ledger, dataset_id: str) -> Dataset:
     dataset = rows_load(ledger.blobs / event["payload"]["blob"]["sha"])
     targets = event["payload"]["recipe"]["targets"]
     dataset.reveal = {name: _stored_lag(lag) for name, lag in targets.items()}
+    dataset.auxiliary_rows = int(event["payload"].get("auxiliary_rows") or 0)
     return dataset
 
 

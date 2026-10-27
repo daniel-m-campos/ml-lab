@@ -209,6 +209,22 @@ def refuse_unrevealed(dataset: Dataset, targets: dict[str, Lag], folds: list[Fol
         )
 
 
+def refuse_auxiliary(evaluation: Evaluation, folds: list[Fold], auxiliary_rows: int):
+    """An auxiliary row is trained on and never scored: a fold whose test range
+    reaches into the dataset's auxiliary head is refused.
+    """
+    name = evaluation.name or evaluation.id
+    for fold in folds:
+        lo, hi = fold.test
+        if lo < auxiliary_rows:
+            raise Refused(
+                f"evaluation {name} fold {fold.label} validates rows {lo} to {hi}, "
+                f"inside the dataset's {auxiliary_rows} auxiliary rows, which a fit "
+                f"may learn from and no evaluation scores; start its folds at row "
+                f"{auxiliary_rows} or later"
+            )
+
+
 def refuse_sealed(evaluation: Evaluation, folds: list[Fold], sealed: int | None):
     """A sealed tail is validated only by a sealed evaluation, a sealed evaluation
     needs one and validates nothing else, and a fold trains on a tail row only after

@@ -232,6 +232,13 @@ def inner_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     return Fitted(model, {"alpha": best, "inner": inner, "validation": valid})
 
 
+def headed_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
+    """Records the dataset's auxiliary head the view carries."""
+    return Fitted(
+        ridge_fit(dataset, train, config), {"auxiliary_rows": dataset.auxiliary_rows}
+    )
+
+
 def bad_facts_fit(dataset: FitView, train: Segments, config: RidgeConfig) -> Fitted:
     return Fitted(ridge_fit(dataset, train, config), {"when": object()})
 
